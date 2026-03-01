@@ -169,12 +169,18 @@ class AsyncTrainingController:
             for sample in dataset:
                 if isinstance(sample, dict):
                     data_id = sample.get("data_id") or self._generate_data_id()
-                    assert "packed_loss_mask" in sample, "packed_loss_mask is required"
+                    input_ids = sample.get("input_ids")
                     packed_loss_mask = sample.get("packed_loss_mask")
+                    if input_ids is not None and packed_loss_mask is None:
+                        raise ValueError(
+                            f"packed_loss_mask is required when input_ids is provided "
+                            f"(data_id={data_id}). Use defer_tokenization=True to skip "
+                            f"tokenization entirely."
+                        )
                     entry = InferenceInput(
                         data_id=data_id,
                         prompt=sample.get("prompt", sample),
-                        input_ids=sample.get("input_ids"),
+                        input_ids=input_ids,
                         packed_loss_mask=packed_loss_mask,
                         formatted_prompt=sample.get("formatted_prompt"),
                         metadata=sample.get("metadata", {}),
@@ -189,13 +195,13 @@ class AsyncTrainingController:
             return len(dataset)
 
     def load_dataset(self, args) -> int:
-        """Load and tokenize dataset on the controller, store for epoch reloads, and prime the prompt buffer."""
+        """Load and process dataset on the controller, store for epoch reloads, and prime the prompt buffer."""
         from torchspec.data.dataset import load_conversation_dataset
 
         self._stored_dataset = load_conversation_dataset(args)
         if not self._stored_dataset:
             raise ValueError(
-                f"Training dataset is empty after tokenization. "
+                f"Training dataset is empty after processing. "
                 f"Check train_data_path='{args.train_data_path}', "
                 f"max_seq_length={getattr(args, 'max_seq_length', None)}, "
                 f"and chat_template settings."
@@ -244,10 +250,18 @@ class AsyncTrainingController:
         return len(self._stored_eval_dataset) if self._stored_eval_dataset is not None else 0
 
     def compute_vocab_mapping(self, target_vocab_size: int, draft_vocab_size: int) -> tuple:
-        """Generate vocab mapping on the controller using the stored dataset."""
+        """Generate vocab mapping on the controller using the stored dataset.
+
+        Requires the dataset to have been loaded with defer_tokenization=False,
+        since vocab mapping needs input_ids.
+        """
         from torchspec.data.preprocessing import generate_vocab_mapping
 
         assert self._stored_dataset is not None, "No stored dataset for vocab mapping"
+        assert "input_ids" in self._stored_dataset[0], (
+            "compute_vocab_mapping requires input_ids in dataset. "
+            "Set defer_tokenization=False to enable tokenization."
+        )
         return generate_vocab_mapping(
             prompts=self._stored_dataset,
             target_vocab_size=target_vocab_size,

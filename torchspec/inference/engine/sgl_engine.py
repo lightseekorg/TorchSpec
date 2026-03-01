@@ -55,6 +55,8 @@ _PROTECTED_ENGINE_KEYS = frozenset(
         "dist_init_addr",
         "dist_timeout",
         "enable_multimodal",
+        "allow_auto_truncate",
+        "context_length",
     }
 )
 
@@ -212,6 +214,8 @@ class SglEngine(InferenceEngine, RayActor):
             engine_kwargs.update(extra)
 
         # Protected keys — always set by TorchSpec, never overridable
+        max_seq_length = getattr(self.args, "max_seq_length", None)
+
         engine_kwargs.update(
             {
                 "model_path": self.args.target_model_path,
@@ -229,6 +233,8 @@ class SglEngine(InferenceEngine, RayActor):
                 "enable_multimodal": getattr(self.args, "sglang_enable_multimodal", False),
                 "trust_remote_code": getattr(self.args, "trust_remote_code", True),
                 "chunked_prefill_size": -1,
+                "allow_auto_truncate": True,
+                **({"context_length": max_seq_length} if max_seq_length else {}),
             }
         )
 
@@ -414,10 +420,16 @@ class SglEngine(InferenceEngine, RayActor):
             )
 
             for key in store_keys:
-                seq_len = result["meta_info"].get(
-                    "prompt_tokens",
-                    len(formatted_prompts[i]) if use_prompts else len(input_ids_list_of_lists[i]),
-                )
+                seq_len = result["meta_info"].get("prompt_tokens")
+                if seq_len is None:
+                    if use_prompts:
+                        raise RuntimeError(
+                            f"SglEngine rank {self.rank}: 'prompt_tokens' missing from "
+                            f"meta_info for data_id={data_ids[i]}. The engine must report "
+                            f"prompt_tokens when using formatted_prompts (defer_tokenization mode)."
+                        )
+                    else:
+                        seq_len = len(input_ids_list_of_lists[i])
 
                 tensor_shapes = self._get_tensor_shapes(seq_len)
                 logger.debug(
