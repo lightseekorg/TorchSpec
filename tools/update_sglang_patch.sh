@@ -44,12 +44,12 @@ fi
 cd "$SGLANG_PATH"
 
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
-    echo "Error: $SGLANG_FOLDER_NAME is not a git repository"
+    echo "Error: $SGLANG_PATH is not a git repository"
     exit 1
 fi
 
 if ! git rev-parse "$SGLANG_COMMIT" > /dev/null 2>&1; then
-    echo "Error: Commit $SGLANG_COMMIT not found in $SGLANG_FOLDER_NAME repository"
+    echo "Error: Commit $SGLANG_COMMIT not found in $SGLANG_PATH repository"
     exit 1
 fi
 
@@ -70,9 +70,9 @@ if [ "$(git rev-parse HEAD)" = "$(git rev-parse $SGLANG_COMMIT)" ]; then
         git status --short
         echo ""
         echo "Please commit them first:"
-        echo "  cd $SGLANG_FOLDER_NAME && git add -A && git commit -m 'your message'"
+        echo "  cd $SGLANG_PATH && git add -A && git commit -m 'your message'"
     else
-        echo "Please make and commit your changes in $SGLANG_FOLDER_NAME first."
+        echo "Please make and commit your changes in $SGLANG_PATH first."
     fi
     exit 1
 fi
@@ -82,7 +82,7 @@ if [ "$has_uncommitted" = true ]; then
     git status --short
     echo ""
     echo "Please commit them first:"
-    echo "  cd $SGLANG_FOLDER_NAME && git add -A && git commit --amend --no-edit"
+    echo "  cd $SGLANG_PATH && git add -A && git commit --amend --no-edit"
     exit 1
 fi
 

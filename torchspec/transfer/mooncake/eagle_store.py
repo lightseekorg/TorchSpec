@@ -144,6 +144,14 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             buf = self._gpu_send_buffer
             buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
             self._do_sync_batch_put(keys, buffer_ptrs, sizes)
+        elif self._host_buffer_pool is None or self._async_put_manager is None:
+            raise RuntimeError(
+                "put() requires either GPU Direct (enable_gpu_direct=True) or "
+                "async host-buffer puts (async_put_pool_size > 0). "
+                "Current config has async_put_pool_size=0 and GPU Direct is "
+                f"{'enabled but gpu_send_buffer failed to initialize' if self._gpu_direct_available else 'disabled'}. "
+                "Set async_put_pool_size >= 1 or enable GPU Direct."
+            )
         else:
             buf = self._host_buffer_pool.get_buffer()
             self._async_put_manager.check_last_error()
@@ -193,6 +201,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         ``_copy_stream``, the copies are typically finished by the time
         this is called — the wait is only for the (fast) RDMA transfer.
         """
+        if self._async_put_manager is None:
+            return
         self._async_put_manager.check_last_error()
         self._async_put_manager.drain()
         self._async_put_manager.check_last_error()
