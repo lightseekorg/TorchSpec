@@ -1,103 +1,99 @@
-"""Standalone integration script that tests Mooncake hidden states collection behavior."""
+"""Profile sglang engine generate() with large batches."""
 
 import os
+import random
+import time
 
 import sglang as sgl
-import torch
-from transformers import AutoTokenizer
-
-from torchspec.transfer.mooncake import EagleMooncakeStore, MooncakeConfig
 
 os.environ["MOONCAKE_MASTER_HOST"] = "0.0.0.0"
 os.environ["MOONCAKE_MASTER_PORT"] = "50051"
 os.environ["MOONCAKE_METADATA_PORT"] = "8090"
+os.environ["MOONCAKE_PROTOCOL"] = "rdma"
+os.environ["MOONCAKE_DEVICE_NAME"] = "mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11"
+
+BATCH_SIZE = 4
+SEQ_LEN = 32_768
+NUM_STEPS = 2
+MODEL_PATH = "Qwen/Qwen3-8B"
+TP_SIZE = 4
+AUX_LAYER_IDS = [2, 4, 6]
+HIDDEN_DIM = 4096
+NUM_AUX_LAYERS = len(AUX_LAYER_IDS)
+
+# Per-sample bytes: hidden_states(seq×dim×aux×bf16) + input_ids(seq×i64) + last_hidden(seq×dim×bf16)
+_per_sample = SEQ_LEN * (HIDDEN_DIM * NUM_AUX_LAYERS * 2 + 8 + HIDDEN_DIM * 2)
+_buf_size = int(_per_sample * 1.2)
+# global_segment must cover all in-flight samples (batch × steps + warmup headroom)
+_segment_size = int(_per_sample * BATCH_SIZE * (NUM_STEPS + 1) * 1.3)
+os.environ["MOONCAKE_HOST_BUFFER_SIZE"] = str(_buf_size)
+os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = str(_segment_size)
+os.environ["MOONCAKE_LOCAL_BUFFER_SIZE"] = str(_segment_size)
+os.environ["MOONCAKE_ENABLE_GPU_DIRECT"] = "0"
+os.environ["MOONCAKE_GPU_BUFFER_SIZE"] = str(_buf_size)
+
+
+def make_batch(batch_size: int, seq_len: int, step: int) -> dict:
+    input_ids_list = [
+        [random.randint(100, 30000) for _ in range(seq_len)] for _ in range(batch_size)
+    ]
+    data_ids = [f"step{step}_seq{i}" for i in range(batch_size)]
+    return {
+        "input_ids": input_ids_list,
+        "spec_training_data_id": data_ids,
+        "sampling_params": {"max_new_tokens": 0},
+        "return_hidden_states": True,
+    }
+
 
 if __name__ == "__main__":
-    model_path = "Qwen/Qwen3-8B"
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    eos_token_id = tokenizer.eos_token_id
-
-    input_ids_list = [
-        [1, 2345, 6789],
-        [100, 200, 300, 400],
-        [500, 600],
-    ]
+    print(f"Config: batch_size={BATCH_SIZE}, seq_len={SEQ_LEN}, steps={NUM_STEPS}, tp={TP_SIZE}")
 
     engine = sgl.Engine(
-        model_path=model_path,
+        disable_radix_cache=True,
+        model_path=MODEL_PATH,
         disable_cuda_graph=True,
         enable_return_hidden_states=True,
         enable_aux_hidden_states=True,
-        aux_hidden_state_layer_ids=[2, 4, 6],
+        aux_hidden_state_layer_ids=AUX_LAYER_IDS,
         enable_spec_training_mooncake=True,
         log_level="info",
-        tp_size=4,
+        tp_size=TP_SIZE,
     )
 
-    results = engine.generate(
-        input_ids=input_ids_list,
-        spec_training_data_id=["data_id_1", "data_id_2", "data_id_3"],
-        spec_training_prompt_length=[1, 2, 1],
-        spec_training_response_length=[5, 10, 8],
-        sampling_params={"max_new_tokens": 32},
-        return_hidden_states=True,
+    # Warmup (not profiled)
+    print("\n=== Warmup ===")
+    warmup_batch = make_batch(BATCH_SIZE, SEQ_LEN, step=-1)
+    t0 = time.perf_counter()
+    engine.generate(**warmup_batch)
+    print(f"Warmup done in {time.perf_counter() - t0:.2f}s")
+
+    # Start profiling
+    profile_dir = os.environ.get("PROFILE_DIR", "/tmp/sgl_profile")
+    os.makedirs(profile_dir, exist_ok=True)
+    print(f"\n=== Profiling {NUM_STEPS} steps -> {profile_dir} ===")
+    engine.start_profile(
+        output_dir=profile_dir,
+        activities=["CPU", "GPU"],
+        with_stack=True,
+        record_shapes=True,
     )
 
-    print("=== Batch Results ===")
-    all_keys = []
-    seq_lens = []
-    for i, result in enumerate(results):
-        output_ids = result["output_ids"]
-        hidden_states = result["meta_info"].get("hidden_states")
-        mooncake_keys = result["meta_info"].get("spec_training_mooncake_store_keys")
-
-        print(f"\n--- Request {i} ---")
-        print(f"output_ids: {output_ids}")
-        print(f"num tokens generated: {len(output_ids)}")
-        print(f"spec_training_data_id: {result['meta_info'].get('spec_training_data_id')}")
-
-        print(f"\n  Hidden states in meta_info: {hidden_states}")
-        assert hidden_states is None, "hidden_states should be None when using mooncake"
-
-        print(f"\n  Mooncake store keys: {mooncake_keys}")
-        assert mooncake_keys and len(mooncake_keys) > 0, "mooncake_store_keys should not be empty"
-
-        all_keys.extend(mooncake_keys)
-        seq_lens.append(len(input_ids_list[i]))
-
-        print(f"\n  All meta_info keys: {list(result['meta_info'].keys())}")
-
-    print("\n=== Fetching data from Mooncake Store ===")
-    mooncake_config = MooncakeConfig.from_env()
-    mooncake_store = EagleMooncakeStore(mooncake_config)
-    mooncake_store.setup(device="cuda")
-
-    hidden_dim = 12288
-    last_hidden_dim = 4096
-
-    for i, key in enumerate(all_keys):
-        seq_len = seq_lens[i]
-        shapes = {
-            "hidden_states": (seq_len, hidden_dim),
-            "loss_mask": (seq_len,),
-            "input_ids": (seq_len,),
-            "last_hidden_states": (seq_len, last_hidden_dim),
-        }
-        dtypes = {
-            "hidden_states": torch.bfloat16,
-            "loss_mask": torch.long,
-            "input_ids": torch.long,
-            "last_hidden_states": torch.bfloat16,
-        }
-
-        data = mooncake_store.get(key, shapes=shapes, dtypes=dtypes, device="cuda")
-        print(f"\n  Key: {key}")
+    for step in range(NUM_STEPS):
+        batch = make_batch(BATCH_SIZE, SEQ_LEN, step=step)
+        t0 = time.perf_counter()
+        results = engine.generate(**batch)
+        elapsed = time.perf_counter() - t0
+        total_tokens = BATCH_SIZE * SEQ_LEN
         print(
-            f"    hidden_states: shape={data.hidden_states.shape}, dtype={data.hidden_states.dtype}"
+            f"  Step {step}: {elapsed:.2f}s | "
+            f"{total_tokens} tokens | "
+            f"{total_tokens / elapsed:.0f} tok/s | "
+            f"mooncake_keys={sum(len(r['meta_info'].get('spec_training_mooncake_store_keys', [])) for r in results)}"
         )
-        print(f"    loss_mask: {data.loss_mask.tolist()}")
-        print(f"    input_ids: {data.input_ids.tolist()}")
-        print(f"    last_hidden_states: shape={data.last_hidden_states.shape}")
 
-    print("\n✓ Test completed - hidden states sent to mooncake and retrieved successfully")
+    engine.stop_profile()
+    print(f"\n=== Profile traces saved to {profile_dir} ===")
+    print("View with: chrome://tracing or tensorboard --logdir", profile_dir)
+
     engine.shutdown()

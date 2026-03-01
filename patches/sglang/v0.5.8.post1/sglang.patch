@@ -654,9 +654,6 @@ index d79f929d3..4f5a3e0b8 100644
 +                hidden_state_offset : hidden_state_offset + seq_len
 +            ]
 +
-+        # When overlap is enabled, hidden_states is still on GPU (produced on
-+        # the forward stream).  Establish cross-stream ordering so that put()'s
-+        # _copy_stream DtoH sees the completed writes.
 +        if hidden_states.is_cuda and copy_done_event is not None:
 +            torch.cuda.current_stream().wait_event(copy_done_event)
 +

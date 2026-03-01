@@ -253,6 +253,10 @@ class HFRunner:
                 )
             else:
                 results.append({"tensors": sample, "packed_loss_mask": packed_loss_mask_list[i]})
+
+        if self.mooncake_store is not None:
+            self.mooncake_store.flush()
+
         return results
 
     def _run_inference(

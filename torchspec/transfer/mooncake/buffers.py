@@ -154,6 +154,7 @@ class AsyncPutManager:
         sizes: List[int],
         owner_buffer_ptr: int,
         wait_event: Optional[Any] = None,
+        device_index: Optional[int] = None,
     ) -> None:
         """Submit a ``batch_put_from`` to the background thread.
 
@@ -163,11 +164,17 @@ class AsyncPutManager:
         *wait_event* is an optional CUDA event to synchronize on before the
         RDMA transfer (used when DtoH staging runs on a separate stream).
 
+        *device_index* is the CUDA device ordinal that owns *wait_event*.
+        Worker threads do not inherit the caller's device context, so the
+        worker must call ``torch.cuda.set_device`` before synchronizing.
+
         GPU tensor lifetime is managed by the caller via
         ``record_stream`` — the CUDA caching allocator keeps the underlying
         memory alive until the copy stream passes the recorded point.
         """
-        future = self._executor.submit(self._do_put, keys, buffer_ptrs, sizes, wait_event)
+        future = self._executor.submit(
+            self._do_put, keys, buffer_ptrs, sizes, wait_event, device_index
+        )
         self._in_flight[owner_buffer_ptr] = future
 
     def _do_put(
@@ -176,12 +183,23 @@ class AsyncPutManager:
         buffer_ptrs: List[int],
         sizes: List[int],
         wait_event: Optional[Any] = None,
+        device_index: Optional[int] = None,
     ) -> None:
         if wait_event is not None:
+            if device_index is not None:
+                torch.cuda.set_device(device_index)
             wait_event.synchronize()
         results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
         failures = [(k, r) for k, r in zip(keys, results) if r != 0]
         if failures:
+            for k in keys:
+                try:
+                    self._store.remove(k)
+                except Exception:
+                    logger.debug(
+                        "Failed to remove partial key %s after async batch_put_from failure.",
+                        k,
+                    )
             detail = ", ".join(f"{k} (code={r})" for k, r in failures)
             raise RuntimeError(f"async batch_put_from failed: {detail}")
 

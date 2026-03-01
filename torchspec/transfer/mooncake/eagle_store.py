@@ -170,6 +170,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 sizes,
                 buf.ptr,
                 wait_event=copy_done,
+                device_index=self._copy_stream.device.index,
             )
 
         shapes = {
