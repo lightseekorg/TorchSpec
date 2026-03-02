@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# To force apply a patch, run: ./tools/apply_sglang_patch.sh <path-to-sglang-repo> <path-to-patch-file>
+# To force apply a patch, run: ./tools/apply_sglang_patch.sh <absolute-path-to-sglang-repo>
 # Please note that this will overwrite all the local changes.
 
 set -e
