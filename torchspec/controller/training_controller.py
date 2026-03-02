@@ -140,11 +140,13 @@ class AsyncTrainingController:
         self._eval_pool_lock = threading.Lock()
         self._eval_data_ids: set[str] = set()
         self._eval_expected_count: int = 0
+        self._eval_dispatched_samples: int = 0
         self.eval_queues = [Queue() for _ in range(dp_size)]
 
         self.batch_id = 0
-        self.dispatch_batch_size = args.dispatch_batch_size
-        self.eval_dispatch_batch_size = args.eval_dispatch_batch_size
+        self.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
+        max_pool = getattr(args, "max_sample_pool_size", 0)
+        self.eval_dispatch_batch_size = max_pool or self.dispatch_batch_size
         self._data_id_counter = 0
 
         self._stored_dataset: list | None = None
@@ -342,10 +344,13 @@ class AsyncTrainingController:
         return self.train_queues
 
     def get_pool_size(self) -> int:
-        # Exclude eval samples during eval as inference has to run.
+        """Total mooncake-resident samples (training + eval) for backpressure.
+
+        Always includes eval pool so that backpressure accounts for mooncake
+        segment capacity used by eval data.  Without this, eval data occupies
+        mooncake outside backpressure awareness and the segment overflows.
+        """
         train_size = len(self.sample_pool)
-        if self._eval_expected_count > 0:
-            return train_size
         with self._eval_pool_lock:
             return train_size + len(self.eval_pool)
 
@@ -403,21 +408,7 @@ class AsyncTrainingController:
                 self._pool_bytes -= sample_bytes
                 batch_results.append(result)
 
-        partitioned = self._partition_results(batch_results)
-
-        for dp_rank, results in enumerate(partitioned):
-            logger.debug(f"Pushing {len(results)} samples to dp_rank={dp_rank} queue")
-            for i, result in enumerate(results):
-                logger.debug(f"dp_rank={dp_rank} sample {i}: mooncake_key={result.mooncake_key}")
-                self.train_queues[dp_rank].put(
-                    TrainSample(
-                        mooncake_key=result.mooncake_key,
-                        tensor_shapes=result.tensor_shapes,
-                        tensor_dtypes=result.tensor_dtypes,
-                        packed_loss_mask=result.packed_loss_mask,
-                    )
-                )
-            logger.debug(f"Finished pushing to dp_rank={dp_rank} queue")
+        self._dispatch_to_queues(batch_results, self.train_queues)
 
         self._training_monitor.record(self.dispatch_batch_size)
         logger.debug(
@@ -433,6 +424,24 @@ class AsyncTrainingController:
         for i, result in enumerate(results):
             partitions[i % self.dp_size].append(result)
         return partitions
+
+    def _dispatch_to_queues(
+        self,
+        batch_results: list[InferenceOutput],
+        queues: list[Queue],
+    ) -> None:
+        """Partition results across DP ranks and push TrainSamples into queues."""
+        partitioned = self._partition_results(batch_results)
+        for dp_rank, results in enumerate(partitioned):
+            for result in results:
+                queues[dp_rank].put(
+                    TrainSample(
+                        mooncake_key=result.mooncake_key,
+                        tensor_shapes=result.tensor_shapes,
+                        tensor_dtypes=result.tensor_dtypes,
+                        packed_loss_mask=result.packed_loss_mask,
+                    )
+                )
 
     def push_inference_sample(self, sample: InferenceOutput) -> int:
         """Add a single inference sample to the training pool.
@@ -463,6 +472,8 @@ class AsyncTrainingController:
         training pool can starve eval indefinitely.
         """
         self._eval_expected_count = len(dataset)
+        self._eval_dispatched_samples = 0
+
         eval_entries: list[InferenceInput] = []
         for sample in dataset:
             if isinstance(sample, dict):
@@ -493,62 +504,58 @@ class AsyncTrainingController:
         with self._eval_pool_lock:
             return len(self.eval_pool)
 
-    def is_eval_ready(self) -> bool:
-        """True when all expected eval samples have completed inference."""
-        if self._eval_expected_count == 0:
-            return False
-        with self._eval_pool_lock:
-            return len(self.eval_pool) >= self._eval_expected_count
-
     def get_eval_queues(self) -> list[Queue]:
         return self.eval_queues
 
-    def dispatch_all_eval(self) -> int:
-        """Dispatch all complete eval batches to eval queues.
-
-        Uses ``eval_dispatch_batch_size`` (may differ from training).
-        Only dispatches full batches. Remaining samples stay in the pool.
-        Clears eval tracking state after dispatch to prevent unbounded growth.
-
-        Returns:
-            Number of batches dispatched.
-        """
+    def try_dispatch_eval_batch(self) -> bool:
+        """Dispatch one eval batch from the pool if enough samples are available."""
         bs = self.eval_dispatch_batch_size
-        dispatched = 0
-        while True:
-            with self._eval_pool_lock:
-                if len(self.eval_pool) < bs:
-                    break
-                batch_results = []
-                for _ in range(bs):
-                    batch_results.append(self.eval_pool.popleft())
+        with self._eval_pool_lock:
+            if len(self.eval_pool) < bs:
+                return False
+            batch_results = [self.eval_pool.popleft() for _ in range(bs)]
 
-            partitioned = self._partition_results(batch_results)
-            for dp_rank, results in enumerate(partitioned):
-                for result in results:
-                    self.eval_queues[dp_rank].put(
-                        TrainSample(
-                            mooncake_key=result.mooncake_key,
-                            tensor_shapes=result.tensor_shapes,
-                            tensor_dtypes=result.tensor_dtypes,
-                            packed_loss_mask=result.packed_loss_mask,
-                        )
-                    )
-            dispatched += 1
+        self._dispatch_to_queues(batch_results, self.eval_queues)
+        self._eval_dispatched_samples += bs
+        logger.debug(
+            f"Eval: dispatched batch ({self._eval_dispatched_samples}/"
+            f"{self._eval_expected_count} samples)"
+        )
+        return True
 
+    def is_eval_dispatch_complete(self) -> bool:
+        """True when all dispatchable eval batches have been sent to queues.
+
+        Becomes true once all expected eval samples have completed inference
+        AND all full batches have been dispatched.  Remainder samples (less
+        than one batch) are not dispatched.
+        """
+        if self._eval_expected_count == 0:
+            return False
+        with self._eval_pool_lock:
+            arrived = self._eval_dispatched_samples + len(self.eval_pool)
+        if arrived < self._eval_expected_count:
+            return False
+        # All samples arrived. Check if any full batch remains.
+        with self._eval_pool_lock:
+            return len(self.eval_pool) < self.eval_dispatch_batch_size
+
+    def finalize_eval_dispatch(self) -> None:
+        """Clean up eval tracking state after all batches have been cached.
+
+        Drops remainder samples that didn't fill a full batch and resets
+        counters so the next eval cycle starts fresh.
+        """
         with self._eval_pool_lock:
             remaining = len(self.eval_pool)
             if remaining > 0:
-                logger.warning(
-                    f"Eval: dropping {remaining} leftover samples that didn't fill a batch"
-                )
+                logger.info(f"Eval: dropping {remaining} leftover samples that didn't fill a batch")
                 self.eval_pool.clear()
 
         self._eval_data_ids.clear()
         self._eval_expected_count = 0
-
-        logger.info(f"Eval: dispatched {dispatched} batches to eval queues")
-        return dispatched
+        self._eval_dispatched_samples = 0
+        logger.info("Eval: dispatch finalized, tracking state cleared")
 
     # ─────────────────────────────────────────────────────────────
     # Status and Monitoring

@@ -106,8 +106,8 @@ class TrainerActor(RayActor):
             queue, mooncake_config=mooncake_config, per_dp_rank_batch_size=per_dp_rank_batch_size
         )
 
-    def cache_eval_data(self, num_batches: int) -> int:
-        return self._trainer.cache_eval_data(num_batches)
+    def cache_eval_samples(self, count: int) -> int:
+        return self._trainer.cache_eval_samples(count)
 
     def save_eval_cache(self, cache_dir: str) -> None:
         return self._trainer.save_eval_cache(cache_dir)

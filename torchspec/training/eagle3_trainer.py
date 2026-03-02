@@ -267,17 +267,28 @@ class Eagle3Trainer(Trainer):
         }
 
     def eval_from_cache(self) -> dict:
-        """Run forward-only eval over all CPU-cached eval batches."""
+        """Run forward-only eval over all CPU-cached eval samples.
+
+        Samples are stored individually (no padding). We re-collate them into
+        batches of ``eval_micro_batch_size`` (or ``micro_batch_size``) so the
+        eval forward batch size is independent of cache generation throughput.
+        """
         if not getattr(self, "_eval_cache", None):
             return {}
 
+        eval_mbs = getattr(self.args, "eval_micro_batch_size", None) or self.args.micro_batch_size
+
         self.model.eval()
         all_metrics: list[dict] = []
-        for batch in self._eval_cache:
+        for i in range(0, len(self._eval_cache), eval_mbs):
+            chunk = self._eval_cache[i : i + eval_mbs]
+            batch = self._eval_collator(chunk)
             gpu_batch = {
                 k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()
             }
             all_metrics.append(self.eval_forward(gpu_batch))
+
+        # Switch back to training mode
         self.model.train()
 
         return self._aggregate_eval_metrics(all_metrics)

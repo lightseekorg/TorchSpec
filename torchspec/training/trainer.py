@@ -195,36 +195,40 @@ class Trainer(abc.ABC):
             device=torch.cuda.current_device(),
             batch_size=per_dp_rank_batch_size,
         )
+        self._eval_collator = collator
         self._eval_cache: list[dict] = []
         logger.info(
             f"[Rank {self.dp_rank}] Eval data fetcher initialized "
             f"with batch_size={per_dp_rank_batch_size}"
         )
 
-    def cache_eval_data(self, num_batches: int) -> int:
-        """Read *num_batches* from the eval queue and store on CPU."""
-        self._eval_cache = []
-        for batch in itertools.islice(self._eval_data_fetcher, num_batches):
-            cpu_batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            self._eval_cache.append(cpu_batch)
-        logger.info(f"[Rank {self.dp_rank}] Cached {len(self._eval_cache)} eval batches on CPU")
+    def cache_eval_samples(self, count: int) -> int:
+        for sample in itertools.islice(self._eval_data_fetcher, count):
+            cpu_sample = {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sample.items()
+            }
+            self._eval_cache.append(cpu_sample)
         return len(self._eval_cache)
 
     def save_eval_cache(self, cache_dir: str) -> None:
-        """Persist the CPU-cached eval batches to disk for reuse across runs."""
         if not getattr(self, "_eval_cache", None):
             return
         os.makedirs(cache_dir, exist_ok=True)
         path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
-        torch.save(self._eval_cache, path)
+        tmp_path = path + ".tmp"
+        torch.save(self._eval_cache, tmp_path)
+        os.replace(tmp_path, path)
         logger.info(f"[Rank {self.dp_rank}] Saved {len(self._eval_cache)} eval batches to {path}")
 
     def load_eval_cache(self, cache_dir: str) -> int:
-        """Load eval batches from a previous disk cache. Returns count loaded (0 = miss)."""
         path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
         if not os.path.exists(path):
             return 0
-        self._eval_cache = torch.load(path, weights_only=False)
+        try:
+            self._eval_cache = torch.load(path, weights_only=False)
+        except Exception as e:
+            logger.warning(f"[Rank {self.dp_rank}] Corrupt eval cache at {path}, ignoring: {e}")
+            return 0
         logger.info(
             f"[Rank {self.dp_rank}] Loaded {len(self._eval_cache)} eval batches from {path}"
         )

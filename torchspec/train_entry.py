@@ -157,12 +157,7 @@ def _resolve_batch_size(args):
     sp_size = sp_size or 1
     accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
     args.per_dp_rank_batch_size = args.micro_batch_size * sp_size
-    args.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
-    args.global_batch_size = args.dispatch_batch_size * accumulation_steps
-
-    eval_mbs = getattr(args, "eval_micro_batch_size", None) or args.micro_batch_size
-    args.eval_per_dp_rank_batch_size = eval_mbs * sp_size
-    args.eval_dispatch_batch_size = args.eval_per_dp_rank_batch_size * dp_size
+    args.global_batch_size = args.per_dp_rank_batch_size * dp_size * accumulation_steps
 
 
 def _get_draft_model_config(args):

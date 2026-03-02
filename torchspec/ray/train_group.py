@@ -189,15 +189,17 @@ class RayTrainGroup:
             ]
         )
 
-    def cache_eval_data(self, num_batches: int):
-        """Tell every actor to read *num_batches* from its eval queue and cache on CPU."""
-        return ray.get(
-            [actor.cache_eval_data.remote(num_batches) for actor in self._actor_handlers]
-        )
+    def cache_eval_samples(self, count: int):
+        """Tell every actor to drain ``count`` individual samples from its eval queue into CPU cache."""
+        return ray.get([actor.cache_eval_samples.remote(count) for actor in self._actor_handlers])
 
     def save_eval_cache(self, cache_dir: str):
-        """Persist CPU-cached eval batches to disk on every actor."""
+        """Persist CPU-cached eval batches to disk on every actor (blocking)."""
         return ray.get([actor.save_eval_cache.remote(cache_dir) for actor in self._actor_handlers])
+
+    def async_save_eval_cache(self, cache_dir: str) -> list[ray.ObjectRef]:
+        """Fire-and-forget disk save — returns refs the caller can optionally await."""
+        return [actor.save_eval_cache.remote(cache_dir) for actor in self._actor_handlers]
 
     def load_eval_cache(self, cache_dir: str):
         """Load eval batches from disk on every actor. Returns list of counts (0 = miss)."""

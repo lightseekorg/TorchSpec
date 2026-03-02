@@ -234,7 +234,7 @@ def get_lr_scheduler_from_args(args, optimizer: torch.optim.Optimizer) -> LRSche
         args.num_inference
         * args.inference_batch_size
         * args.n_samples_per_prompt
-        // args.dispatch_batch_size
+        // (args.per_dp_rank_batch_size * args.dp_size)
     )
     args.train_iters = train_iters
 
