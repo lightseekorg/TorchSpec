@@ -6,8 +6,8 @@ torchspec sglang patch (base: 0f2df9370a)
  python/sglang/srt/managers/detokenizer_manager.py  |   3 +
  python/sglang/srt/managers/io_struct.py            |  48 ++++++++
  python/sglang/srt/managers/schedule_batch.py       |  56 ++++++++-
- python/sglang/srt/managers/scheduler.py            |  56 ++++++++-
- .../managers/scheduler_output_processor_mixin.py   | 137 ++++++++++++++++++---
+ python/sglang/srt/managers/scheduler.py            |  57 ++++++++-
+ .../managers/scheduler_output_processor_mixin.py   | 134 ++++++++++++++++++---
  python/sglang/srt/managers/tokenizer_manager.py    |  16 +++
  python/sglang/srt/managers/utils.py                |   5 +-
  .../srt/model_executor/forward_batch_info.py       |   5 +-
@@ -17,7 +17,7 @@ torchspec sglang patch (base: 0f2df9370a)
  python/sglang/srt/models/qwen3_next_mtp.py         |   3 +
  python/sglang/srt/server_args.py                   |  21 ++++
  .../sglang/srt/speculative/spec_training_info.py   |  50 ++++++++
- 17 files changed, 552 insertions(+), 27 deletions(-)
+ 17 files changed, 550 insertions(+), 27 deletions(-)
 
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
 index 8d7ab8716..b2e633016 100644
@@ -456,7 +456,7 @@ index 8f3441b1b..31489b445 100644
 +    # For spec training
 +    has_spec_training: bool = False
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index e818deaa4..0c89c718d 100644
+index e818deaa4..ca2c70e34 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -346,6 +346,26 @@ class Scheduler(
@@ -499,7 +499,7 @@ index e818deaa4..0c89c718d 100644
          self.is_initializing = False
  
      def init_model_config(self):
-@@ -727,6 +753,24 @@ class Scheduler(
+@@ -727,6 +753,25 @@ class Scheduler(
          self.forward_sleep_time = None
          self._engine_paused = False
  
@@ -525,7 +525,7 @@ index e818deaa4..0c89c718d 100644
      def init_chunked_prefill(self):
          # Init chunked prefill
          self.chunked_prefill_size = self.server_args.chunked_prefill_size
-@@ -1468,6 +1512,8 @@ class Scheduler(
+@@ -1468,6 +1513,8 @@ class Scheduler(
                  routing_key=recv_req.routing_key,
                  http_worker_ipc=recv_req.http_worker_ipc,
                  dllm_config=self.dllm_config,
@@ -534,7 +534,7 @@ index e818deaa4..0c89c718d 100644
              )
              req.tokenizer = self.tokenizer
  
-@@ -2276,7 +2322,10 @@ class Scheduler(
+@@ -2276,7 +2323,10 @@ class Scheduler(
                      batch_result.copy_done = self.device_module.Event()
                      if batch_result.delay_sample_func is None:
                          self.future_map.store_to_map(future_indices, batch_result)
@@ -546,7 +546,7 @@ index e818deaa4..0c89c718d 100644
                      else:
                          batch_result.future_indices = future_indices
  
-@@ -2385,7 +2434,10 @@ class Scheduler(
+@@ -2385,7 +2435,10 @@ class Scheduler(
              _batch_result = batch_result.delay_sample_func()
              assert _batch_result is batch_result
              self.future_map.store_to_map(batch_result.future_indices, batch_result)
@@ -559,7 +559,7 @@ index e818deaa4..0c89c718d 100644
      def process_batch_result(
          self,
 diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
-index d79f929d3..4f5a3e0b8 100644
+index d79f929d3..3eebfacb5 100644
 --- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 +++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
 @@ -180,21 +180,22 @@ class SchedulerOutputProcessorMixin:
@@ -599,7 +599,7 @@ index d79f929d3..4f5a3e0b8 100644
  
                      if req.grammar is not None:
                          # FIXME: this try-except block is for handling unexpected xgrammar issue.
-@@ -843,6 +844,74 @@ class SchedulerOutputProcessorMixin:
+@@ -843,6 +844,71 @@ class SchedulerOutputProcessorMixin:
          if req.input_token_ids_logprobs_idx is None:
              req.input_token_ids_logprobs_idx = []
  
@@ -671,7 +671,7 @@ index d79f929d3..4f5a3e0b8 100644
      def stream_output(
          self: Scheduler,
          reqs: List[Req],
-@@ -901,6 +970,18 @@ class SchedulerOutputProcessorMixin:
+@@ -901,6 +967,18 @@ class SchedulerOutputProcessorMixin:
          routed_experts = None
          customized_info = {}
  
@@ -690,7 +690,7 @@ index d79f929d3..4f5a3e0b8 100644
          queue_times = []
          forward_entry_times = []
          prefill_launch_delays = []
-@@ -1022,6 +1103,13 @@ class SchedulerOutputProcessorMixin:
+@@ -1022,6 +1100,13 @@ class SchedulerOutputProcessorMixin:
                      spec_verify_ct.append(req.spec_verify_ct)
                      spec_accepted_tokens.append(req.spec_accepted_tokens)
  
@@ -704,7 +704,7 @@ index d79f929d3..4f5a3e0b8 100644
                  if return_logprob:
                      if (
                          req.return_logprob
-@@ -1091,9 +1179,15 @@ class SchedulerOutputProcessorMixin:
+@@ -1091,9 +1176,15 @@ class SchedulerOutputProcessorMixin:
                          output_token_ids_logprobs_idx.append([])
  
                  if req.return_hidden_states:
@@ -723,7 +723,7 @@ index d79f929d3..4f5a3e0b8 100644
                  if req.return_routed_experts:
                      if routed_experts is None:
                          routed_experts = []
-@@ -1158,6 +1252,15 @@ class SchedulerOutputProcessorMixin:
+@@ -1158,6 +1249,15 @@ class SchedulerOutputProcessorMixin:
                      placeholder_tokens_val=None,
                      retraction_counts=retraction_counts,
                      load=load,
