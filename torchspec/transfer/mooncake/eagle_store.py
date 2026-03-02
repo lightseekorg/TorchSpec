@@ -128,6 +128,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         For GPU Direct send the path is synchronous (no DtoH needed).
         """
+        self._ensure_initialized()
         logger.debug("put: starting for key=%s", key)
         keys = [f"{key}_hs", f"{key}_ids"]
         tensors = [hidden_states, input_ids]
@@ -201,6 +202,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         ``_copy_stream``, the copies are typically finished by the time
         this is called — the wait is only for the (fast) RDMA transfer.
         """
+        self._ensure_initialized()
         if self._async_put_manager is None:
             return
         self._async_put_manager.check_last_error()
@@ -270,6 +272,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         Returns:
             Eagle3TargetOutput with the retrieved tensors.
         """
+        self._ensure_initialized()
+
         from torchspec.models.target.eagle3_target_model import Eagle3TargetOutput
 
         keys = [f"{key}_hs", f"{key}_ids"]

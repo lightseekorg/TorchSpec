@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import threading
 from abc import ABC
 from typing import Dict, Optional
 
@@ -47,6 +48,7 @@ class MooncakeHiddenStateStore(ABC):
         self.config = config
         self._store: Optional[MooncakeDistributedStore] = None
         self._initialized = False
+        self._init_event = threading.Event()
         self._registered_buffers: Dict[int, int] = {}
         self._host_buffer_pool: Optional[HostBufferPool] = None
         self._async_put_manager: Optional[AsyncPutManager] = None
@@ -115,6 +117,7 @@ class MooncakeHiddenStateStore(ABC):
             logger.info("DtoH copy stream created on %s", cuda_device)
 
         self._initialized = True
+        self._init_event.set()
         logger.info(
             "Mooncake Store client initialized (protocol=%s, device=%s, gpu_direct=%s, pool_size=%d)",
             self.config.protocol,
@@ -176,10 +179,18 @@ class MooncakeHiddenStateStore(ABC):
                 self._gpu_send_buffer.free()
                 self._gpu_send_buffer = None
 
-    def _ensure_initialized(self) -> None:
-        """Ensure the store is initialized."""
-        if not self._initialized:
-            self.setup()
+    def _ensure_initialized(self, timeout: float = 30.0) -> None:
+        """Block until setup() has completed (thread-safe via Event).
+
+        If setup() was called from a background thread, this will wait up to
+        *timeout* seconds for it to finish.  If nobody has called setup() yet,
+        falls back to calling it on the current thread.
+        """
+        if self._init_event.is_set():
+            return
+        if not self._init_event.wait(timeout=timeout):
+            if not self._initialized:
+                self.setup()
 
     def _register_buffer(self, buffer_ptr: int, size: int) -> bool:
         """Register a buffer for RDMA transfers."""
@@ -246,4 +257,5 @@ class MooncakeHiddenStateStore(ABC):
         if self._store is not None and hasattr(self._store, "close"):
             self._store.close()
         self._initialized = False
+        self._init_event.clear()
         self._gpu_direct_available = False

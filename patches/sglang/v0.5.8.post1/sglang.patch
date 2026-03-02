@@ -504,7 +504,6 @@ index e818deaa4..ca2c70e34 100644
          self._engine_paused = False
  
 +    def init_eagle_mooncake_store(self, device=None):
-+        self.eagle_mooncake_store = None
 +        if self.server_args.enable_spec_training_mooncake:
 +            try:
 +                from torchspec.transfer.mooncake import (
@@ -513,9 +512,10 @@ index e818deaa4..ca2c70e34 100644
 +                )
 +
 +                config = MooncakeConfig.from_env()
-+                self.eagle_mooncake_store = EagleMooncakeStore(config)
-+                self.eagle_mooncake_store.setup(device=device or self.device)
-+                self.eagle_mooncake_store.warmup_rdma()
++                store = EagleMooncakeStore(config)
++                store.setup(device=device or self.device)
++                store.warmup_rdma()
++                self.eagle_mooncake_store = store
 +                logger.info("EagleMooncakeStore initialized for spec training")
 +            except ImportError:
 +                logger.warning(

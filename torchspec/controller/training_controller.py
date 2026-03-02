@@ -197,7 +197,7 @@ class AsyncTrainingController:
             return len(dataset)
 
     def load_dataset(self, args) -> int:
-        """Load and process dataset on the controller, store for epoch reloads, and prime the prompt buffer."""
+        """Load and store dataset on the controller for later use."""
         from torchspec.data.dataset import load_conversation_dataset
 
         self._stored_dataset = load_conversation_dataset(args)
@@ -208,9 +208,13 @@ class AsyncTrainingController:
                 f"max_seq_length={getattr(args, 'max_seq_length', None)}, "
                 f"and chat_template settings."
             )
-        count = self.add_dataset(self._stored_dataset)
-        logger.info(f"Controller loaded dataset: {count} samples")
-        return count
+        logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
+        return len(self._stored_dataset)
+
+    def submit_training_dataset(self) -> int:
+        """Submit the stored training dataset to the prompt buffer for inference."""
+        assert self._stored_dataset is not None, "No stored dataset to submit"
+        return self.add_dataset(self._stored_dataset)
 
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""

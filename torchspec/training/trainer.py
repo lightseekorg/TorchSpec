@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import abc
+import concurrent.futures
 import dataclasses
 import itertools
 import logging
@@ -83,6 +84,9 @@ class Trainer(abc.ABC):
         self.max_dump_steps = getattr(args, "max_dump_steps", 5)
 
         self._enable_perf_metrics = getattr(args, "enable_perf_metrics", True)
+
+        self._io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._eval_cache_save_future: Optional[concurrent.futures.Future] = None
 
     # ------------------------------------------------------------------
     # Device mesh
@@ -213,14 +217,30 @@ class Trainer(abc.ABC):
     def save_eval_cache(self, cache_dir: str) -> None:
         if not getattr(self, "_eval_cache", None):
             return
-        os.makedirs(cache_dir, exist_ok=True)
-        path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
-        tmp_path = path + ".tmp"
-        torch.save(self._eval_cache, tmp_path)
-        os.replace(tmp_path, path)
-        logger.info(f"[Rank {self.dp_rank}] Saved {len(self._eval_cache)} eval batches to {path}")
+        self._wait_for_eval_cache_save()
+
+        cache_snapshot = list(self._eval_cache)
+        rank = self.dp_rank
+
+        def _save() -> None:
+            os.makedirs(cache_dir, exist_ok=True)
+            path = os.path.join(cache_dir, f"eval_rank_{rank}.pt")
+            tmp_path = path + ".tmp"
+            torch.save(cache_snapshot, tmp_path)
+            os.replace(tmp_path, path)
+            logger.info(f"[Rank {rank}] Saved {len(cache_snapshot)} eval batches to {path}")
+
+        self._eval_cache_save_future = self._io_executor.submit(_save)
+
+    def _wait_for_eval_cache_save(self) -> None:
+        fut = self._eval_cache_save_future
+        if fut is not None:
+            fut.result()
+            self._eval_cache_save_future = None
 
     def load_eval_cache(self, cache_dir: str) -> int:
+        # Safe guard to wait for eval cache save to complete.
+        self._wait_for_eval_cache_save()
         path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
         if not os.path.exists(path):
             return 0
@@ -377,6 +397,8 @@ class Trainer(abc.ABC):
         return checkpoint.load(self)
 
     def close(self) -> None:
+        self._wait_for_eval_cache_save()
+        self._io_executor.shutdown(wait=True)
         if self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):
             self.mooncake_store.close()
             logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore closed")

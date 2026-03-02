@@ -223,7 +223,7 @@ def run_training_loop(
             )
 
     inference_future = inference_manager.run.remote()
-    # Inference engine is alive.
+    # Inference engine is alive. Run eval hs generation first.
     if eval_enabled and not eval_cache_loaded:
         _generate_eval_cache(
             controller,
@@ -232,6 +232,10 @@ def run_training_loop(
             eval_samples_per_rank,
             eval_cache_path,
         )
+
+    # Submit training data AFTER eval hs generation so that training prompts don't
+    # leak into the inference pipeline during eval.
+    ray.get(controller.submit_training_dataset.remote())
 
     dp_size = (
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
