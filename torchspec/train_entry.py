@@ -21,6 +21,7 @@
 """Training entry point for Eagle3 speculative decoding."""
 
 import argparse
+import os
 import sys
 import time
 from collections import namedtuple
@@ -101,10 +102,10 @@ def parse_config():
     """Parse YAML config and convert to flat args.
 
     Supports configs with sections matching the Config dataclass:
-    model, dataset, training, debug, inference, logging, mooncake.
+    model, dataset, training, debug, inference, logging, mooncake, decode.
 
-    The config is flattened via config_to_flat_args(), with mooncake and
-    inference.sglang sections getting a name prefix (mooncake_*, sglang_*).
+    The config is flattened via config_to_flat_args(), with prefixed sections:
+    mooncake_*, sglang_*, decode_*.
     """
 
     parser = argparse.ArgumentParser(description="Eagle3 speculative decoding training")
@@ -145,6 +146,21 @@ def parse_config():
     return flat_args
 
 
+def _maybe_create_scratch_draft(args, train_group):
+    """Auto-create scratch draft checkpoint for inference engine if not provided."""
+    if (
+        getattr(args, "train_with_decode", False)
+        and getattr(args, "decode_speculative_algorithm", None)
+        and getattr(args, "decode_speculative_draft_model_path", None) is None
+    ):
+        scratch_dir = os.path.join(getattr(args, "output_dir", "./outputs"), "scratch_draft_model")
+        os.makedirs(scratch_dir, exist_ok=True)
+        logger.info(f"Auto-creating scratch draft checkpoint at {scratch_dir}")
+        train_group.save_draft_model_for_serving(scratch_dir)
+        args.decode_speculative_draft_model_path = scratch_dir
+        logger.info(f"Set decode_speculative_draft_model_path = {scratch_dir}")
+
+
 def _resolve_batch_size(args):
     """Derive dp_size, per_dp_rank_batch_size, dispatch_batch_size, and global_batch_size."""
     dp_size = (
@@ -175,14 +191,18 @@ def _get_draft_model_config(args):
 
 
 def train_async_no_generation(args):
-    """Entry point for Eagle3 distillation training without generation.
+    """Entry point for Eagle3 online training.
 
-    Uses distributed HFEngine Ray actors with placement groups for multi-node deployment.
-    Engines are scheduled across nodes and communicate via Ray.
-    Each engine stores tensors in mooncake and returns keys to AsyncInferenceManager.
-
-    Mooncake master is launched as a Ray actor to handle tensor storage coordination.
+    Supports prefill-only mode (default) and decode mode (train_with_decode=True)
+    with speculative decoding. Uses distributed Ray actors with placement groups.
+    Engines store tensors in mooncake and return keys to AsyncInferenceManager.
     """
+    if (
+        getattr(args, "train_with_decode", False)
+        and getattr(args, "inference_engine_type", "sgl") != "sgl"
+    ):
+        raise ValueError("train_with_decode=True requires inference_engine_type=sgl")
+
     init_tracking(args)
     timer = _InitTimer()
 
@@ -249,6 +269,12 @@ def train_async_no_generation(args):
         train_init_refs = train_group.async_init(
             args, role="training", mooncake_config=mooncake_config, with_ref=False
         )
+
+        # Decode mode: create scratch draft checkpoint before inference engines
+        # are prepared, since they need decode_speculative_draft_model_path on args.
+        # This blocks on train actor init (FSDP gather), so inference engines are
+        # dispatched after to maximize parallelism with the wait below.
+        _maybe_create_scratch_draft(args, train_group)
 
         inference_engines, engine_init_refs = prepare_inference_engines(
             args, pgs["inference"], mooncake_config

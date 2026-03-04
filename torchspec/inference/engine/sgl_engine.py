@@ -37,6 +37,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from torchspec.inference.engine.base import InferenceEngine
+from torchspec.inference.engine.sgl_engine_decode import SglDecodeEngineMixin
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids, get_free_port
@@ -61,7 +62,7 @@ _PROTECTED_ENGINE_KEYS = frozenset(
 )
 
 
-class SglEngine(InferenceEngine, RayActor):
+class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
     """Ray actor wrapper for sgl.Engine with distributed deployment support.
 
     Uses patched sglang's spec_training mode to generate training data and store
@@ -219,7 +220,6 @@ class SglEngine(InferenceEngine, RayActor):
         engine_kwargs.update(
             {
                 "model_path": self.args.target_model_path,
-                "disable_cuda_graph": True,
                 "disable_radix_cache": True,
                 "enable_return_hidden_states": True,
                 "enable_aux_hidden_states": True,
@@ -237,6 +237,13 @@ class SglEngine(InferenceEngine, RayActor):
                 **({"context_length": max_seq_length} if max_seq_length else {}),
             }
         )
+
+        # Decode mode: add speculative decoding and performance tuning params
+        self._train_with_decode = getattr(self.args, "train_with_decode", False)
+        if self._train_with_decode:
+            self._build_decode_engine_kwargs(engine_kwargs)
+        else:
+            engine_kwargs["disable_cuda_graph"] = True
 
         # Each engine needs 2 consecutive ports (service + NCCL).  Offset the
         # search start by rank so parallel engines on the same node never probe
@@ -496,7 +503,8 @@ class SglEngine(InferenceEngine, RayActor):
         """Get tensor shapes for mooncake metadata.
 
         Args:
-            seq_len: Sequence length for this sample (input length, not generated length).
+            seq_len: Sequence length for this sample (prompt length in prefill mode,
+                or prompt + completion - 1 in decode mode).
 
         Returns:
             Dict mapping tensor names to shapes.

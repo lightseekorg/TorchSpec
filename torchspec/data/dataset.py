@@ -57,7 +57,7 @@ def _init_tokenize_worker(
 
 def _tokenize_single(args):
     """Worker function — tokenize one sample."""
-    messages, max_length = args
+    messages, max_length, train_with_decode = args
     processed = _worker_state["preprocess"](
         _worker_state["tokenizer"],
         [messages],
@@ -66,6 +66,7 @@ def _tokenize_single(args):
         is_preformatted=False,
         include_attention_mask=False,
         use_packed_loss_mask=True,
+        add_generation_prompt=train_with_decode,
         return_formatted_text=True,
         last_turn_loss_only=_worker_state.get("last_turn_loss_only", False),
     )
@@ -95,10 +96,10 @@ def _format_single(args):
     """
     Worker function — format only, skip tokenization.
     """
-    messages, _ = args
+    messages, _, train_with_decode = args
     messages = _normalize_conversation(messages)
     parser = _worker_state["parser"]
-    formatted = parser.format(messages)
+    formatted = parser.format(messages, add_generation_prompt=train_with_decode)
     if not formatted:
         return None
     return {"formatted_prompt": formatted}
@@ -139,10 +140,11 @@ def load_conversation_dataset(args):
         st = os.stat(args.train_data_path)
         file_stat = f"-{st.st_size}-{st.st_mtime}"
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
+    train_with_decode = getattr(args, "train_with_decode", False)
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-{chat_template_name}-ltlo={last_turn_loss_only_flag}"
-        f"-defer={defer_tokenization}"
+        f"-defer={defer_tokenization}-decode={train_with_decode}"
     )
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
@@ -181,7 +183,7 @@ def load_conversation_dataset(args):
     )
 
     # Pass 2: process in parallel
-    work_items = [(messages, max_length) for _, messages, _ in raw_samples]
+    work_items = [(messages, max_length, train_with_decode) for _, messages, _ in raw_samples]
 
     if defer_tokenization:
         worker_init = _init_format_worker

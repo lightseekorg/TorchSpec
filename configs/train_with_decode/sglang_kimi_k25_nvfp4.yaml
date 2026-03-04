@@ -1,0 +1,103 @@
+# Kimi-K2.5 NVFP4 Eagle3 online training (train with decode mode)
+#
+# This extends the regular Kimi training to enable EAGLE3 speculative decoding:
+# the sgl.Engine loads both target and draft models, generates tokens with
+# speculative decoding, and captures hidden states during the full sequence
+# (prefill + decode) for training.
+#
+# GPU allocation:
+#   - 4 GPUs for inference (1 engine x TP=4, target + draft model)
+#   - 2 GPUs for training (FSDP/DP across 2 GPUs)
+#   - Total: 6 GPUs
+#
+# Usage:
+#   python -m torchspec.train_entry \
+#       --config configs/train_with_decode/sglang_kimi_k25_nvfp4.yaml
+
+model:
+  target_model_path: nvidia/Kimi-K2.5-NVFP4
+  trust_remote_code: true
+  lm_head_key: language_model.lm_head.weight
+  embedding_key: language_model.model.embed_tokens.weight
+  draft_model_config: configs/draft_models/kimi_k25_eagle3.json
+
+dataset:
+  train_data_path: liuhaotian/LLaVA-Instruct-150K
+  chat_template: kimi-k25-vlm
+  prompt_key: conversations
+
+training:
+  max_seq_length: 8192
+  seed: 42
+  micro_batch_size: 2
+  num_epochs: 1
+  save_interval: 500
+  learning_rate: 1e-4
+  warmup_ratio: 0.0
+  max_grad_norm: 1
+  ttt_length: 5
+  draft_accumulation_steps: 1
+  training_num_nodes: 1
+  training_num_gpus_per_node: 2
+  train_with_decode: true
+  attention_backend: flex_attention
+  max_concurrent_batches: 1
+  gradient_checkpointing: true
+
+inference:
+  inference_engine_type: sgl
+  inference_num_gpus: 4
+  inference_num_gpus_per_engine: 4
+  inference_num_gpus_per_node: 6
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 8
+  inference_batch_size: 8
+  sglang:
+    tp_size: 4
+    mem_fraction_static: 0.85
+    enable_multimodal: true
+    init_timeout: 1000
+    extra_args:
+      quantization: modelopt_fp4
+      kv_cache_dtype: fp8_e4m3
+      context_length: 262144
+      attention_backend: trtllm_mla
+      moe_runner_backend: flashinfer_trtllm
+      model_loader_extra_config:
+        enable_multithread_load: true
+        num_threads: 119
+      disable_flashinfer_autotune: true
+      disable_cuda_graph: false
+      log_requests: true
+      log_requests_level: 0
+      speculative_draft_attention_backend: flashinfer
+
+decode:
+  max_new_tokens: 512
+  temperature: 1.0
+  speculative_algorithm: EAGLE3
+  speculative_draft_model_path: null  # Auto-created from target model
+  speculative_num_steps: 5
+  speculative_eagle_topk: 1
+  speculative_num_draft_tokens: 6
+  weight_sync_enabled: true
+  weight_sync_interval: 10
+  cuda_graph_max_bs: 8
+  max_running_requests: 8
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  hidden_dim: 7168
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/kimi_k25_nvfp4_decode
+cache_dir: ./cache/kimi_k25_nvfp4_decode
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

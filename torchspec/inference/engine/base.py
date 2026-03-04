@@ -72,15 +72,6 @@ class InferenceEngine(ABC):
             List of dicts with mooncake_key or tensors.
         """
 
-    def update_weights_from_disk(self, model_path: str) -> dict:
-        """Update draft model weights from disk without restarting the engine.
-
-        Default implementation raises NotImplementedError.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support update_weights_from_disk"
-        )
-
     def get_mooncake_config(self):
         """Get the mooncake configuration.
 

@@ -116,6 +116,7 @@ class TrainingConfig:
     seed: int = 0
     train_backend: str = "fsdp"
     train_env_vars: str = "{}"
+    train_with_decode: bool = False
     training_num_gpus_per_node: int = 1
     training_num_nodes: int = 1
     ttt_length: int = 7
@@ -123,9 +124,29 @@ class TrainingConfig:
 
 
 @dataclass
+class DecodeConfig:
+    """Config for train-with-decode mode (speculative decoding during training)."""
+
+    cuda_graph_max_bs: Optional[int] = None
+    max_new_tokens: int = 512
+    max_running_requests: Optional[int] = None
+    speculative_algorithm: Optional[str] = None
+    speculative_draft_model_path: Optional[str] = None
+    speculative_eagle_topk: Optional[int] = None
+    speculative_num_draft_tokens: Optional[int] = None
+    speculative_num_steps: Optional[int] = None
+    temperature: float = 1.0
+    top_k: int = -1
+    top_p: float = 1.0
+    weight_sync_enabled: bool = False
+    weight_sync_interval: int = 500
+
+
+@dataclass
 class Config:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    decode: DecodeConfig = field(default_factory=DecodeConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -223,6 +244,7 @@ def load_config(
 
 # Sub-sections whose fields receive a name prefix when flattened.
 _PREFIXED_SECTIONS = {
+    "decode": "decode_",
     "mooncake": "mooncake_",
     "sglang": "sglang_",
 }
@@ -259,7 +281,7 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     # --- Computed / alias fields ---
     flat["world_size"] = flat["training_num_nodes"] * flat["training_num_gpus_per_node"]
     flat["rank"] = 0
-    flat["dynamic_loss_mask"] = flat["defer_tokenization"]
+    flat["dynamic_loss_mask"] = flat["defer_tokenization"] and not flat["train_with_decode"]
     flat["use_wandb"] = flat.get("use_wandb", False) or flat.get("report_to") == "wandb"
     flat["use_tensorboard"] = (
         flat.get("use_tensorboard", False) or flat.get("report_to") == "tensorboard"

@@ -20,6 +20,8 @@
 
 """Pipeline training loop: main training loop with sync training and async inference."""
 
+import shutil
+import tempfile
 import time
 
 import ray
@@ -33,6 +35,40 @@ from torchspec.controller.eval import (
     update_checkpoint_eval_meta,
 )
 from torchspec.utils.logging import logger
+
+
+def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines):
+    """Sync draft model weights to inference engines (decode mode only)."""
+    weight_sync_enabled = getattr(args, "decode_weight_sync_enabled", False)
+    weight_sync_interval = getattr(args, "decode_weight_sync_interval", 500)
+    if not (
+        getattr(args, "train_with_decode", False)
+        and weight_sync_enabled
+        and inference_engines
+        and weight_sync_interval > 0
+        and completed_steps > 0
+        and completed_steps % weight_sync_interval == 0
+    ):
+        return
+
+    # NOTE: uses local tmp dir; for multi-node, ensure output_dir is on shared filesystem.
+    tmp_dir = tempfile.mkdtemp(prefix="draft_weight_sync_")
+    try:
+        logger.info(f"Step {completed_steps}: saving draft model to {tmp_dir}")
+        train_group.save_draft_model_for_serving(tmp_dir)
+
+        logger.info(f"Step {completed_steps}: updating {len(inference_engines)} engine(s)")
+        update_results = ray.get(
+            [engine.update_weights_from_disk.remote(tmp_dir) for engine in inference_engines]
+        )
+        for i, res in enumerate(update_results):
+            log_fn = logger.info if res.get("success") else logger.warning
+            log_fn(f"Engine {i}: success={res.get('success')}, message={res.get('message')}")
+    except Exception:
+        logger.exception(f"Step {completed_steps}: weight sync failed, skipping")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info(f"Cleaned up temp dir {tmp_dir}")
 
 
 def _is_save_interval_step(step: int, interval: int) -> bool:
@@ -279,6 +315,8 @@ def training_loop(
                 best_eval_score = update_checkpoint_eval_meta(
                     args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                 )
+
+            _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines)
 
             # Check if epoch completed
             if steps_in_current_epoch >= steps_per_epoch:
