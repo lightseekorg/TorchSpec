@@ -68,6 +68,49 @@ class SGLangConfig:
 
 
 @dataclass
+class VllmConfig:
+    """Essential vLLM engine configuration.
+
+    Only fields that TorchSpec explicitly uses are listed here.
+    Any additional vLLM engine kwargs can be supplied via ``extra_args``
+    and will be forwarded as-is.
+
+    Uses vLLM's extract_hidden_states speculative config for hidden states retrieval.
+    """
+
+    # Parallelism
+    tp_size: int = 8
+    pp_size: int = 1
+    nnodes: int = 1
+
+    # Memory
+    mem_fraction_static: float = 0.8
+
+    # Observability
+    enable_metrics: bool = False
+
+    # Multimodal
+    enable_multimodal: bool = False
+
+    # Networking (port is auto-selected by VllmEngine)
+    dist_init_addr: Optional[str] = None
+    dist_timeout: int = 60
+    init_timeout: int = 300
+
+    # Hidden states extraction
+    num_speculative_tokens: int = 1
+
+    # Use worker extension for hidden states capture (new implementation)
+    # If False, falls back to LLM class with speculative_config
+    use_worker_extension: bool = True
+
+    # Passthrough: forwarded as-is to vLLM LLM.
+    # Use this for any vLLM kwarg that TorchSpec doesn't need to
+    # inspect (e.g. quantization, max_model_len, trust_remote_code, ...).
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class InferenceConfig:
     aux_hidden_states_layers: Optional[list] = None
     inference_batch_size: int = 1
@@ -79,6 +122,7 @@ class InferenceConfig:
     inference_num_gpus_per_node: int = 8
     max_sample_pool_size: int = 0
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
+    vllm: VllmConfig = field(default_factory=VllmConfig)
 
 
 @dataclass

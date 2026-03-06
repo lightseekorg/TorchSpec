@@ -333,7 +333,7 @@ def run_training_loop(
                     if step_time > 0:
                         metrics["perf/train_capacity"] = args.global_batch_size / step_time
 
-                if wandb.run is not None:
+                if getattr(wandb, "run", None) is not None:
                     wandb.log(metrics)
 
             # ── Eval at explicit interval (if configured) ─────────

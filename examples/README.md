@@ -17,10 +17,20 @@ If you just want to try TorchSpec locally, start with **hf-quickstart** (3 GPUs,
 ./examples/hf-quickstart/run.sh
 ```
 
-For production workloads with SGLang async inference, use **qwen3-8b-single-node**:
+For production workloads with async inference, use **qwen3-8b-single-node**:
 
 ```bash
 ./examples/qwen3-8b-single-node/run.sh
+```
+
+## Switching inference backends
+
+Examples use SGLang by default. To use vLLM instead:
+
+```bash
+# Use vLLM backend with qwen3-8b-single-node example
+./examples/qwen3-8b-single-node/run.sh \
+    --config configs/vllm_qwen3_8b.yaml \
 ```
 
 ## Data

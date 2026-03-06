@@ -1,0 +1,76 @@
+# Configuration for train_entry.py with vLLM Engine inference (nested config format)
+#
+# GPU allocation:
+#   - 2 GPUs for inference (duplicate mode: each engine has full model copy)
+#   - 2 GPUs for training (DP/FSDP: model sharded across 2 GPUs)
+#   - Total: 4 GPUs
+#
+# Installation:
+#   pip install -e ".[vllm]"  # Install vLLM backend
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/vllm_qwen3_8b.yaml
+#
+# Note: Uses vLLM Worker Extension to hook into model forward pass for hidden states capture.
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: examples/data/sample_conversations.jsonl
+  eval_data_path: examples/data/eval_conversations.jsonl
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+
+# Use GPUs 4-7 to avoid zombie process on GPU 0-1
+# GPU 4-5: inference (vLLM, TP=2)
+# GPU 6-7: training (DP=2)
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 16384
+  num_epochs: 1
+  seed: 42
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 2
+  inference_num_gpus_per_node: 4
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  vllm:
+    tp_size: 2
+    mem_fraction_static: 0.7
+    use_worker_extension: true
+    extra_args:
+      max_num_batched_tokens: 32768
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/vllm_qwen3_8b-single-node
+cache_dir: ./cache
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Train with SglEngine async inference (multi-GPU version)
+# Train with SGLang/vLLM async inference (multi-GPU version)
 #
 # GPU allocation (default: 4 GPUs total):
 #   - 2 GPUs for inference (duplicate mode: each engine has full model copy)
@@ -46,7 +46,7 @@ INFERENCE_GPUS=2
 LOCAL_IP=$(python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('8.8.8.8', 80)); print(s.getsockname()[0]); s.close()")
 
 echo "=============================================="
-echo "Train with SglEngine inference"
+echo "Train with async inference"
 echo "=============================================="
 echo "Config: $CONFIG_FILE (nested format)"
 echo "Total GPUs: $TOTAL_GPUS (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
@@ -59,11 +59,9 @@ echo "=============================================="
 python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
     training.training_num_gpus_per_node="$TRAIN_GPUS" \
-    inference.inference_engine_type="sgl" \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=2 \
     inference.inference_num_gpus_per_node="$TOTAL_GPUS" \
-    inference.sglang.tp_size=2 \
     "$@"
 
 echo "=============================================="

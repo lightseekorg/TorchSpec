@@ -211,6 +211,7 @@ def load_config(
 _PREFIXED_SECTIONS = {
     "mooncake": "mooncake_",
     "sglang": "sglang_",
+    "vllm": "vllm_",
 }
 
 

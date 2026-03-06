@@ -24,7 +24,8 @@ torchspec/
 │       ├── base.py          #     InferenceEngine (ABC)
 │       ├── hf_engine.py     #     HFEngine (Ray actor, inherits RayActor)
 │       ├── hf_runner.py     #     HFRunner (core inference logic)
-│       └── sgl_engine.py    #     SglEngine (Ray actor, inherits RayActor)
+│       ├── sgl_engine.py   #     SglEngine (Ray actor, inherits RayActor)
+│       └── vllm_engine.py   #     VllmEngine (Ray actor, uses vLLM extract_hidden_states)
 ├── models/                  # Model definitions
 │   ├── eagle3.py            #   Eagle3Model (core forward/loss)
 │   ├── draft/               #   Draft model implementations

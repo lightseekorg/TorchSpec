@@ -24,7 +24,7 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from torchspec.inference.engine.hf_engine import HFEngine
-from torchspec.inference.engine.sgl_engine import SglEngine
+from torchspec.inference.engine.vllm_engine import VllmEngine
 from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
@@ -36,7 +36,7 @@ _alive_worker_engines: list = []
 def create_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
     """Create inference engines based on configured engine type (blocking).
 
-    Supports "hf" and "sgl" engine types via inference_engine_type config.
+    Supports "hf", "sgl", and "vllm" engine types via inference_engine_type config.
 
     Returns:
         List of head engines used for dispatching requests. Multi-node TP
@@ -44,7 +44,7 @@ def create_inference_engines(args, inference_pg, mooncake_config, engine_group: 
     """
     engine_type = getattr(args, "inference_engine_type", "hf")
 
-    if engine_type not in ("hf", "sgl"):
+    if engine_type not in ("hf", "sgl", "vllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
     logger.info(f"Using {engine_type} engine for inference")
@@ -76,15 +76,19 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
     """
     engine_type = getattr(args, "inference_engine_type", "hf")
 
-    if engine_type not in ("hf", "sgl"):
+    if engine_type not in ("hf", "sgl", "vllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
     logger.info(f"Preparing {engine_type} inference engines...")
 
     if engine_type == "hf":
         engines, init_refs = _prepare_hf_engines(args, inference_pg, mooncake_config, engine_group)
-    else:
+    elif engine_type == "sgl":
         engines, init_refs = _prepare_sgl_engines(args, inference_pg, mooncake_config, engine_group)
+    else:
+        engines, init_refs = _prepare_vllm_engines(
+            args, inference_pg, mooncake_config, engine_group
+        )
 
     return engines, init_refs
 
@@ -95,7 +99,7 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group:
     Args:
         args: Configuration arguments.
         pg: Placement group tuple (pg, reordered_bundle_indices, reordered_gpu_ids).
-        engine_type: Engine type ("hf" or "sgl").
+        engine_type: Engine type ("hf", "sgl", or "vllm").
         mooncake_config: MooncakeConfig object.
 
     Returns:
@@ -105,6 +109,8 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group:
         return _init_hf_engines(args, pg, mooncake_config, engine_group)
     elif engine_type == "sgl":
         return _init_sgl_engines(args, pg, mooncake_config, engine_group)
+    elif engine_type == "vllm":
+        return _init_vllm_engines(args, pg, mooncake_config, engine_group)
     else:
         raise ValueError(f"Unknown engine_type: {engine_type}")
 
@@ -160,6 +166,8 @@ def _prepare_sgl_engines(
         accept generate() calls. init_handles are ObjectRefs for ALL engines
         (head + worker) that must be waited on before use.
     """
+    from torchspec.inference.engine.sgl_engine import SglEngine
+
     nnodes = getattr(args, "sglang_nnodes", 1)
     num_gpus_total = getattr(args, "inference_num_gpus", 1)
 
@@ -265,6 +273,125 @@ def _init_sgl_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> 
     nnodes = getattr(args, "sglang_nnodes", 1)
     init_timeout = getattr(args, "sglang_init_timeout", 300 if nnodes == 1 else 600)
     _wait_for_init(init_handles, "Sgl", timeout=init_timeout)
+    return head_engines
+
+
+def _prepare_vllm_engines(
+    args, pg, mooncake_config=None, engine_group: int = 0
+) -> tuple[list, list]:
+    """Create vLLM engine actors and fire init calls without waiting.
+
+    Handles three cases:
+      - Single-node, multiple engines: one engine per group of GPUs
+      - Multi-node, single replica: one engine per node, all forming one TP group
+      - Multi-node, multiple replicas: N independent TP groups, each spanning nnodes
+
+    For multi-node, worker engines are stored in a module-level list to prevent GC.
+
+    Returns:
+        Tuple of (head_engines, init_handles). head_engines are the engines that
+        accept generate() calls. init_handles are ObjectRefs for ALL engines
+        (head + worker) that must be waited on before use.
+    """
+    nnodes = getattr(args, "vllm_nnodes", 1)
+    num_gpus_total = getattr(args, "inference_num_gpus", 1)
+
+    if nnodes > 1:
+        gpus_per_node = getattr(args, "inference_num_gpus_per_node", 8)
+        gpus_per_replica = nnodes * gpus_per_node
+        num_replicas = num_gpus_total // gpus_per_replica
+        num_engines = num_replicas * nnodes
+        gpus_per_engine = gpus_per_node
+    else:
+        gpus_per_engine = getattr(args, "inference_num_gpus_per_engine", 1)
+        num_replicas = num_gpus_total // gpus_per_engine
+        num_engines = num_replicas
+
+    logger.info(
+        f"Initializing {num_engines} vLLM engines "
+        f"({gpus_per_engine} GPU(s) each, nnodes={nnodes}, replicas={num_replicas})"
+    )
+
+    pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
+    VllmRayActor = ray.remote(VllmEngine)
+    env_vars = get_torchspec_env_vars()
+
+    engines = []
+    for i in range(num_engines):
+        node_rank = i % nnodes if nnodes > 1 else 0
+
+        bundle_offset = i * gpus_per_engine
+        base_gpu_id = int(reordered_gpu_ids[bundle_offset])
+
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg_obj,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=reordered_bundle_indices[bundle_offset],
+        )
+
+        engine = VllmRayActor.options(
+            num_cpus=0.2,
+            num_gpus=0.2,
+            scheduling_strategy=scheduling_strategy,
+            runtime_env={"env_vars": env_vars},
+        ).remote(
+            args=args,
+            rank=i,
+            base_gpu_id=base_gpu_id,
+            num_gpus_per_engine=gpus_per_engine,
+            node_rank=node_rank,
+            engine_group=engine_group,
+        )
+        engines.append(engine)
+
+    dist_init_addrs: dict[int, str] = {}
+    if nnodes > 1:
+        configured_addr = getattr(args, "vllm_dist_init_addr", None)
+        for replica_idx in range(num_replicas):
+            if configured_addr and num_replicas == 1:
+                dist_init_addrs[replica_idx] = configured_addr
+                logger.info(
+                    f"Replica {replica_idx}: using configured dist_init_addr: {configured_addr}"
+                )
+            else:
+                head_engine = engines[replica_idx * nnodes]
+                ip, port = ray.get(
+                    [head_engine.get_node_ip.remote(), head_engine.find_free_port.remote()],
+                    timeout=30,
+                )
+                addr = f"{ip}:{port}"
+                dist_init_addrs[replica_idx] = addr
+                logger.info(f"Replica {replica_idx}: auto-negotiated dist_init_addr: {addr}")
+
+    init_handles = []
+    for i, engine in enumerate(engines):
+        replica_idx = i // nnodes if nnodes > 1 else i
+        init_handles.append(
+            engine.init.remote(
+                mooncake_config=mooncake_config,
+                dist_init_addr=dist_init_addrs.get(replica_idx),
+            )
+        )
+
+    if nnodes > 1:
+        head_engines = [engines[i] for i in range(num_engines) if i % nnodes == 0]
+        worker_engines = [engines[i] for i in range(num_engines) if i % nnodes != 0]
+        _alive_worker_engines.extend(worker_engines)
+        logger.info(
+            f"Prepared multi-node vLLM engines: {len(head_engines)} heads + "
+            f"{len(worker_engines)} workers ({num_replicas} replicas)"
+        )
+        return head_engines, init_handles
+
+    return engines, init_handles
+
+
+def _init_vllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
+    """Initialize vLLM engines with Ray placement groups (blocking)."""
+    head_engines, init_handles = _prepare_vllm_engines(args, pg, mooncake_config, engine_group)
+    nnodes = getattr(args, "vllm_nnodes", 1)
+    init_timeout = getattr(args, "vllm_init_timeout", 300 if nnodes == 1 else 600)
+    _wait_for_init(init_handles, "Vllm", timeout=init_timeout)
     return head_engines
 
 

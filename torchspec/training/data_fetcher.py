@@ -74,7 +74,17 @@ class MooncakeDataset(IterableDataset):
 
     def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
         """Load tensors from mooncake key into device memory."""
-        dtypes = sample.tensor_dtypes or {}
+        dtypes_raw = sample.tensor_dtypes or {}
+
+        # Convert string dtypes to torch.dtype objects
+        dtypes = {}
+        for key, dtype_val in dtypes_raw.items():
+            if isinstance(dtype_val, str):
+                # Handle "bfloat16" or "torch.bfloat16" format
+                dtype_str = dtype_val.replace("torch.", "")
+                dtypes[key] = getattr(torch, dtype_str)
+            else:
+                dtypes[key] = dtype_val
 
         # DEBUG: Print the shapes we're requesting
         logger.debug(

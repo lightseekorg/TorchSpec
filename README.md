@@ -8,18 +8,52 @@ TorchSpec is a torch-native speculative decoding training framework. We introduc
 
 ## Setup
 
+### Choose Your Backend
+
+TorchSpec supports two inference backends:
+
+| Backend | Best For | Installation |
+|---------|----------|--------------|
+| **SGLang** | Production workloads, high throughput | `./tools/build_conda.sh 1 sglang` (default) |
+| **vLLM** | Flexibility, easier deployment | `./tools/build_conda.sh 1 vllm` |
+| **Both** | Development, comparison testing | `./tools/build_conda.sh 1 both` |
+
+### Quick Setup
+
 ```bash
+# Install with SGLang (default)
 ./tools/build_conda.sh
+micromamba activate torchspec
+
+# Or install with vLLM
+./tools/build_conda.sh 1 vllm
 micromamba activate torchspec
 ```
 
-To install into your current environment instead: `./tools/build_conda.sh current`
+To install into your current environment instead:
+```bash
+./tools/build_conda.sh current sglang  # or 'vllm' or 'both'
+```
 
 Optional — install Flash Attention:
 
 ```bash
 pip install -e ".[fa]"
 ```
+
+### Backend-Specific Usage
+
+**SGLang (default):**
+```bash
+./examples/qwen3-8b-single-node/run.sh
+```
+
+**vLLM:**
+```bash
+./examples/qwen3-8b-single-node/run.sh --config configs/vllm_qwen3_8b.yaml
+```
+
+TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model's forward pass and capture hidden states directly in the worker processes. This avoids RPC serialization issues and enables reliable hidden states extraction.
 
 ## Quick Start
 

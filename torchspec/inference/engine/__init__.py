@@ -21,7 +21,11 @@
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.inference.engine.hf_engine import HFEngine
 from torchspec.inference.engine.hf_runner import HFRunner
-from torchspec.inference.engine.sgl_engine import SglEngine
+
+try:
+    from torchspec.inference.engine.sgl_engine import SglEngine
+except ModuleNotFoundError:
+    SglEngine = None
 
 __all__ = [
     "InferenceEngine",
