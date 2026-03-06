@@ -65,7 +65,9 @@ def verify_from_mooncake(mooncake_store, keys, seq_lens, hidden_dim, last_hidden
         }
         data = mooncake_store.get(key, shapes=shapes, dtypes=dtypes, device="cuda")
         print(f"\n  Key: {key}")
-        print(f"    hidden_states: shape={data.hidden_states.shape}, dtype={data.hidden_states.dtype}")
+        print(
+            f"    hidden_states: shape={data.hidden_states.shape}, dtype={data.hidden_states.dtype}"
+        )
         print(f"    input_ids: {data.input_ids.tolist()[:10]}{'...' if seq_len > 10 else ''}")
         print(f"    last_hidden_states: shape={data.last_hidden_states.shape}")
 
@@ -203,7 +205,7 @@ if __name__ == "__main__":
         did = prompt_data_ids[i]
         request_metadata[did] = len(output.prompt_token_ids)
         input_ids_map[did] = list(output.prompt_token_ids)
-        print(f"  Request {i}: \"{text_prompts[i]}\" -> {len(output.prompt_token_ids)} tokens")
+        print(f'  Request {i}: "{text_prompts[i]}" -> {len(output.prompt_token_ids)} tokens')
     engine.collective_rpc("_set_request_metadata", args=(request_metadata, {}, input_ids_map))
 
     metadata = collect_metadata(engine)

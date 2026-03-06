@@ -25,7 +25,6 @@ Uses Worker Extension mode with MultiprocExecutor for reliable hidden states
 extraction via model.forward patching in worker processes.
 """
 
-import os
 import socket
 
 import ray

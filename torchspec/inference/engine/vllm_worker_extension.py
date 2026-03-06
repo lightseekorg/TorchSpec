@@ -464,9 +464,7 @@ class VllmWorkerExtension:
             if captured == expected:
                 self._prefill_complete = True
             elif captured > expected:
-                logger.warning(
-                    f"Captured more tokens than expected: {captured} > {expected}"
-                )
+                logger.warning(f"Captured more tokens than expected: {captured} > {expected}")
 
     def _store_input_ids(self, input_ids: torch.Tensor) -> None:
         """Store input_ids from a forward pass.
@@ -568,7 +566,9 @@ class VllmWorkerExtension:
         self._packed_loss_mask_map = {}
         self._input_ids_map = {}
 
-    def _store_and_get_metadata(self, internal_to_external: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Dict[str, Any]]]:
+    def _store_and_get_metadata(
+        self, internal_to_external: Optional[Dict[str, str]] = None
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
         """Store captured hidden states to Mooncake and return metadata.
 
         This method stores tensors directly to Mooncake from the worker process,
@@ -613,7 +613,9 @@ class VllmWorkerExtension:
             concatenated_last_hs = torch.cat(self._captured_last_hs, dim=0)
 
         internal_to_external = internal_to_external or {}
-        ext_token_counts = dict(self._current_request_metadata) if self._current_request_metadata else {}
+        ext_token_counts = (
+            dict(self._current_request_metadata) if self._current_request_metadata else {}
+        )
 
         # Build worker-visible ID -> external ID lookup once.
         # In V1, the worker sees "{counter}-{uuid8}" while internal_to_external
@@ -641,7 +643,9 @@ class VllmWorkerExtension:
 
         # Fallback if _request_metadata didn't produce results
         if not request_slices and ext_token_counts:
-            logger.warning("Internal request metadata mapping failed; falling back to external order")
+            logger.warning(
+                "Internal request metadata mapping failed; falling back to external order"
+            )
             for ext_id, n_tokens in ext_token_counts.items():
                 request_slices.append((ext_id, n_tokens))
 
