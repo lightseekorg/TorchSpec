@@ -70,6 +70,7 @@ class MooncakeConfig:
     get_retry_wait_seconds: float = 0.5
     get_retry_log_interval_seconds: float = 10.0
     get_retry_max_wait_seconds: float = 60.0
+    kv_lease_ttl_s: float = 5.0
 
     def __post_init__(self):
         # Coerce size fields: accept str ("4GB") or int
@@ -144,6 +145,7 @@ class MooncakeConfig:
             "get_batch_size": getattr(
                 args, "mooncake_get_batch_size", getattr(args, "per_dp_rank_batch_size", 1)
             ),
+            "kv_lease_ttl_s": getattr(args, "mooncake_kv_lease_ttl_s", 5.0),
             "max_seq_len": getattr(
                 args,
                 "mooncake_max_seq_len",

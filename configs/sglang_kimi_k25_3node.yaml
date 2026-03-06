@@ -55,7 +55,6 @@ inference:
     init_timeout: 1800
     dist_timeout: 600
     extra_args:
-      context_length: 262144
       model_loader_extra_config:
         enable_multithread_load: true
         num_threads: 32
@@ -73,7 +72,7 @@ mooncake:
   # enable_gpu_direct: true
 
 output_dir: ./outputs/train_kimi25_mixed_3node
-cache_dir: ./cache
+cache_dir: ./cache/train_kimi25_mixed_3node
 model_download_dir: null
 
 debug:

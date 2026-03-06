@@ -57,17 +57,6 @@ def setup_async_training_with_engines(
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
     )
 
-    if args.dispatch_batch_size < dp_size:
-        raise ValueError(
-            f"dispatch_batch_size ({args.dispatch_batch_size}) must be >= dp_size ({dp_size}). "
-            f"Each DP rank needs at least 1 sample per dispatch."
-        )
-    if args.dispatch_batch_size % dp_size != 0:
-        raise ValueError(
-            f"dispatch_batch_size ({args.dispatch_batch_size}) must be divisible by dp_size ({dp_size}). "
-            f"Cannot evenly distribute samples across DP ranks."
-        )
-
     if controller is None:
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -90,9 +79,10 @@ def setup_async_training_with_engines(
         train_queues, mooncake_config, per_dp_rank_batch_size=args.per_dp_rank_batch_size
     )
 
-    eval_per_dp = getattr(args, "eval_per_dp_rank_batch_size", args.per_dp_rank_batch_size)
     eval_queues = ray.get(controller.get_eval_queues.remote())
-    train_group.set_eval_queues(eval_queues, mooncake_config, per_dp_rank_batch_size=eval_per_dp)
+    # eval_from_cache re-collates individual samples with eval_micro_batch_size,
+    # so the fetcher must yield unbatched (batch_size=1) entries.
+    train_group.set_eval_queues(eval_queues, mooncake_config, per_dp_rank_batch_size=1)
 
     return controller, inference_manager
 
@@ -102,7 +92,7 @@ def auto_calculate_training_steps(args, dataset_size: int):
 
     All step counts are in optimizer steps (not dispatches).
     steps_per_epoch = dataset_size // global_batch_size
-    where global_batch_size = dispatch_batch_size * draft_accumulation_steps.
+    where global_batch_size = per_dp_rank_batch_size * dp_size * draft_accumulation_steps.
 
     If num_train_steps is set by user, num_epochs is calculated from it.
     Otherwise: lr_total_steps = steps_per_epoch * num_epochs
@@ -142,7 +132,7 @@ def auto_calculate_training_steps(args, dataset_size: int):
         f"Training steps (optimizer steps): num_train_steps={args.num_train_steps}, "
         f"lr_total_steps={args.lr_total_steps} "
         f"(dataset_size={dataset_size}, global_batch_size={global_batch_size}, "
-        f"dispatch_batch_size={args.dispatch_batch_size}, "
+        f"per_dp_rank_batch_size={args.per_dp_rank_batch_size}, "
         f"accumulation_steps={accumulation_steps}, "
         f"steps_per_epoch={steps_per_epoch}, num_epochs={args.num_epochs})"
     )

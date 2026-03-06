@@ -113,8 +113,8 @@ class TestEstimateTensorBytes:
 class MockControllerArgs:
     """Mock args for AsyncTrainingController."""
 
-    dispatch_batch_size: int = 4
-    eval_dispatch_batch_size: int = 4
+    per_dp_rank_batch_size: int = 4
+    max_sample_pool_size: int = 0
 
 
 def _create_mock_inference_output(
@@ -151,10 +151,10 @@ def _create_controller_class():
 class TestAsyncTrainingControllerPoolBytes:
     """Tests for pool byte tracking in AsyncTrainingController."""
 
-    def _create_controller(self, dispatch_batch_size: int = 4):
+    def _create_controller(self, per_dp_rank_batch_size: int = 4):
         """Create controller without Ray remote decorator."""
         AsyncTrainingController = _create_controller_class()
-        args = MockControllerArgs(dispatch_batch_size=dispatch_batch_size)
+        args = MockControllerArgs(per_dp_rank_batch_size=per_dp_rank_batch_size)
         return AsyncTrainingController(args, dp_size=1)
 
     def test_initial_pool_bytes_is_zero(self):
@@ -270,13 +270,13 @@ class TestAsyncTrainingControllerPoolBytes:
 class TestAsyncTrainingControllerDispatchDecreasesBytes:
     """Tests that dispatch reduces pool bytes."""
 
-    def _create_controller(self, dispatch_batch_size: int = 2):
+    def _create_controller(self, per_dp_rank_batch_size: int = 2):
         AsyncTrainingController = _create_controller_class()
-        args = MockControllerArgs(dispatch_batch_size=dispatch_batch_size)
+        args = MockControllerArgs(per_dp_rank_batch_size=per_dp_rank_batch_size)
         return AsyncTrainingController(args, dp_size=1)
 
     def test_dispatch_reduces_pool_bytes(self):
-        controller = self._create_controller(dispatch_batch_size=2)
+        controller = self._create_controller(per_dp_rank_batch_size=2)
 
         results = [
             _create_mock_inference_output(
@@ -301,7 +301,7 @@ class TestAsyncTrainingControllerDispatchDecreasesBytes:
         assert remaining_bytes == 2 * per_sample_bytes
 
     def test_dispatch_removes_correct_bytes_for_varying_sizes(self):
-        controller = self._create_controller(dispatch_batch_size=2)
+        controller = self._create_controller(per_dp_rank_batch_size=2)
 
         results = [
             _create_mock_inference_output(
@@ -339,7 +339,7 @@ class TestAsyncTrainingControllerDispatchDecreasesBytes:
         assert remaining_bytes == bytes_sample2
 
     def test_dispatch_all_samples_returns_zero_bytes(self):
-        controller = self._create_controller(dispatch_batch_size=2)
+        controller = self._create_controller(per_dp_rank_batch_size=2)
 
         results = [
             _create_mock_inference_output(
@@ -357,7 +357,7 @@ class TestAsyncTrainingControllerDispatchDecreasesBytes:
         assert controller.get_pool_bytes() == 0
 
     def test_multiple_dispatches_reduce_bytes_correctly(self):
-        controller = self._create_controller(dispatch_batch_size=2)
+        controller = self._create_controller(per_dp_rank_batch_size=2)
 
         results = [
             _create_mock_inference_output(
@@ -384,7 +384,7 @@ class TestAsyncTrainingControllerDispatchDecreasesBytes:
         assert controller.get_pool_bytes() == 0
 
     def test_failed_dispatch_does_not_change_bytes(self):
-        controller = self._create_controller(dispatch_batch_size=4)
+        controller = self._create_controller(per_dp_rank_batch_size=4)
 
         results = [
             _create_mock_inference_output(
@@ -407,9 +407,9 @@ class TestAsyncTrainingControllerDispatchDecreasesBytes:
 class TestPoolBytesThreadSafety:
     """Tests for thread safety of pool byte tracking."""
 
-    def _create_controller(self, dispatch_batch_size: int = 4):
+    def _create_controller(self, per_dp_rank_batch_size: int = 4):
         AsyncTrainingController = _create_controller_class()
-        args = MockControllerArgs(dispatch_batch_size=dispatch_batch_size)
+        args = MockControllerArgs(per_dp_rank_batch_size=per_dp_rank_batch_size)
         return AsyncTrainingController(args, dp_size=1)
 
     def test_concurrent_pushes_maintain_consistency(self):
@@ -443,9 +443,9 @@ class TestPoolBytesThreadSafety:
 class TestEmptyTensorShapes:
     """Tests for edge cases with empty tensor shapes."""
 
-    def _create_controller(self, dispatch_batch_size: int = 2):
+    def _create_controller(self, per_dp_rank_batch_size: int = 2):
         AsyncTrainingController = _create_controller_class()
-        args = MockControllerArgs(dispatch_batch_size=dispatch_batch_size)
+        args = MockControllerArgs(per_dp_rank_batch_size=per_dp_rank_batch_size)
         return AsyncTrainingController(args, dp_size=1)
 
     def test_push_result_with_empty_shapes(self):
@@ -478,6 +478,182 @@ class TestEmptyTensorShapes:
         returned_bytes = controller.push_inference_results([result])
         assert returned_bytes == 0
         assert controller.get_pool_size() == 1
+
+
+class TestEvalDispatch:
+    """Tests for eval dispatch pipeline in AsyncTrainingController."""
+
+    def _create_controller(self, per_dp_rank_batch_size=4, max_sample_pool_size=4, dp_size=4):
+        AsyncTrainingController = _create_controller_class()
+        args = MockControllerArgs(
+            per_dp_rank_batch_size=per_dp_rank_batch_size,
+            max_sample_pool_size=max_sample_pool_size,
+        )
+        return AsyncTrainingController(args, dp_size=dp_size)
+
+    def _setup_eval_and_push(self, controller, num_samples):
+        """Set up eval dataset, push all inference results, return the eval data_ids."""
+        dataset = [{"prompt": f"eval prompt {i}", "data_id": f"s{i}"} for i in range(num_samples)]
+        controller.set_eval_dataset(dataset)
+
+        eval_data_ids = sorted(controller._eval_data_ids)
+        results = [
+            _create_mock_inference_output(
+                data_id=data_id,
+                mooncake_key=f"mc_{data_id}",
+                tensor_shapes={"hidden": (1, 128, 4096)},
+                tensor_dtypes={"hidden": torch.bfloat16},
+            )
+            for data_id in eval_data_ids
+        ]
+        controller.push_inference_results(results)
+        return eval_data_ids
+
+    def test_get_pool_size_includes_eval(self):
+        controller = self._create_controller()
+
+        train_results = [
+            _create_mock_inference_output(
+                data_id=f"train-{i}",
+                mooncake_key=f"key-train-{i}",
+                tensor_shapes={"hidden": (1, 128, 4096)},
+                tensor_dtypes={"hidden": torch.bfloat16},
+            )
+            for i in range(2)
+        ]
+        controller.push_inference_results(train_results)
+
+        self._setup_eval_and_push(controller, 3)
+
+        assert controller.get_pool_size() == 2 + 3
+
+    def test_try_dispatch_eval_batch_happy_path(self):
+        controller = self._create_controller(max_sample_pool_size=4)
+        self._setup_eval_and_push(controller, 4)
+
+        assert controller.try_dispatch_eval_batch() is True
+
+        from torchspec.training.data_fetcher import TrainSample
+
+        for q in controller.eval_queues:
+            sample = q.get(timeout=5)
+            assert isinstance(sample, TrainSample)
+
+    def test_try_dispatch_eval_batch_insufficient_samples(self):
+        controller = self._create_controller(max_sample_pool_size=4)
+        self._setup_eval_and_push(controller, 2)
+
+        assert controller.try_dispatch_eval_batch() is False
+
+    def test_finalize_eval_dispatch_all_arrived_and_drained(self):
+        controller = self._create_controller(max_sample_pool_size=4, dp_size=4)
+        self._setup_eval_and_push(controller, 4)
+
+        assert controller.try_dispatch_eval_batch() is True
+        controller.finalize_eval_dispatch()
+
+        assert controller.get_eval_pool_size() == 0
+        assert len(controller._eval_data_ids) == 0
+        assert controller._eval_expected_count == 0
+
+    def test_finalize_eval_dispatch_fails_when_still_in_flight(self):
+        controller = self._create_controller(max_sample_pool_size=4)
+
+        dataset = [{"prompt": f"eval prompt {i}", "data_id": f"s{i}"} for i in range(8)]
+        controller.set_eval_dataset(dataset)
+
+        partial_ids = sorted(controller._eval_data_ids)[:4]
+        results = [
+            _create_mock_inference_output(
+                data_id=data_id,
+                mooncake_key=f"mc_{data_id}",
+                tensor_shapes={"hidden": (1, 128, 4096)},
+                tensor_dtypes={"hidden": torch.bfloat16},
+            )
+            for data_id in partial_ids
+        ]
+        controller.push_inference_results(results)
+
+        assert controller.try_dispatch_eval_batch() is True
+        with pytest.raises(AssertionError, match="before all samples arrived"):
+            controller.finalize_eval_dispatch()
+
+    def test_finalize_eval_dispatch_drops_remainder(self):
+        controller = self._create_controller(max_sample_pool_size=4, dp_size=4)
+        self._setup_eval_and_push(controller, 6)
+
+        controller.try_dispatch_eval_batch()
+
+        assert controller.get_eval_pool_size() == 2
+        assert len(controller._eval_data_ids) > 0
+
+        controller.finalize_eval_dispatch()
+
+        assert controller.get_eval_pool_size() == 0
+        assert len(controller._eval_data_ids) == 0
+        assert controller._eval_expected_count == 0
+        assert controller._eval_dispatched_samples == 0
+
+    def test_eval_does_not_contaminate_training_pool(self):
+        controller = self._create_controller()
+        self._setup_eval_and_push(controller, 4)
+
+        assert len(controller.sample_pool) == 0
+        assert len(controller.eval_pool) == 4
+
+
+class TestEvalEndToEnd:
+    """End-to-end eval flow: set_eval_dataset → push results → dispatch batches → finalize."""
+
+    def _create_controller(self, max_sample_pool_size=2, dp_size=2):
+        AsyncTrainingController = _create_controller_class()
+        args = MockControllerArgs(
+            per_dp_rank_batch_size=4,
+            max_sample_pool_size=max_sample_pool_size,
+        )
+        return AsyncTrainingController(args, dp_size=dp_size)
+
+    def test_full_chunked_drain(self):
+        controller = self._create_controller(max_sample_pool_size=2)
+
+        num_samples = 7
+        dataset = [{"prompt": f"eval prompt {i}", "data_id": f"e{i}"} for i in range(num_samples)]
+        controller.set_eval_dataset(dataset)
+
+        eval_data_ids = sorted(controller._eval_data_ids)
+        results = [
+            _create_mock_inference_output(
+                data_id=data_id,
+                mooncake_key=f"mc_{data_id}",
+                tensor_shapes={"hidden": (1, 128, 4096)},
+                tensor_dtypes={"hidden": torch.bfloat16},
+            )
+            for data_id in eval_data_ids
+        ]
+        controller.push_inference_results(results)
+
+        dispatched_count = 0
+        while controller.try_dispatch_eval_batch():
+            dispatched_count += 1
+
+        assert dispatched_count == 3
+        assert controller._eval_dispatched_samples == 6
+
+        assert controller.get_eval_pool_size() == 1
+
+        controller.finalize_eval_dispatch()
+
+        assert controller.get_eval_pool_size() == 0
+        assert len(controller._eval_data_ids) == 0
+        assert controller._eval_expected_count == 0
+        assert controller._eval_dispatched_samples == 0
+
+        from torchspec.training.data_fetcher import TrainSample
+
+        for q in controller.eval_queues:
+            for _ in range(3):
+                sample = q.get(timeout=5)
+                assert isinstance(sample, TrainSample)
 
 
 if __name__ == "__main__":

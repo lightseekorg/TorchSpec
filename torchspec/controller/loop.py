@@ -20,27 +20,85 @@
 
 """Pipeline training loop: main training loop with sync training and async inference."""
 
-import hashlib
-import os
+import shutil
+import tempfile
 import time
-from pathlib import Path
 
 import ray
 import wandb
 from tqdm import tqdm
 
-from torchspec.training.checkpoint import (
-    _read_checkpoint_metadata,
-    _write_checkpoint_metadata,
+from torchspec.controller.eval import (
+    generate_eval_cache,
+    run_eval,
+    setup_eval,
+    update_checkpoint_eval_meta,
 )
 from torchspec.utils.logging import logger
+
+
+def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines):
+    """Sync draft model weights to inference engines (decode mode only)."""
+    weight_sync_enabled = getattr(args, "decode_weight_sync_enabled", False)
+    weight_sync_interval = getattr(args, "decode_weight_sync_interval", 500)
+    if not (
+        getattr(args, "train_with_decode", False)
+        and weight_sync_enabled
+        and inference_engines
+        and weight_sync_interval > 0
+        and completed_steps > 0
+        and completed_steps % weight_sync_interval == 0
+    ):
+        return
+
+    # NOTE: uses local tmp dir; for multi-node, ensure output_dir is on shared filesystem.
+    tmp_dir = tempfile.mkdtemp(prefix="draft_weight_sync_")
+    try:
+        logger.info(f"Step {completed_steps}: saving draft model to {tmp_dir}")
+        train_group.save_draft_model_for_serving(tmp_dir)
+
+        logger.info(f"Step {completed_steps}: updating {len(inference_engines)} engine(s)")
+        update_results = ray.get(
+            [engine.update_weights_from_disk.remote(tmp_dir) for engine in inference_engines]
+        )
+        for i, res in enumerate(update_results):
+            log_fn = logger.info if res.get("success") else logger.warning
+            log_fn(f"Engine {i}: success={res.get('success')}, message={res.get('message')}")
+    except Exception:
+        logger.exception(f"Step {completed_steps}: weight sync failed, skipping")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info(f"Cleaned up temp dir {tmp_dir}")
 
 
 def _is_save_interval_step(step: int, interval: int) -> bool:
     return interval > 0 and step % interval == 0
 
 
-def run_training_loop(
+def _safe_training_cleanup(args, inference_manager, inference_future) -> None:
+    """Best-effort teardown for inference manager and mooncake master actor."""
+    if inference_manager is not None:
+        try:
+            ray.get(inference_manager.stop.remote())
+        except Exception as exc:
+            logger.warning(f"Failed to stop inference manager: {exc}")
+        if inference_future is not None:
+            try:
+                ray.get(inference_future)
+            except Exception as exc:
+                logger.warning(
+                    f"Inference manager run loop exited with error during cleanup: {exc}"
+                )
+
+    mooncake_master_actor = getattr(args, "_mooncake_master_actor", None)
+    if mooncake_master_actor is not None:
+        try:
+            ray.get(mooncake_master_actor.shutdown.remote(), timeout=10)
+        except Exception as exc:
+            logger.warning(f"Failed to shutdown mooncake master actor: {exc}")
+
+
+def training_loop(
     args,
     controller,
     inference_manager,
@@ -55,7 +113,7 @@ def run_training_loop(
     Inference runs in background, continuously producing data.
 
     Each optimizer step (with draft_accumulation_steps dispatches):
-      1. Controller dispatches dispatch_batch_size samples, accumulation_steps times
+      1. Controller dispatches per_dp_rank_batch_size * dp_size samples, accumulation_steps times
       2. Each DP rank receives per_dp_rank_batch_size * accumulation_steps samples total
       3. train_from_queue(num_batches=accumulation_steps) processes all micro-batches
       4. Optimizer steps after the last micro-batch
@@ -81,129 +139,19 @@ def run_training_loop(
         eval_dataset_size = ray.get(controller.get_eval_dataset_size.remote())
 
     # ── Eval setup ──────────────────────────────────────────────
-    # eval_interval=N>0: eval runs every N steps in addition to checkpoint saves.
-    eval_interval = args.eval_interval
-    eval_enabled = eval_dataset_size > 0
-    eval_cached = False
-    eval_batches_per_dp = 0
-    eval_cache_path: str | None = None
-    eval_dispatch_bs = args.eval_dispatch_batch_size
+    eval_state = setup_eval(controller, train_group, args, eval_dataset_size)
 
-    if eval_enabled:
-        eval_batches_per_dp = eval_dataset_size // eval_dispatch_bs
-        if eval_batches_per_dp == 0:
-            logger.warning(
-                f"Eval dataset ({eval_dataset_size} samples) is smaller than "
-                f"eval_dispatch_batch_size ({eval_dispatch_bs}). Disabling eval."
-            )
-            eval_enabled = False
-        else:
-            dropped = eval_dataset_size - eval_batches_per_dp * eval_dispatch_bs
-            if dropped > 0:
-                logger.info(
-                    f"Eval: {dropped} samples will be dropped (not enough for a full batch)"
-                )
+    # Inference engine is alive. Run eval hs generation first.
+    if eval_state.eval_enabled and not eval_state.eval_cache_loaded:
+        generate_eval_cache(controller, train_group, eval_state)
 
-    best_eval_score = -float("inf")
-    if eval_enabled and args.checkpoint_dir:
-        best_meta_path = Path(args.checkpoint_dir).expanduser() / "best_meta.json"
-        if best_meta_path.exists():
-            existing = _read_checkpoint_metadata(best_meta_path)
-            if "eval/simulated_acc_len" in existing:
-                best_eval_score = existing["eval/simulated_acc_len"]
-                logger.info(f"Resumed best eval score: {best_eval_score:.2f}")
+    eval_interval = eval_state.eval_interval
+    eval_enabled = eval_state.eval_enabled
+    best_eval_score = eval_state.best_eval_score
 
-    if eval_enabled:
-        cache_dir = getattr(args, "cache_dir", "./cache")
-        cache_key = hashlib.md5(
-            f"{getattr(args, 'eval_data_path', '')}|"
-            f"{getattr(args, 'target_model_path', '')}|"
-            f"{getattr(args, 'max_seq_length', 0)}|"
-            f"{eval_dispatch_bs}".encode()
-        ).hexdigest()[:12]
-        eval_cache_path = os.path.join(cache_dir, "eval_cache", cache_key)
-
-        loaded = train_group.load_eval_cache(eval_cache_path)
-        if all(n > 0 for n in loaded):
-            eval_cached = True
-            logger.info(
-                f"Eval: loaded cached tensors from {eval_cache_path} ({loaded[0]} batches per rank)"
-            )
-        else:
-            ray.get(controller.submit_eval_dataset.remote())
-            logger.info(f"Eval: {eval_dataset_size} samples, batches_per_dp={eval_batches_per_dp}")
-
-    def _update_checkpoint_eval_meta(step: int, eval_metrics: dict, current_best: float) -> float:
-        """Append eval metrics to checkpoint meta.json and track best checkpoint."""
-        checkpoint_dir = args.checkpoint_dir
-        if not checkpoint_dir or not eval_metrics:
-            return current_best
-
-        base_dir = Path(checkpoint_dir).expanduser()
-        step_id = step + 1
-        meta_path = base_dir / f"iter_{step_id:07d}" / "meta.json"
-
-        metadata = _read_checkpoint_metadata(meta_path)
-        if not metadata:
-            logger.warning(
-                f"Checkpoint meta.json not found at {meta_path}, skipping eval meta update"
-            )
-            return current_best
-
-        for key in ("eval/avg_loss", "eval/avg_acc", "eval/simulated_acc_len"):
-            if key in eval_metrics:
-                metadata[key] = eval_metrics[key]
-        _write_checkpoint_metadata(meta_path, metadata)
-
-        score = eval_metrics.get("eval/simulated_acc_len")
-        if score is not None and score > current_best:
-            current_best = score
-            (base_dir / "best_checkpointed_iteration.txt").write_text(str(step_id))
-            _write_checkpoint_metadata(base_dir / "best_meta.json", metadata)
-            logger.info(f"New best checkpoint: iter_{step_id:07d} (simulated_acc_len={score:.2f})")
-
-        return current_best
-
-    def _try_eval(step: int, eval_cached: bool) -> tuple[dict, bool]:
-        """Ensure eval cache is warm, then run forward-only eval.
-
-        Returns (eval_metrics, eval_cached).
-        """
-        if not eval_enabled:
-            return {}, eval_cached
-
-        if not eval_cached:
-            eval_ready = ray.get(controller.is_eval_ready.remote())
-            if eval_ready:
-                ray.get(controller.dispatch_all_eval.remote())
-                train_group.cache_eval_data(eval_batches_per_dp)
-                eval_cached = True
-                logger.info("Eval data cached in trainers")
-                if eval_cache_path:
-                    train_group.save_eval_cache(eval_cache_path)
-                    logger.info(f"Eval cache saved to {eval_cache_path}")
-            else:
-                pool_sz = ray.get(controller.get_eval_pool_size.remote())
-                logger.warning(
-                    f"Eval inference not ready yet ({pool_sz}/{eval_dataset_size}), skipping eval"
-                )
-                return {}, eval_cached
-
-        eval_results = train_group.run_eval()
-        eval_metrics = eval_results[0] if eval_results else {}
-        if eval_metrics:
-            eval_metrics["eval/step"] = step
-            if wandb.run is not None:
-                wandb.log(eval_metrics)
-            logger.info(
-                f"Step {step} eval: "
-                f"loss={eval_metrics.get('eval/avg_loss', 0):.4f}, "
-                f"acc={eval_metrics.get('eval/avg_acc', 0):.4f}, "
-                f"sim_acc_len={eval_metrics.get('eval/simulated_acc_len', 0):.2f}"
-            )
-        return eval_metrics, eval_cached
-
-    inference_future = inference_manager.run.remote()
+    # Submit training data AFTER eval hs generation so that training prompts don't
+    # leak into the inference pipeline during eval.
+    ray.get(controller.submit_training_dataset.remote())
 
     dp_size = (
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
@@ -211,9 +159,7 @@ def run_training_loop(
     num_steps = args.num_train_steps
     accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
     # steps_per_epoch in optimizer steps, pre-computed in auto_calculate_training_steps
-    steps_per_epoch = getattr(
-        args, "steps_per_epoch", dataset_size // (args.dispatch_batch_size * accumulation_steps)
-    )
+    steps_per_epoch = getattr(args, "steps_per_epoch", dataset_size // args.global_batch_size)
     if steps_per_epoch == 0:
         steps_per_epoch = 1
     num_epochs = getattr(args, "num_epochs", 1)
@@ -221,7 +167,6 @@ def run_training_loop(
     logger.info(
         f"Starting: num_steps={num_steps}, num_epochs={num_epochs}, "
         f"steps_per_epoch={steps_per_epoch}, global_batch_size={args.global_batch_size}, "
-        f"dispatch_batch_size={args.dispatch_batch_size}, "
         f"accumulation_steps={accumulation_steps}, "
         f"dp_size={dp_size}, per_dp_rank_batch_size={args.per_dp_rank_batch_size}"
     )
@@ -265,7 +210,7 @@ def run_training_loop(
                         f"dispatch failed {dispatch_attempts} times "
                         f"(consecutive={consecutive_failures}), "
                         f"pool_size={status['sample_pool_size']}, "
-                        f"need={args.dispatch_batch_size}"
+                        f"need={status['dispatch_batch_size']}"
                     )
 
                 should_reload = False
@@ -275,13 +220,13 @@ def run_training_loop(
                     consecutive_failures >= 500
                     and (completed_steps > 0 or dispatches_done > 0)
                     and status is not None
-                    and status["sample_pool_size"] < args.dispatch_batch_size
+                    and status["sample_pool_size"] < status["dispatch_batch_size"]
                     and status.get("prompt_buffer_size", 0) == 0
                 ):
                     logger.warning(
                         f"Pool insufficient for dispatch "
                         f"(pool_size={status['sample_pool_size']}, "
-                        f"need={args.dispatch_batch_size}, "
+                        f"need={status['dispatch_batch_size']}, "
                         f"{dispatches_done}/{accumulation_steps} dispatches done, "
                         f"{steps_in_current_epoch}/{steps_per_epoch} steps in epoch). "
                         f"Reloading dataset."
@@ -340,7 +285,7 @@ def run_training_loop(
             # Skip if a checkpoint save is about to run (it will eval anyway)
             save_due = _is_save_interval_step(completed_steps, args.save_interval)
             if eval_interval > 0 and completed_steps % eval_interval == 0 and not save_due:
-                _, eval_cached = _try_eval(completed_steps, eval_cached)
+                run_eval(completed_steps, train_group, eval_enabled)
 
             steps_in_current_epoch += 1
             dispatch_attempts = 0
@@ -363,13 +308,15 @@ def run_training_loop(
             progress.update(1)
 
             if _is_save_interval_step(completed_steps, args.save_interval):
-                eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
+                eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
                 logger.info(f"Saving checkpoint at step {completed_steps}...")
                 train_group.save_model(completed_steps)
                 last_saved_step = completed_steps
-                best_eval_score = _update_checkpoint_eval_meta(
-                    completed_steps, eval_metrics, best_eval_score
+                best_eval_score = update_checkpoint_eval_meta(
+                    args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                 )
+
+            _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines)
 
             # Check if epoch completed
             if steps_in_current_epoch >= steps_per_epoch:
@@ -383,15 +330,15 @@ def run_training_loop(
                     and args.checkpoint_dir
                     and last_saved_step != completed_steps
                 ):
-                    eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
+                    eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
                     logger.info(
                         f"Saving checkpoint at end of epoch {current_epoch} "
                         f"(step {completed_steps})..."
                     )
                     train_group.save_model(completed_steps)
                     last_saved_step = completed_steps
-                    best_eval_score = _update_checkpoint_eval_meta(
-                        completed_steps, eval_metrics, best_eval_score
+                    best_eval_score = update_checkpoint_eval_meta(
+                        args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
                     )
 
                 if completed_steps < num_steps:
@@ -409,16 +356,13 @@ def run_training_loop(
 
     progress.close()
 
-    ray.get(inference_manager.stop.remote())
-    ray.get(inference_future)
-
     # Always save a final checkpoint unless saved.
     if args.checkpoint_dir and last_saved_step != completed_steps:
-        eval_metrics, eval_cached = _try_eval(completed_steps, eval_cached)
+        eval_metrics = run_eval(completed_steps, train_group, eval_enabled)
         logger.info(f"Saving final checkpoint at step {completed_steps}...")
         train_group.save_model(completed_steps, force_sync=True)
-        best_eval_score = _update_checkpoint_eval_meta(
-            completed_steps, eval_metrics, best_eval_score
+        best_eval_score = update_checkpoint_eval_meta(
+            args.checkpoint_dir, completed_steps, eval_metrics, best_eval_score
         )
 
     final_status = ray.get(controller.get_full_status.remote())
@@ -427,3 +371,31 @@ def run_training_loop(
         f"avg inference={final_status['avg_inference_speed']:.1f} entries/s | "
         f"avg training={final_status['avg_training_speed']:.1f} entries/s"
     )
+
+
+def run_training_loop(
+    args,
+    controller,
+    inference_manager,
+    train_group,
+    inference_engines=None,
+    dataset_size=None,
+    eval_dataset_size=None,
+):
+    inference_future = inference_manager.run.remote()
+    try:
+        return training_loop(
+            args,
+            controller,
+            inference_manager,
+            train_group,
+            inference_engines=inference_engines,
+            dataset_size=dataset_size,
+            eval_dataset_size=eval_dataset_size,
+        )
+    finally:
+        _safe_training_cleanup(
+            args=args,
+            inference_manager=inference_manager,
+            inference_future=inference_future,
+        )

@@ -75,13 +75,20 @@ class MooncakeMaster(RayActor):
         self._process = None
         self._info = {}
 
-    def start(self, port: int, http_port: int, http_host: str = "0.0.0.0") -> dict:
+    def start(
+        self,
+        port: int,
+        http_port: int,
+        http_host: str = "0.0.0.0",
+        kv_lease_ttl_s: float = 5.0,
+    ) -> dict:
         """Launch the mooncake master subprocess.
 
         Args:
             port: gRPC port for mooncake master.
             http_port: HTTP metadata server port.
             http_host: HTTP metadata server host.
+            kv_lease_ttl_s: Default KV object lease TTL in seconds.
 
         Returns:
             Dict with "master_addr" and "metadata_port".
@@ -100,6 +107,7 @@ class MooncakeMaster(RayActor):
             f"--http_metadata_server_port={http_port}",
             f"--http_metadata_server_host={http_host}",
             "--enable_http_metadata_server=true",
+            f"--default_kv_lease_ttl={int(kv_lease_ttl_s * 1000)}",
         ]
 
         logger.info(f"Starting mooncake master on port {port}")
@@ -295,8 +303,10 @@ def launch_mooncake_master(args):
         actor_options["scheduling_strategy"] = scheduling_strategy
     actor = RemoteActor.options(**actor_options).remote()
 
+    kv_lease_ttl_s = getattr(args, "mooncake_kv_lease_ttl_s", 5.0)
+
     try:
-        info = ray.get(actor.start.remote(port, http_port, http_host))
+        info = ray.get(actor.start.remote(port, http_port, http_host, kv_lease_ttl_s))
         # Write back resolved values (actor may have updated host from node IP)
         args.mooncake_master_server_address = info["master_addr"]
         args.mooncake_metadata_port = info["metadata_port"]

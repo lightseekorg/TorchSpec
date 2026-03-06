@@ -175,6 +175,7 @@ class AsyncInferenceManager:
 
         self._defer_tokenization = getattr(args, "defer_tokenization", False)
         self._return_hidden_states = getattr(args, "compute_logits_in_trainer", True)
+        self._train_with_decode = getattr(args, "train_with_decode", False)
 
         self._enable_perf_metrics = getattr(args, "enable_perf_metrics", True)
         self._perf_window_seconds: float = 10.0
@@ -437,7 +438,10 @@ class AsyncInferenceManager:
             try:
                 if self._enable_perf_metrics:
                     t0 = time.time()
-                outputs = await engine.generate.remote(
+                generate_method = (
+                    engine.generate_with_decode if self._train_with_decode else engine.generate
+                )
+                outputs = await generate_method.remote(
                     kwargs["data_ids"],
                     kwargs["input_ids_ref"],
                     kwargs["packed_loss_mask_list"],
@@ -464,6 +468,9 @@ class AsyncInferenceManager:
     def _parse_engine_output(self, entry: InferenceInput, output: dict) -> InferenceOutput | None:
         """Convert engine output dict to InferenceOutput."""
         if not isinstance(output, dict) or "mooncake_key" not in output:
+            logger.debug(
+                f"Skipping invalid engine output for data_id={entry.data_id}: {type(output)}"
+            )
             return None
 
         self._metrics.record(output)

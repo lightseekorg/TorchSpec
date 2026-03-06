@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import abc
+import concurrent.futures
 import dataclasses
 import itertools
 import logging
@@ -83,6 +84,9 @@ class Trainer(abc.ABC):
         self.max_dump_steps = getattr(args, "max_dump_steps", 5)
 
         self._enable_perf_metrics = getattr(args, "enable_perf_metrics", True)
+
+        self._io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._eval_cache_save_future: Optional[concurrent.futures.Future] = None
 
     # ------------------------------------------------------------------
     # Device mesh
@@ -195,36 +199,56 @@ class Trainer(abc.ABC):
             device=torch.cuda.current_device(),
             batch_size=per_dp_rank_batch_size,
         )
+        self._eval_collator = collator
         self._eval_cache: list[dict] = []
         logger.info(
             f"[Rank {self.dp_rank}] Eval data fetcher initialized "
             f"with batch_size={per_dp_rank_batch_size}"
         )
 
-    def cache_eval_data(self, num_batches: int) -> int:
-        """Read *num_batches* from the eval queue and store on CPU."""
-        self._eval_cache = []
-        for batch in itertools.islice(self._eval_data_fetcher, num_batches):
-            cpu_batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            self._eval_cache.append(cpu_batch)
-        logger.info(f"[Rank {self.dp_rank}] Cached {len(self._eval_cache)} eval batches on CPU")
+    def cache_eval_samples(self, count: int) -> int:
+        for sample in itertools.islice(self._eval_data_fetcher, count):
+            cpu_sample = {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sample.items()
+            }
+            self._eval_cache.append(cpu_sample)
         return len(self._eval_cache)
 
     def save_eval_cache(self, cache_dir: str) -> None:
-        """Persist the CPU-cached eval batches to disk for reuse across runs."""
         if not getattr(self, "_eval_cache", None):
             return
-        os.makedirs(cache_dir, exist_ok=True)
-        path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
-        torch.save(self._eval_cache, path)
-        logger.info(f"[Rank {self.dp_rank}] Saved {len(self._eval_cache)} eval batches to {path}")
+        self._wait_for_eval_cache_save()
+
+        cache_snapshot = list(self._eval_cache)
+        rank = self.dp_rank
+
+        def _save() -> None:
+            os.makedirs(cache_dir, exist_ok=True)
+            path = os.path.join(cache_dir, f"eval_rank_{rank}.pt")
+            tmp_path = path + ".tmp"
+            torch.save(cache_snapshot, tmp_path)
+            os.replace(tmp_path, path)
+            logger.info(f"[Rank {rank}] Saved {len(cache_snapshot)} eval batches to {path}")
+
+        self._eval_cache_save_future = self._io_executor.submit(_save)
+
+    def _wait_for_eval_cache_save(self) -> None:
+        fut = self._eval_cache_save_future
+        if fut is not None:
+            fut.result()
+            self._eval_cache_save_future = None
 
     def load_eval_cache(self, cache_dir: str) -> int:
-        """Load eval batches from a previous disk cache. Returns count loaded (0 = miss)."""
+        # Safe guard to wait for eval cache save to complete.
+        self._wait_for_eval_cache_save()
         path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
         if not os.path.exists(path):
             return 0
-        self._eval_cache = torch.load(path, weights_only=False)
+        try:
+            self._eval_cache = torch.load(path, weights_only=False)
+        except Exception as e:
+            logger.warning(f"[Rank {self.dp_rank}] Corrupt eval cache at {path}, ignoring: {e}")
+            return 0
         logger.info(
             f"[Rank {self.dp_rank}] Loaded {len(self._eval_cache)} eval batches from {path}"
         )
@@ -373,6 +397,8 @@ class Trainer(abc.ABC):
         return checkpoint.load(self)
 
     def close(self) -> None:
+        self._wait_for_eval_cache_save()
+        self._io_executor.shutdown(wait=True)
         if self.mooncake_store is not None and hasattr(self.mooncake_store, "close"):
             self.mooncake_store.close()
             logger.info(f"[Rank {self.dp_rank}] EagleMooncakeStore closed")

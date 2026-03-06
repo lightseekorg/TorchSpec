@@ -313,6 +313,7 @@ def _load_tokenized_prompts(
         prompt_key=prompt_key,
         max_seq_length=max_seq_length,
         cache_dir=cache_dir or "./cache",
+        train_with_decode=False,
     )
     return load_conversation_dataset(args_ns)
 

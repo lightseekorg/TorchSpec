@@ -76,7 +76,6 @@ inference:
     tp_size: 8
     enable_multimodal: true
     extra_args:
-      context_length: 262144
       attention_backend: flashinfer
       quantization: fp8
       disable_flashinfer_autotune: true

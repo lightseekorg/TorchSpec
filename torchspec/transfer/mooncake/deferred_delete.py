@@ -44,7 +44,7 @@ class DeleteTask:
 class DeferredDeleteManager:
     """Manages deferred deletions with TTL awareness and retry logic.
 
-    Mooncake objects have a lease TTL (default 5s) during which they cannot be deleted.
+    Mooncake objects have a lease TTL during which they cannot be deleted.
     This manager queues deletions and processes them after the TTL expires.
     """
 

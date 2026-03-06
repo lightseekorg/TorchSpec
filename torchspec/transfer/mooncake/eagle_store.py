@@ -60,7 +60,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     - {key}_ids: input_ids
     - {key}_lhs: last_hidden_states (if present)
 
-    Deletions are deferred to respect Mooncake's lease TTL (5 seconds).
+    Deletions are deferred to respect Mooncake's lease TTL (config.kv_lease_ttl_s).
     """
 
     TENSOR_SUFFIXES = ["_hs", "_tgt", "_ids", "_lhs"]
@@ -76,14 +76,15 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         super().setup(device)
 
         if self._deferred_delete_manager is None:
+            lease_ttl_s = self.config.kv_lease_ttl_s
             # Initialize deferred delete manager after store is ready
             self._deferred_delete_manager = DeferredDeleteManager(
                 store=self._store,
-                ttl_seconds=5.0,  # Mooncake lease TTL
                 ttl_buffer_seconds=0.5,  # Small buffer for safety
                 check_interval=1.0,  # Check queue every second
                 max_queue_size=10000,  # Max pending deletions
                 retry_interval=2.0,  # Retry failed deletes after 2s
+                ttl_seconds=lease_ttl_s,  # Mooncake lease TTL
             )
             logger.debug("Deferred delete manager initialized")
 
@@ -128,6 +129,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
         For GPU Direct send the path is synchronous (no DtoH needed).
         """
+        self._ensure_initialized()
         logger.debug("put: starting for key=%s", key)
         keys = [f"{key}_hs", f"{key}_ids"]
         tensors = [hidden_states, input_ids]
@@ -201,6 +203,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         ``_copy_stream``, the copies are typically finished by the time
         this is called — the wait is only for the (fast) RDMA transfer.
         """
+        self._ensure_initialized()
         if self._async_put_manager is None:
             return
         self._async_put_manager.check_last_error()
@@ -270,6 +273,8 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         Returns:
             Eagle3TargetOutput with the retrieved tensors.
         """
+        self._ensure_initialized()
+
         from torchspec.models.target.eagle3_target_model import Eagle3TargetOutput
 
         keys = [f"{key}_hs", f"{key}_ids"]
@@ -478,7 +483,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         """
         Queue deferred removal of all tensors associated with an Eagle3 output.
 
-        Deletions are queued and executed after Mooncake's lease TTL expires (5s).
+        Deletions are queued and executed after Mooncake's lease TTL expires.
         This prevents deletion failures due to active leases.
 
         Args:

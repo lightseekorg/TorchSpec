@@ -116,6 +116,7 @@ class TrainingConfig:
     seed: int = 0
     train_backend: str = "fsdp"
     train_env_vars: str = "{}"
+    train_with_decode: bool = False
     training_num_gpus_per_node: int = 1
     training_num_nodes: int = 1
     ttt_length: int = 7
@@ -123,9 +124,29 @@ class TrainingConfig:
 
 
 @dataclass
+class DecodeConfig:
+    """Config for train-with-decode mode (speculative decoding during training)."""
+
+    cuda_graph_max_bs: Optional[int] = None
+    max_new_tokens: int = 512
+    max_running_requests: Optional[int] = None
+    speculative_algorithm: Optional[str] = None
+    speculative_draft_model_path: Optional[str] = None
+    speculative_eagle_topk: Optional[int] = None
+    speculative_num_draft_tokens: Optional[int] = None
+    speculative_num_steps: Optional[int] = None
+    temperature: float = 1.0
+    top_k: int = -1
+    top_p: float = 1.0
+    weight_sync_enabled: bool = False
+    weight_sync_interval: int = 500
+
+
+@dataclass
 class Config:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    decode: DecodeConfig = field(default_factory=DecodeConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -141,14 +162,24 @@ _ALWAYS_LOCAL_PATH_KEYS = ("output_dir", "cache_dir", "model_download_dir")
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 
 
-def _resolve_relative_paths(config: DictConfig, base_dir: str) -> None:
+def _resolve_relative_paths(
+    config: DictConfig,
+    base_dir: str,
+    *,
+    skip_keys: frozenset[str] = frozenset(),
+) -> None:
     """Resolve local relative paths in *config* against *base_dir* (in-place).
 
     Always-local keys (output_dir, cache_dir, …) are absolutized unconditionally.
     Data-path keys are only absolutized when ``is_local_data_path`` says they look
     like filesystem paths (as opposed to HF Hub dataset IDs).
+
+    Keys listed in *skip_keys* are left untouched (useful for deferring
+    CWD-relative keys when resolving a file-level config).
     """
     for dotted_key in (*_ALWAYS_LOCAL_PATH_KEYS, *_DATA_PATH_KEYS):
+        if dotted_key in skip_keys:
+            continue
         val = OmegaConf.select(config, dotted_key, default=None)
         if not (isinstance(val, str) and val):
             continue
@@ -192,7 +223,11 @@ def load_config(
 
     if config_path is not None:
         file_config = OmegaConf.load(config_path)
-        _resolve_relative_paths(file_config, os.path.dirname(os.path.abspath(config_path)))
+        _resolve_relative_paths(
+            file_config,
+            os.path.dirname(os.path.abspath(config_path)),
+            skip_keys=frozenset(_ALWAYS_LOCAL_PATH_KEYS),
+        )
         configs_to_merge.append(file_config)
 
     if cli_args:
@@ -209,6 +244,7 @@ def load_config(
 
 # Sub-sections whose fields receive a name prefix when flattened.
 _PREFIXED_SECTIONS = {
+    "decode": "decode_",
     "mooncake": "mooncake_",
     "sglang": "sglang_",
     "vllm": "vllm_",
@@ -246,7 +282,7 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     # --- Computed / alias fields ---
     flat["world_size"] = flat["training_num_nodes"] * flat["training_num_gpus_per_node"]
     flat["rank"] = 0
-    flat["dynamic_loss_mask"] = flat["defer_tokenization"]
+    flat["dynamic_loss_mask"] = flat["defer_tokenization"] and not flat["train_with_decode"]
     flat["use_wandb"] = flat.get("use_wandb", False) or flat.get("report_to") == "wandb"
     flat["use_tensorboard"] = (
         flat.get("use_tensorboard", False) or flat.get("report_to") == "tensorboard"

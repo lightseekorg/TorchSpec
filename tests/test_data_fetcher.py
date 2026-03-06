@@ -286,3 +286,78 @@ class TestSynchronousFetching:
 
         assert batch_count == num_samples
         assert store.call_count == num_samples
+
+
+class TestCacheEvalSamples:
+    """Tests that cache_eval_samples drains individual samples into a flat cache."""
+
+    def test_cache_eval_samples_drains_count(self):
+        """Drain 3 samples in one call, verify _eval_cache has 3 entries."""
+        import itertools
+
+        ray_queue = MockRayQueue()
+        store = MockMooncakeStore()
+        device = torch.device("cpu")
+
+        for i in range(3):
+            ray_queue.put(make_sample(i))
+        ray_queue.put(None)
+
+        fetcher = MooncakeDataFetcher(
+            queue=ray_queue,
+            mooncake_store=store,
+            collator=simple_collator,
+            device=device,
+            batch_size=1,
+        )
+
+        eval_cache: list[dict] = []
+
+        def cache_eval_samples(count):
+            for sample in itertools.islice(fetcher, count):
+                cpu_sample = {
+                    k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sample.items()
+                }
+                eval_cache.append(cpu_sample)
+            return len(eval_cache)
+
+        assert cache_eval_samples(3) == 3
+        assert len(eval_cache) == 3
+
+        for sample in eval_cache:
+            assert "input_ids" in sample
+            assert "labels" in sample
+
+    def test_cache_eval_samples_incremental(self):
+        """Drain samples incrementally across multiple calls."""
+        import itertools
+
+        ray_queue = MockRayQueue()
+        store = MockMooncakeStore()
+        device = torch.device("cpu")
+
+        for i in range(5):
+            ray_queue.put(make_sample(i))
+        ray_queue.put(None)
+
+        fetcher = MooncakeDataFetcher(
+            queue=ray_queue,
+            mooncake_store=store,
+            collator=simple_collator,
+            device=device,
+            batch_size=1,
+        )
+
+        eval_cache: list[dict] = []
+
+        def cache_eval_samples(count):
+            for sample in itertools.islice(fetcher, count):
+                cpu_sample = {
+                    k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in sample.items()
+                }
+                eval_cache.append(cpu_sample)
+            return len(eval_cache)
+
+        assert cache_eval_samples(2) == 2
+        assert cache_eval_samples(3) == 5
+        assert len(eval_cache) == 5

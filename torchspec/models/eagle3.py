@@ -87,10 +87,12 @@ class Eagle3Model(nn.Module):
           computes target softmax inside the compiled graph.
         """
         valid_idx = mask.flatten().nonzero().squeeze(-1)
-        # Guard against all-masked positions to avoid nan from mean() on empty tensors.
         if valid_idx.numel() == 0:
-            zero = hidden_states.new_tensor(0.0)
-            return zero, zero
+            # FSDP requires every trainable param to participate in gradient
+            # all-reduce/reduce-scatter.
+            total = sum(p.reshape(-1)[0] for p in self.parameters() if p.requires_grad)
+            zero = total * 0.0
+            return zero, zero.detach()
         # Important as it prevents recompilation.
         torch._dynamo.mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])

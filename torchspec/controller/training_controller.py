@@ -140,11 +140,12 @@ class AsyncTrainingController:
         self._eval_pool_lock = threading.Lock()
         self._eval_data_ids: set[str] = set()
         self._eval_expected_count: int = 0
+        self._eval_dispatched_samples: int = 0
         self.eval_queues = [Queue() for _ in range(dp_size)]
 
         self.batch_id = 0
-        self.dispatch_batch_size = args.dispatch_batch_size
-        self.eval_dispatch_batch_size = args.eval_dispatch_batch_size
+        self.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
+        self.eval_dispatch_batch_size = dp_size
         self._data_id_counter = 0
 
         self._stored_dataset: list | None = None
@@ -195,7 +196,7 @@ class AsyncTrainingController:
             return len(dataset)
 
     def load_dataset(self, args) -> int:
-        """Load and process dataset on the controller, store for epoch reloads, and prime the prompt buffer."""
+        """Load and store dataset on the controller for later use."""
         from torchspec.data.dataset import load_conversation_dataset
 
         self._stored_dataset = load_conversation_dataset(args)
@@ -206,9 +207,13 @@ class AsyncTrainingController:
                 f"max_seq_length={getattr(args, 'max_seq_length', None)}, "
                 f"and chat_template settings."
             )
-        count = self.add_dataset(self._stored_dataset)
-        logger.info(f"Controller loaded dataset: {count} samples")
-        return count
+        logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
+        return len(self._stored_dataset)
+
+    def submit_training_dataset(self) -> int:
+        """Submit the stored training dataset to the prompt buffer for inference."""
+        assert self._stored_dataset is not None, "No stored dataset to submit"
+        return self.add_dataset(self._stored_dataset)
 
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
@@ -228,7 +233,16 @@ class AsyncTrainingController:
         eval_prompt_key = getattr(args, "eval_prompt_key", None)
         if eval_prompt_key:
             eval_args.prompt_key = eval_prompt_key
-        self._stored_eval_dataset = load_conversation_dataset(eval_args)
+        raw_dataset = load_conversation_dataset(eval_args)
+        raw_count = len(raw_dataset)
+        # Truncate to a multiple of dp_size so every dispatch is a full batch
+        usable = (raw_count // self.dp_size) * self.dp_size
+        if usable < raw_count:
+            logger.info(
+                f"Eval dataset truncated from {raw_count} to {usable} samples "
+                f"(dp_size={self.dp_size})"
+            )
+        self._stored_eval_dataset = raw_dataset[:usable] if usable > 0 else []
         count = len(self._stored_eval_dataset)
         logger.info(f"Controller loaded eval dataset: {count} samples from {eval_data_path}")
         return count
@@ -342,10 +356,13 @@ class AsyncTrainingController:
         return self.train_queues
 
     def get_pool_size(self) -> int:
-        # Exclude eval samples during eval as inference has to run.
+        """Total mooncake-resident samples (training + eval) for backpressure.
+
+        Always includes eval pool so that backpressure accounts for mooncake
+        segment capacity used by eval data.  Without this, eval data occupies
+        mooncake outside backpressure awareness and the segment overflows.
+        """
         train_size = len(self.sample_pool)
-        if self._eval_expected_count > 0:
-            return train_size
         with self._eval_pool_lock:
             return train_size + len(self.eval_pool)
 
@@ -403,21 +420,7 @@ class AsyncTrainingController:
                 self._pool_bytes -= sample_bytes
                 batch_results.append(result)
 
-        partitioned = self._partition_results(batch_results)
-
-        for dp_rank, results in enumerate(partitioned):
-            logger.debug(f"Pushing {len(results)} samples to dp_rank={dp_rank} queue")
-            for i, result in enumerate(results):
-                logger.debug(f"dp_rank={dp_rank} sample {i}: mooncake_key={result.mooncake_key}")
-                self.train_queues[dp_rank].put(
-                    TrainSample(
-                        mooncake_key=result.mooncake_key,
-                        tensor_shapes=result.tensor_shapes,
-                        tensor_dtypes=result.tensor_dtypes,
-                        packed_loss_mask=result.packed_loss_mask,
-                    )
-                )
-            logger.debug(f"Finished pushing to dp_rank={dp_rank} queue")
+        self._dispatch_to_queues(batch_results, self.train_queues)
 
         self._training_monitor.record(self.dispatch_batch_size)
         logger.debug(
@@ -433,6 +436,24 @@ class AsyncTrainingController:
         for i, result in enumerate(results):
             partitions[i % self.dp_size].append(result)
         return partitions
+
+    def _dispatch_to_queues(
+        self,
+        batch_results: list[InferenceOutput],
+        queues: list[Queue],
+    ) -> None:
+        """Partition results across DP ranks and push TrainSamples into queues."""
+        partitioned = self._partition_results(batch_results)
+        for dp_rank, results in enumerate(partitioned):
+            for result in results:
+                queues[dp_rank].put(
+                    TrainSample(
+                        mooncake_key=result.mooncake_key,
+                        tensor_shapes=result.tensor_shapes,
+                        tensor_dtypes=result.tensor_dtypes,
+                        packed_loss_mask=result.packed_loss_mask,
+                    )
+                )
 
     def push_inference_sample(self, sample: InferenceOutput) -> int:
         """Add a single inference sample to the training pool.
@@ -463,6 +484,8 @@ class AsyncTrainingController:
         training pool can starve eval indefinitely.
         """
         self._eval_expected_count = len(dataset)
+        self._eval_dispatched_samples = 0
+
         eval_entries: list[InferenceInput] = []
         for sample in dataset:
             if isinstance(sample, dict):
@@ -493,62 +516,55 @@ class AsyncTrainingController:
         with self._eval_pool_lock:
             return len(self.eval_pool)
 
-    def is_eval_ready(self) -> bool:
-        """True when all expected eval samples have completed inference."""
-        if self._eval_expected_count == 0:
-            return False
-        with self._eval_pool_lock:
-            return len(self.eval_pool) >= self._eval_expected_count
-
     def get_eval_queues(self) -> list[Queue]:
         return self.eval_queues
 
-    def dispatch_all_eval(self) -> int:
-        """Dispatch all complete eval batches to eval queues.
-
-        Uses ``eval_dispatch_batch_size`` (may differ from training).
-        Only dispatches full batches. Remaining samples stay in the pool.
-        Clears eval tracking state after dispatch to prevent unbounded growth.
-
-        Returns:
-            Number of batches dispatched.
-        """
+    def try_dispatch_eval_batch(self) -> bool:
+        """Dispatch one eval batch from the pool if enough samples are available."""
         bs = self.eval_dispatch_batch_size
-        dispatched = 0
-        while True:
-            with self._eval_pool_lock:
-                if len(self.eval_pool) < bs:
-                    break
-                batch_results = []
-                for _ in range(bs):
-                    batch_results.append(self.eval_pool.popleft())
+        with self._eval_pool_lock:
+            if len(self.eval_pool) < bs:
+                return False
+            batch_results = [self.eval_pool.popleft() for _ in range(bs)]
 
-            partitioned = self._partition_results(batch_results)
-            for dp_rank, results in enumerate(partitioned):
-                for result in results:
-                    self.eval_queues[dp_rank].put(
-                        TrainSample(
-                            mooncake_key=result.mooncake_key,
-                            tensor_shapes=result.tensor_shapes,
-                            tensor_dtypes=result.tensor_dtypes,
-                            packed_loss_mask=result.packed_loss_mask,
-                        )
-                    )
-            dispatched += 1
+        self._dispatch_to_queues(batch_results, self.eval_queues)
+        self._eval_dispatched_samples += bs
+        logger.debug(
+            f"Eval: dispatched batch ({self._eval_dispatched_samples}/"
+            f"{self._eval_expected_count} samples)"
+        )
+        return True
+
+    def finalize_eval_dispatch(self) -> None:
+        """Assert all eval batches were dispatched, then clean up tracking state.
+
+        Raises AssertionError if not all expected samples have arrived or
+        undispatched full batches remain in the pool.
+        """
+        with self._eval_pool_lock:
+            arrived = self._eval_dispatched_samples + len(self.eval_pool)
+            pool_remaining = len(self.eval_pool)
+
+        assert self._eval_expected_count > 0 and arrived >= self._eval_expected_count, (
+            f"finalize_eval_dispatch called before all samples arrived "
+            f"(arrived={arrived}, expected={self._eval_expected_count})"
+        )
+        assert pool_remaining < self.eval_dispatch_batch_size, (
+            f"finalize_eval_dispatch called with undispatched full batches "
+            f"(pool={pool_remaining}, batch_size={self.eval_dispatch_batch_size})"
+        )
 
         with self._eval_pool_lock:
-            remaining = len(self.eval_pool)
-            if remaining > 0:
-                logger.warning(
-                    f"Eval: dropping {remaining} leftover samples that didn't fill a batch"
+            if pool_remaining > 0:
+                logger.info(
+                    f"Eval: dropping {pool_remaining} leftover samples that didn't fill a batch"
                 )
                 self.eval_pool.clear()
 
         self._eval_data_ids.clear()
         self._eval_expected_count = 0
-
-        logger.info(f"Eval: dispatched {dispatched} batches to eval queues")
-        return dispatched
+        self._eval_dispatched_samples = 0
+        logger.info("Eval: dispatch finalized, tracking state cleared")
 
     # ─────────────────────────────────────────────────────────────
     # Status and Monitoring

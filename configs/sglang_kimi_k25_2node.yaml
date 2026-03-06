@@ -14,9 +14,9 @@ model:
   embedding_key: language_model.model.embed_tokens.weight
 
 dataset:
-  train_data_path: ???  # set to your dataset path (HF hub id, local dir, or jsonl)
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: ../examples/data/eval_conversations.jsonl
   chat_template: kimi-k25-vlm
-  prompt_key: conversations
   defer_tokenization: true
 
 training:
@@ -55,7 +55,6 @@ inference:
     init_timeout: 1800
     dist_timeout: 600
     extra_args:
-      context_length: 262144
       model_loader_extra_config:
         enable_multithread_load: true
         num_threads: 32
@@ -66,15 +65,17 @@ mooncake:
   master_server_address: null
   metadata_server: null
   hidden_dim: 7168
-  protocol: tcp # Change this to RDMA for good performance.
   global_segment_size: 96GB
   local_buffer_size: 16GB
-  device_name: mlx5_0
-  # device_name: mlx5_0,mlx5_1 # Please change this to correct network devices.
-  # enable_gpu_direct: true
+  protocol: rdma # Change this to RDMA for good performance.
+  enable_gpu_direct: false
+  device_name: mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11 # Please change this to correct network devices.
+  # protocol: tcp # Switch to TCP if RDMA is not available.
+  # kv_lease_ttl_s: 60 # If TCP transfer is slow, increase the lease TTL. Also increase the global_segment_size accordingly.
+
 
 output_dir: ./outputs/train_kimi25_2node_h200
-cache_dir: ./cache
+cache_dir: ./cache/train_kimi25_2node_h200
 model_download_dir: null
 
 debug:

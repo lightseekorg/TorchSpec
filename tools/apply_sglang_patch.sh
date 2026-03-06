@@ -1,12 +1,23 @@
 #!/bin/bash
 
-# To force apply a patch, run: ./tools/apply_sglang_patch.sh <absolute-path-to-sglang-repo>
-# Please note that this will overwrite all the local changes.
+# Apply sglang patch for TorchSpec.
+#
+# Usage:
+#   ./tools/apply_sglang_patch.sh <path-to-sglang-repo>           # base patch (prefill only)
+#   ./tools/apply_sglang_patch.sh --decode <path-to-sglang-repo>  # full patch (prefill + decode)
+#
+# Please note that this will overwrite all local changes and delete untracked files.
 
 set -e
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+PATCH_NAME="sglang.patch"
+if [ "${1:-}" = "--decode" ]; then
+    PATCH_NAME="sglang_decode.patch"
+    shift
+fi
 
 SGLANG_VERSION="${SGLANG_VERSION:-v0.5.8.post1}"
 SGLANG_DIR="$PROJECT_ROOT/docker/sglang/$SGLANG_VERSION"
@@ -23,9 +34,10 @@ if [ -z "$SGLANG_COMMIT" ]; then
     exit 1
 fi
 
-SGLANG_PATH="${1:?Usage: $0 <path-to-sglang-repo>}"
+SGLANG_PATH="${1:?Usage: $0 [--decode] <path-to-sglang-repo>}"
 
-PATCH_FILE="$PROJECT_ROOT/patches/sglang/$SGLANG_VERSION/sglang.patch"
+PATCH_FILE="$PROJECT_ROOT/patches/sglang/$SGLANG_VERSION/$PATCH_NAME"
+
 if [ ! -f "$PATCH_FILE" ]; then
     echo "Error: Patch file not found: $PATCH_FILE"
     exit 1
