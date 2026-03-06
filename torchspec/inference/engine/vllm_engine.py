@@ -225,20 +225,8 @@ class VllmEngine(InferenceEngine, RayActor):
         if not hasattr(self._engine, "collective_rpc"):
             raise RuntimeError("vLLM LLM.collective_rpc is required for worker extension mode")
 
-        # Set environment variables so workers can connect to Mooncake
         if self._mooncake_config is not None:
-            import os
-
-            os.environ["TORCHSPEC_MOONCAKE_MASTER_ADDR"] = (
-                self._mooncake_config.master_server_address
-            )
-            os.environ["TORCHSPEC_MOONCAKE_METADATA_PORT"] = str(
-                self._mooncake_config.metadata_server.split(":")[-1].replace("/metadata", "")
-            )
-            os.environ["TORCHSPEC_MOONCAKE_LOCAL_HOSTNAME"] = self._mooncake_config.local_hostname
-            os.environ["TORCHSPEC_MOONCAKE_PROTOCOL"] = self._mooncake_config.protocol
-            if self._mooncake_config.device_name:
-                os.environ["TORCHSPEC_MOONCAKE_DEVICE_NAME"] = self._mooncake_config.device_name
+            self._mooncake_config.export_env()
             logger.info(
                 f"VllmEngine rank {self.rank}: Set Mooncake env vars for workers: "
                 f"master={self._mooncake_config.master_server_address}"

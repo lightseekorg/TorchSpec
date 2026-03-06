@@ -18,8 +18,8 @@ model:
   trust_remote_code: true
 
 dataset:
-  train_data_path: ./examples/data/sample_conversations.jsonl
-  eval_data_path: ./examples/data/eval_conversations.jsonl
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: ../examples/data/eval_conversations.jsonl
   eval_interval: 100
   chat_template: qwen
   prompt_key: conversations
@@ -54,6 +54,8 @@ inference:
     use_worker_extension: true
     extra_args:
       max_num_batched_tokens: 32768
+      compilation_config:
+        max_cudagraph_capture_size: 8
 
 mooncake:
   master_server_address: null

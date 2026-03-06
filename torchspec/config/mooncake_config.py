@@ -177,6 +177,16 @@ class MooncakeConfig:
         os.environ["MOONCAKE_ENABLE_GPU_DIRECT"] = "1" if self.enable_gpu_direct else "0"
         if self.async_put_pool_size is not None:
             os.environ["MOONCAKE_ASYNC_PUT_POOL_SIZE"] = str(self.async_put_pool_size)
+        os.environ["MOONCAKE_STORE_FULL_WAIT_SECONDS"] = str(self.store_full_wait_seconds)
+        os.environ["MOONCAKE_STORE_FULL_LOG_INTERVAL_SECONDS"] = str(
+            self.store_full_log_interval_seconds
+        )
+        os.environ["MOONCAKE_STORE_FULL_MAX_WAIT_SECONDS"] = str(self.store_full_max_wait_seconds)
+        os.environ["MOONCAKE_GET_RETRY_WAIT_SECONDS"] = str(self.get_retry_wait_seconds)
+        os.environ["MOONCAKE_GET_RETRY_LOG_INTERVAL_SECONDS"] = str(
+            self.get_retry_log_interval_seconds
+        )
+        os.environ["MOONCAKE_GET_RETRY_MAX_WAIT_SECONDS"] = str(self.get_retry_max_wait_seconds)
 
     @classmethod
     def from_env(cls) -> "MooncakeConfig":

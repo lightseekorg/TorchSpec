@@ -236,85 +236,19 @@ class VllmWorkerExtension:
             pass
 
         try:
-            # Import here to avoid circular dependencies
             from torchspec.config.mooncake_config import MooncakeConfig
             from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
-            # Get connection info from environment (set by main process)
-            # Try TORCHSPEC_MOONCAKE_* first, then fall back to MOONCAKE_*
-            master_addr = os.environ.get("TORCHSPEC_MOONCAKE_MASTER_ADDR") or os.environ.get(
-                "MOONCAKE_MASTER_SERVER"
-            )
-            metadata_server = os.environ.get(
-                "TORCHSPEC_MOONCAKE_METADATA_SERVER"
-            ) or os.environ.get("MOONCAKE_METADATA_SERVER")
-            local_hostname = os.environ.get("TORCHSPEC_MOONCAKE_LOCAL_HOSTNAME") or os.environ.get(
-                "MOONCAKE_LOCAL_HOSTNAME", "localhost"
-            )
-            protocol = os.environ.get("TORCHSPEC_MOONCAKE_PROTOCOL") or os.environ.get(
-                "MOONCAKE_PROTOCOL", "tcp"
-            )
-
-            if not master_addr:
+            if not os.environ.get("MOONCAKE_MASTER_SERVER") and not os.environ.get(
+                "MOONCAKE_MASTER_HOST"
+            ):
                 logger.warning(
                     "Mooncake master address not available in worker environment. "
-                    "Set TORCHSPEC_MOONCAKE_MASTER_ADDR or MOONCAKE_MASTER_SERVER environment variable."
+                    "Set MOONCAKE_MASTER_SERVER environment variable."
                 )
                 return False
 
-            # Parse metadata_server to get port if not explicitly set
-            if metadata_server:
-                # Extract port from URL like "http://host:port/metadata"
-                try:
-                    metadata_port = metadata_server.split(":")[-1].replace("/metadata", "")
-                except Exception:
-                    metadata_port = "8090"
-            else:
-                metadata_port = "8090"
-                metadata_server = f"http://{master_addr.split(':')[0]}:{metadata_port}/metadata"
-
-            # Read buffer sizes from environment (set by main process via export_env)
-            host_buffer_size_env = os.environ.get(
-                "TORCHSPEC_MOONCAKE_HOST_BUFFER_SIZE"
-            ) or os.environ.get("MOONCAKE_HOST_BUFFER_SIZE")
-
-            # Build config kwargs with optional overrides from environment
-            config_kwargs = {
-                "master_server_address": master_addr,
-                "metadata_server": metadata_server,
-                "local_hostname": local_hostname,
-                "protocol": protocol,
-                "device_name": os.environ.get("TORCHSPEC_MOONCAKE_DEVICE_NAME")
-                or os.environ.get("MOONCAKE_DEVICE_NAME", ""),
-                "async_put_pool_size": int(
-                    os.environ.get("TORCHSPEC_MOONCAKE_ASYNC_POOL_SIZE")
-                    or os.environ.get("MOONCAKE_ASYNC_PUT_POOL_SIZE", "2")
-                ),
-                "enable_gpu_direct": (
-                    os.environ.get("TORCHSPEC_MOONCAKE_GPU_DIRECT")
-                    or os.environ.get("MOONCAKE_ENABLE_GPU_DIRECT", "0")
-                ).lower()
-                in ("true", "1", "yes"),
-            }
-
-            # Only override defaults if environment variables are set
-            if host_buffer_size_env:
-                config_kwargs["host_buffer_size"] = int(host_buffer_size_env)
-
-            global_segment_size_env = os.environ.get(
-                "TORCHSPEC_MOONCAKE_GLOBAL_SEGMENT_SIZE"
-            ) or os.environ.get("MOONCAKE_GLOBAL_SEGMENT_SIZE")
-            if global_segment_size_env:
-                config_kwargs["global_segment_size"] = int(global_segment_size_env)
-
-            local_buffer_size_env = os.environ.get(
-                "TORCHSPEC_MOONCAKE_LOCAL_BUFFER_SIZE"
-            ) or os.environ.get("MOONCAKE_LOCAL_BUFFER_SIZE")
-            if local_buffer_size_env:
-                config_kwargs["local_buffer_size"] = int(local_buffer_size_env)
-
-            # Create config for worker
-            config = MooncakeConfig(**config_kwargs)
+            config = MooncakeConfig.from_env()
 
             # Create store object but don't call setup() yet
             # setup() will be called lazily when CUDA context is ready
@@ -325,7 +259,8 @@ class VllmWorkerExtension:
             self._store_setup_complete = False
 
             logger.info(
-                f"Worker initialized Mooncake store (setup deferred): master={master_addr}, protocol={protocol}"
+                f"Worker initialized Mooncake store (setup deferred): "
+                f"master={config.master_server_address}, protocol={config.protocol}"
             )
             return True
 

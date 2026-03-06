@@ -23,16 +23,12 @@ try:
 except Exception:
     LOCAL_IP = "localhost"
 
-# Mooncake env vars for MooncakeConfig.from_env() (retrieval side)
+# Mooncake env vars read by MooncakeConfig.from_env() on both sides
 os.environ["MOONCAKE_MASTER_HOST"] = LOCAL_IP
 os.environ["MOONCAKE_MASTER_PORT"] = "50051"
 os.environ["MOONCAKE_METADATA_PORT"] = "8090"
 os.environ["MOONCAKE_LOCAL_HOSTNAME"] = LOCAL_IP
-
-# Mooncake env vars for worker extension (storage side)
-os.environ["TORCHSPEC_MOONCAKE_MASTER_ADDR"] = f"{LOCAL_IP}:50051"
-os.environ["TORCHSPEC_MOONCAKE_LOCAL_HOSTNAME"] = LOCAL_IP
-os.environ["TORCHSPEC_MOONCAKE_PROTOCOL"] = "tcp"
+os.environ["MOONCAKE_MASTER_SERVER"] = f"{LOCAL_IP}:50051"
 
 
 def collect_metadata(engine, internal_to_external=None):
