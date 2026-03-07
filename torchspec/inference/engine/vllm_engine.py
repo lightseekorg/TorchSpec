@@ -243,7 +243,7 @@ class VllmEngine(InferenceEngine, RayActor):
         self,
         data_id: str | list[str],
         input_ids_ref: ray.ObjectRef | list[torch.Tensor] | None = None,
-        packed_loss_mask_list: list[str] | None = None,
+        packed_loss_mask_list: list[str | None] | None = None,
         formatted_prompts: list[str] | None = None,
         return_last_hidden_states: bool = False,
         return_logits: bool = True,
@@ -323,24 +323,21 @@ class VllmEngine(InferenceEngine, RayActor):
         for i, output in enumerate(outputs):
             internal_to_external[output.request_id] = data_ids[i]
 
-        # For the formatted_prompts path, request_metadata and input_ids_map
-        # were not set before generation (no input_ids available).  Build them
-        # from the outputs so the worker can map captured states to requests.
-        if use_prompts and not request_metadata:
-            for i, output in enumerate(outputs):
-                did = data_ids[i]
-                request_metadata[did] = len(output.prompt_token_ids)
-                input_ids_map[did] = list(output.prompt_token_ids)
-            try:
-                self._engine.collective_rpc(
-                    "_set_request_metadata",
-                    args=(request_metadata, packed_loss_mask_map, input_ids_map),
-                )
-            except Exception as e:
-                logger.warning(
-                    f"VllmEngine rank {self.rank}: Could not set post-generation "
-                    f"request metadata: {e}"
-                )
+        # Always build request_metadata and input_ids_map from the
+        # outputs.
+        for i, output in enumerate(outputs):
+            did = data_ids[i]
+            request_metadata[did] = len(output.prompt_token_ids)
+            input_ids_map[did] = list(output.prompt_token_ids)
+        try:
+            self._engine.collective_rpc(
+                "_set_request_metadata",
+                args=(request_metadata, packed_loss_mask_map, input_ids_map),
+            )
+        except Exception as e:
+            logger.warning(
+                f"VllmEngine rank {self.rank}: Could not set post-generation request metadata: {e}"
+            )
 
         # Get metadata from workers (tensors are already stored in Mooncake by workers)
         metadata_by_request: dict[str, dict] = {}

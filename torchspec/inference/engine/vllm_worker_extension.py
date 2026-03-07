@@ -429,7 +429,7 @@ class VllmWorkerExtension:
         self._captured_states = None
         self._request_metadata = []
         self._current_request_metadata = None
-        self._packed_loss_mask_map: Dict[str, str] = {}
+        self._packed_loss_mask_map: Dict[str, Optional[str]] = {}
         self._store_initialized = False
         self._store_setup_complete = False
         self._init_retry_count = 0
@@ -468,7 +468,7 @@ class VllmWorkerExtension:
     def _set_request_metadata(
         self,
         request_metadata: Dict[str, int],
-        packed_loss_mask_map: Optional[Dict[str, str]] = None,
+        packed_loss_mask_map: Optional[Dict[str, Optional[str]]] = None,
         input_ids_map: Optional[Dict[str, List[int]]] = None,
     ) -> None:
         """Set request metadata for the next forward pass.
@@ -478,7 +478,8 @@ class VllmWorkerExtension:
 
         Args:
             request_metadata: Dict mapping request_id -> num_prefill_tokens
-            packed_loss_mask_map: Optional dict mapping request_id -> packed_loss_mask string
+            packed_loss_mask_map: Optional dict mapping request_id -> packed_loss_mask
+                string (values may be None when loss masks are not available).
             input_ids_map: Optional dict mapping request_id -> input_ids list (passed via RPC)
         """
         self._current_request_metadata = request_metadata

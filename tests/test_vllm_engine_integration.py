@@ -194,17 +194,20 @@ if __name__ == "__main__":
 
     outputs = engine.generate(text_prompts, sampling_params, use_tqdm=False)
 
-    # Build metadata from outputs post-generation (same as VllmEngine does)
+    # Build authoritative metadata from outputs and set on workers,
+    # mirroring VllmEngine.generate()'s unconditional post-generation path.
     request_metadata = {}
     input_ids_map = {}
+    internal_to_external = {}
     for i, output in enumerate(outputs):
         did = prompt_data_ids[i]
         request_metadata[did] = len(output.prompt_token_ids)
         input_ids_map[did] = list(output.prompt_token_ids)
+        internal_to_external[output.request_id] = did
         print(f'  Request {i}: "{text_prompts[i]}" -> {len(output.prompt_token_ids)} tokens')
     engine.collective_rpc("_set_request_metadata", args=(request_metadata, {}, input_ids_map))
 
-    metadata = collect_metadata(engine)
+    metadata = collect_metadata(engine, internal_to_external=internal_to_external)
     all_keys = [metadata[did]["mooncake_key"] for did in prompt_data_ids]
     seq_lens = [request_metadata[did] for did in prompt_data_ids]
     assert len(metadata) == len(prompt_data_ids), (

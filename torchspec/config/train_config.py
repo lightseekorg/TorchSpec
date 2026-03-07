@@ -194,6 +194,19 @@ def _resolve_relative_paths(
             OmegaConf.update(config, dotted_key, os.path.abspath(os.path.join(base_dir, expanded)))
 
 
+def _validate_vllm_config(config: DictConfig) -> None:
+    """Raise if the vllm backend is selected with unsupported feature flags."""
+    if config.model.target_model_backend != "vllm":
+        return
+    unsupported_flags = {
+        "inference.vllm.enable_multimodal": "enable_multimodal",
+        "training.train_with_decode": "train_with_decode",
+    }
+    for key, label in unsupported_flags.items():
+        if OmegaConf.select(config, key):
+            raise NotImplementedError(f"{label} is not yet supported with the vllm backend!")
+
+
 def _save_config_snapshot(config: DictConfig) -> None:
     """Save the resolved config to output_dir/config.yaml if output_dir is set."""
     output_dir = OmegaConf.select(config, "output_dir", default=None)
@@ -236,6 +249,9 @@ def load_config(
 
     config = OmegaConf.merge(*configs_to_merge)
     _resolve_relative_paths(config, os.getcwd())
+
+    _validate_vllm_config(config)
+
     if save_snapshot:
         _save_config_snapshot(config)
 

@@ -408,7 +408,7 @@ class AsyncInferenceManager:
 
         if self._defer_tokenization:
             input_ids_ref = None
-            packed_loss_mask_list = [None] * len(entries)
+            packed_loss_mask_list = None
             assert all(e.formatted_prompt is not None for e in entries), (
                 "formatted_prompt is required when defer_tokenization is True"
             )

@@ -25,7 +25,6 @@ This file contains both:
 - Integration tests: Test with real vLLM engine (requires GPU + infrastructure)
 """
 
-import os
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
@@ -282,145 +281,189 @@ class TestTokenSlicingLogic:
 
 
 # =============================================================================
-# Integration Tests (Requires real GPU + vLLM + Mooncake)
+# VllmEngine.generate() metadata flow tests
 # =============================================================================
 
 
-@pytest.mark.integration
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Need at least 2 GPUs for TP=2")
-class TestVllmWorkerExtensionIntegration:
-    """Integration tests for vLLM Worker Extension with real infrastructure."""
+def _make_mock_output(request_id: str, prompt_token_ids: list[int]):
+    """Create a mock vLLM RequestOutput."""
+    out = MagicMock()
+    out.request_id = request_id
+    out.prompt_token_ids = prompt_token_ids
+    return out
 
-    @pytest.fixture(autouse=True)
-    def setup_env(self):
-        """Setup Mooncake environment variables."""
-        os.environ.setdefault("MOONCAKE_MASTER_HOST", "0.0.0.0")
-        os.environ.setdefault("MOONCAKE_MASTER_PORT", "50051")
-        os.environ.setdefault("MOONCAKE_METADATA_PORT", "8090")
-        yield
-        # Cleanup not needed for env vars
 
-    def test_vllm_worker_extension_mooncake(self):
-        """Test vLLM Worker Extension stores and retrieves hidden states from Mooncake."""
-        from transformers import AutoTokenizer
-        from vllm import LLM, SamplingParams
+def _build_engine_with_mock_vllm(metadata_by_request: dict):
+    """Build a VllmEngine whose _engine is a mock vLLM LLM.
 
-        from torchspec.transfer.mooncake import EagleMooncakeStore, MooncakeConfig
+    Returns (engine, mock_llm) so tests can inspect collective_rpc calls.
+    """
+    try:
+        from torchspec.inference.engine.vllm_engine import VllmEngine
+    except ImportError as e:
+        pytest.skip(f"VllmEngine import failed: {e}")
 
-        model_path = "Qwen/Qwen3-8B"
+    args = MagicMock()
+    args.target_model_path = "mock-model"
+    args.trust_remote_code = True
+    engine = VllmEngine.__new__(VllmEngine)
+    engine.args = args
+    engine.rank = 0
+    engine.base_gpu_id = 0
+    engine._hidden_size = 4096
+    engine.aux_hidden_state_layer_ids = [2, 4]
 
-        # Initialize tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+    mock_llm = MagicMock()
 
-        # Test inputs
-        input_ids_list = [
-            [1, 2345, 6789],
-            [100, 200, 300, 400],
-            [500, 600],
+    def _collective_rpc(method, args=(), kwargs=None):
+        if method == "_store_and_get_metadata":
+            return [metadata_by_request]
+        return [None]
+
+    mock_llm.collective_rpc = MagicMock(side_effect=_collective_rpc)
+    engine._engine = mock_llm
+    return engine, mock_llm
+
+
+class TestGenerateMetadataFlow:
+    """Test that generate() builds and sends request_metadata for both
+    the input_ids path and the formatted_prompts (defer_tokenization) path.
+    """
+
+    def test_input_ids_path_sends_metadata_twice(self):
+        """input_ids path: _set_request_metadata is called both pre- and
+        post-generation with correct token counts."""
+        ids_a = torch.tensor([10, 20, 30])
+        ids_b = torch.tensor([40, 50, 60, 70])
+        data_ids = ["a", "b"]
+
+        worker_meta = {
+            "a": {
+                "mooncake_key": "a",
+                "tensor_shapes": {},
+                "tensor_dtypes": {},
+                "input_ids_list": ids_a.tolist(),
+            },
+            "b": {
+                "mooncake_key": "b",
+                "tensor_shapes": {},
+                "tensor_dtypes": {},
+                "input_ids_list": ids_b.tolist(),
+            },
+        }
+        engine, mock_llm = _build_engine_with_mock_vllm(worker_meta)
+
+        mock_llm.generate.return_value = [
+            _make_mock_output("0", ids_a.tolist()),
+            _make_mock_output("1", ids_b.tolist()),
         ]
-        data_ids = ["test_req_0", "test_req_1", "test_req_2"]
 
-        # Initialize vLLM with Worker Extension
-        engine = LLM(
-            model=model_path,
-            tensor_parallel_size=2,
-            gpu_memory_utilization=0.7,
-            trust_remote_code=True,
-            worker_extension_cls="torchspec.inference.engine.vllm_worker_extension.VllmWorkerExtension",
-            max_model_len=2048,
+        results = engine.generate(
+            data_id=data_ids,
+            input_ids_ref=[ids_a, ids_b],
         )
 
-        try:
-            # Configure hidden states capture
-            engine.collective_rpc("_setup_hidden_states_capture", args=([5, 10, 15],))
+        set_meta_calls = [
+            c for c in mock_llm.collective_rpc.call_args_list if c[0][0] == "_set_request_metadata"
+        ]
+        assert len(set_meta_calls) == 2, (
+            f"Expected 2 _set_request_metadata calls, got {len(set_meta_calls)}"
+        )
 
-            # Prepare generation
-            prompts = [tokenizer.decode(ids) for ids in input_ids_list]
-            sampling_params = SamplingParams(max_tokens=32, temperature=0)
+        # Post-gen call (last one) must carry authoritative token counts
+        post_gen_args = set_meta_calls[-1][1]["args"]
+        req_meta = post_gen_args[0]
+        assert req_meta == {"a": 3, "b": 4}
 
-            # Setup request metadata
-            request_metadata = {data_ids[i]: len(ids) for i, ids in enumerate(input_ids_list)}
-            engine.collective_rpc("_reset_capture")
-            engine.collective_rpc("_set_request_metadata", args=(request_metadata,))
+        input_ids_map = post_gen_args[2]
+        assert input_ids_map == {"a": ids_a.tolist(), "b": ids_b.tolist()}
 
-            # Generate
-            print("=== Generating with vLLM Worker Extension ===")
-            outputs = engine.generate(prompts, sampling_params)
-            assert len(outputs) == len(input_ids_list), "Generation output count mismatch"
+        assert len(results) == 2
+        assert results[0]["data_id"] == "a"
+        assert results[1]["data_id"] == "b"
 
-            for i, output in enumerate(outputs):
-                print(f"\n--- Request {i} ---")
-                print(f"output_ids: {output.prompt_token_ids + list(output.outputs[0].token_ids)}")
-                print(f"num tokens generated: {len(output.outputs[0].token_ids)}")
+    def test_formatted_prompts_path_sends_metadata_post_gen(self):
+        """formatted_prompts (defer_tokenization) path: _set_request_metadata
+        is sent after generation with token counts from vLLM outputs."""
+        prompt_tokens_a = [10, 20, 30, 40, 50]
+        prompt_tokens_b = [60, 70, 80]
+        data_ids = ["p0", "p1"]
 
-            # Retrieve metadata from Mooncake
-            print("\n=== Retrieving metadata from Mooncake ===")
-            metadata_list = engine.collective_rpc("_store_and_get_metadata")
-            assert metadata_list is not None, "No metadata returned from workers"
+        worker_meta = {
+            "p0": {
+                "mooncake_key": "p0",
+                "tensor_shapes": {},
+                "tensor_dtypes": {},
+                "input_ids_list": prompt_tokens_a,
+            },
+            "p1": {
+                "mooncake_key": "p1",
+                "tensor_shapes": {},
+                "tensor_dtypes": {},
+                "input_ids_list": prompt_tokens_b,
+            },
+        }
+        engine, mock_llm = _build_engine_with_mock_vllm(worker_meta)
 
-            all_keys = []
-            seq_lens = []
-            for metadata in metadata_list:
-                if isinstance(metadata, dict):
-                    for req_id, meta in metadata.items():
-                        assert "mooncake_key" in meta
-                        assert "tensor_shapes" in meta
-                        assert "num_layers" in meta
-                        assert meta["num_layers"] == 3
-                        all_keys.append(meta["mooncake_key"])
-                        seq_lens.append(request_metadata[req_id])
-                        print(
-                            f"  {req_id}: key={meta['mooncake_key']}, layers={meta['num_layers']}"
-                        )
+        mock_llm.generate.return_value = [
+            _make_mock_output("0", prompt_tokens_a),
+            _make_mock_output("1", prompt_tokens_b),
+        ]
 
-            # Fetch data from Mooncake Store
-            print("\n=== Fetching data from Mooncake Store ===")
-            mooncake_config = MooncakeConfig.from_env()
-            mooncake_store = EagleMooncakeStore(mooncake_config)
-            mooncake_store.setup(device="cuda")
+        results = engine.generate(
+            data_id=data_ids,
+            formatted_prompts=["Hello world", "Goodbye"],
+        )
 
-            # Qwen3-8B dimensions
-            hidden_dim = 12288  # 3 layers concatenated (4096 * 3)
-            last_hidden_dim = 4096
+        set_meta_calls = [
+            c for c in mock_llm.collective_rpc.call_args_list if c[0][0] == "_set_request_metadata"
+        ]
+        # Only the post-gen call (pre-gen is skipped because request_metadata
+        # is empty before generation).
+        assert len(set_meta_calls) == 1
 
-            for i, key in enumerate(all_keys):
-                seq_len = seq_lens[i]
-                shapes = {
-                    "hidden_states": (seq_len, hidden_dim),
-                    "input_ids": (seq_len,),
-                    "last_hidden_states": (seq_len, last_hidden_dim),
-                }
-                dtypes = {
-                    "hidden_states": torch.bfloat16,
-                    "input_ids": torch.long,
-                    "last_hidden_states": torch.bfloat16,
-                }
+        post_gen_args = set_meta_calls[0][1]["args"]
+        req_meta = post_gen_args[0]
+        assert req_meta == {"p0": 5, "p1": 3}
 
-                data = mooncake_store.get(key, shapes=shapes, dtypes=dtypes, device="cuda")
-                print(f"\n  Key: {key}")
-                print(
-                    f"    hidden_states: shape={data.hidden_states.shape}, dtype={data.hidden_states.dtype}"
-                )
-                print(f"    input_ids: {data.input_ids.tolist()}")
-                print(f"    last_hidden_states: shape={data.last_hidden_states.shape}")
+        input_ids_map = post_gen_args[2]
+        assert input_ids_map == {"p0": prompt_tokens_a, "p1": prompt_tokens_b}
 
-                # Verify tensor device consistency
-                assert data.hidden_states.device == data.input_ids.device, (
-                    f"Device mismatch: hidden_states={data.hidden_states.device}, input_ids={data.input_ids.device}"
-                )
+        assert len(results) == 2
+        assert results[0]["input_ids_list"] == prompt_tokens_a
+        assert results[1]["input_ids_list"] == prompt_tokens_b
 
-            print("\n✓ Test completed - hidden states sent to Mooncake and retrieved successfully")
+    def test_formatted_prompts_with_no_packed_loss_mask(self):
+        """defer_tokenization path with packed_loss_mask_list=None works."""
+        tokens = [1, 2, 3]
+        worker_meta = {
+            "d0": {
+                "mooncake_key": "d0",
+                "tensor_shapes": {},
+                "tensor_dtypes": {},
+                "input_ids_list": tokens,
+            },
+        }
+        engine, mock_llm = _build_engine_with_mock_vllm(worker_meta)
+        mock_llm.generate.return_value = [_make_mock_output("0", tokens)]
 
-        finally:
-            # Cleanup
-            if hasattr(engine, "shutdown"):
-                engine.shutdown()
+        results = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["test"],
+            packed_loss_mask_list=None,
+        )
 
+        set_meta_calls = [
+            c for c in mock_llm.collective_rpc.call_args_list if c[0][0] == "_set_request_metadata"
+        ]
+        assert len(set_meta_calls) == 1
 
-# =============================================================================
-# Legacy main block (kept for backward compatibility)
-# =============================================================================
+        packed_map = set_meta_calls[0][1]["args"][1]
+        assert packed_map == {}
+
+        assert len(results) == 1
+        assert "packed_loss_mask" not in results[0]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
