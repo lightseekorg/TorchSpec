@@ -69,6 +69,7 @@ def compute_assistant_loss_mask(
     input_ids: torch.Tensor,
     assistant_header_ids: list[int],
     end_token_ids: list[int],
+    last_turn_only: bool = False,
 ) -> torch.Tensor:
     """Compute loss mask where 1s mark assistant content tokens only.
 
@@ -80,6 +81,7 @@ def compute_assistant_loss_mask(
         input_ids: 1-D tensor of token IDs (CPU or CUDA).
         assistant_header_ids: Token ID sequence marking the start of assistant content.
         end_token_ids: Token ID sequence marking the end of assistant content.
+        last_turn_only: If True, only the last assistant turn is marked.
 
     Returns:
         1-D long tensor on the same device as input_ids, with 1s for assistant
@@ -95,5 +97,13 @@ def compute_assistant_loss_mask(
     end_np = np.array(end_token_ids, dtype=np.int64)
     out = np.zeros(len(ids_np), dtype=np.int64)
     _numba_loss_mask(ids_np, header_np, len(header_np), end_np, len(end_np), out)
+
+    if last_turn_only and out.any():
+        last_one = len(out) - 1 - np.argmax(out[::-1])
+        first_of_last = last_one
+        while first_of_last > 0 and out[first_of_last - 1] == 1:
+            first_of_last -= 1
+        out[:first_of_last] = 0
+
     result = torch.from_numpy(out)
     return result.to(device) if device.type != "cpu" else result

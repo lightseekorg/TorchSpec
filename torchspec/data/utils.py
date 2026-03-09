@@ -22,12 +22,32 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 import torch
 from datasets import IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
 
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
+
+_IMAGE_CACHE_DIR = os.environ.get("TORCHSPEC_IMAGE_CACHE", "/data/ywang/image_cache")
+
+
+def resolve_image_url(url: str, cache_dir: str = _IMAGE_CACHE_DIR) -> str:
+    """Return local file path if a cached copy exists, otherwise the original URL."""
+    if not url or not url.startswith("http"):
+        return url
+    parsed = urlparse(url)
+    local_path = os.path.join(cache_dir, parsed.netloc, parsed.path.lstrip("/"))
+    if os.path.isfile(local_path):
+        return local_path
+    return url
+
+
+def resolve_image_urls(urls: list[str], cache_dir: str = _IMAGE_CACHE_DIR) -> list[str]:
+    """Resolve a list of image URLs to local paths where cached copies exist."""
+    return [resolve_image_url(u, cache_dir) for u in urls]
+
 
 _LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
 
@@ -52,11 +72,13 @@ class DataCollatorWithPadding:
         assistant_header_ids: Optional[List[int]] = None,
         end_token_ids: Optional[List[int]] = None,
         dynamic_loss_mask: bool = False,
+        last_turn_loss_only: bool = False,
     ):
         self.sp_degree = 1
         self.assistant_header_ids = assistant_header_ids
         self.end_token_ids = end_token_ids
         self.dynamic_loss_mask = dynamic_loss_mask
+        self.last_turn_loss_only = last_turn_loss_only
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
@@ -89,7 +111,10 @@ class DataCollatorWithPadding:
             if input_ids.dim() == 2:
                 input_ids = input_ids.squeeze(0)
             mask = compute_assistant_loss_mask(
-                input_ids, self.assistant_header_ids, self.end_token_ids
+                input_ids,
+                self.assistant_header_ids,
+                self.end_token_ids,
+                last_turn_only=self.last_turn_loss_only,
             )
             # Copy back to GPU.
             return mask[None, :].to(item["input_ids"].device)
