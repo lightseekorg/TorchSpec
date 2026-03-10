@@ -21,13 +21,12 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 from urllib.parse import urlparse
 
 import torch
 from datasets import IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
-
 
 _IMAGE_CACHE_DIR = os.environ.get("TORCHSPEC_IMAGE_CACHE", "/data/ywang/image_cache")
 

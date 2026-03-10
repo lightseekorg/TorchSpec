@@ -33,7 +33,13 @@ if TYPE_CHECKING:
 
     Conversation = List[Dict[str, Any]]
 
-__all__ = ["GeneralParser", "HarmonyParser", "KimiK25Parser", "create_parser", "has_thinking_content"]
+__all__ = [
+    "GeneralParser",
+    "HarmonyParser",
+    "KimiK25Parser",
+    "create_parser",
+    "has_thinking_content",
+]
 
 _HAS_THINKING_RE = re.compile(r"<think>(?!\s*</think>)")
 

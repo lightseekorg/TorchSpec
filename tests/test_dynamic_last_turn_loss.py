@@ -5,7 +5,6 @@ import torch
 from torchspec.data.parse import has_thinking_content
 from torchspec.data.utils import DataCollatorWithPadding
 
-
 # ── has_thinking_content detection ────────────────────────────────────
 
 
