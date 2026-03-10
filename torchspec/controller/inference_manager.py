@@ -481,6 +481,7 @@ class AsyncInferenceManager:
             tensor_shapes=output.get("tensor_shapes", {}),
             tensor_dtypes=output.get("tensor_dtypes", {}),
             packed_loss_mask=output.get("packed_loss_mask", entry.packed_loss_mask),
+            metadata=entry.metadata,
         )
 
     async def _forward_results(self, results: list[tuple[InferenceInput, Any | Exception]]) -> int:

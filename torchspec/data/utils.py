@@ -28,7 +28,6 @@ import torch
 from datasets import IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
 
-from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 _IMAGE_CACHE_DIR = os.environ.get("TORCHSPEC_IMAGE_CACHE", "/data/ywang/image_cache")
 
@@ -67,18 +66,8 @@ def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
 
 
 class DataCollatorWithPadding:
-    def __init__(
-        self,
-        assistant_header_ids: Optional[List[int]] = None,
-        end_token_ids: Optional[List[int]] = None,
-        dynamic_loss_mask: bool = False,
-        last_turn_loss_only: bool = False,
-    ):
+    def __init__(self):
         self.sp_degree = 1
-        self.assistant_header_ids = assistant_header_ids
-        self.end_token_ids = end_token_ids
-        self.dynamic_loss_mask = dynamic_loss_mask
-        self.last_turn_loss_only = last_turn_loss_only
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
@@ -93,36 +82,14 @@ class DataCollatorWithPadding:
         return outtensors
 
     def _get_loss_mask(self, item: Dict[str, Any]) -> torch.Tensor:
-        """Derive loss_mask for a single sample.
+        """Read the materialized loss_mask tensor from the item.
 
-        Priority:
-        1. dynamic_loss_mask flag → compute from input_ids token boundaries
-        2. packed_loss_mask string → unpack RLE-encoded mask
-        3. fallback → all-ones mask
+        Callers (e.g. MooncakeDataset) are responsible for computing and
+        attaching loss_mask before items reach the collator.
         """
-        if self.dynamic_loss_mask:
-            if self.assistant_header_ids is None or self.end_token_ids is None:
-                raise ValueError(
-                    "dynamic_loss_mask requires assistant_header_ids and "
-                    "end_token_ids to be set on the collator"
-                )
-            # TCP's input_ids are on CPU, so we can use input_ids_cpu directly.
-            input_ids = item.get("input_ids_cpu", item["input_ids"])
-            if input_ids.dim() == 2:
-                input_ids = input_ids.squeeze(0)
-            mask = compute_assistant_loss_mask(
-                input_ids,
-                self.assistant_header_ids,
-                self.end_token_ids,
-                last_turn_only=self.last_turn_loss_only,
-            )
-            # Copy back to GPU.
-            return mask[None, :].to(item["input_ids"].device)
-
-        if "packed_loss_mask" not in item or item["packed_loss_mask"] is None:
-            seq_len = item["input_ids"].shape[-1]
-            return torch.ones(1, seq_len, dtype=torch.long, device=item["input_ids"].device)
-        return unpack_loss_mask(item["packed_loss_mask"])[None, :]
+        if "loss_mask" in item and isinstance(item["loss_mask"], torch.Tensor):
+            return item["loss_mask"]
+        raise KeyError(f"loss_mask not found in item: {item}")
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item["input_ids"].shape[1] for item in features)

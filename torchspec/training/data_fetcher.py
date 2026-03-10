@@ -32,6 +32,8 @@ import torch
 from ray.util.queue import Queue as RayQueue
 from torch.utils.data import DataLoader, IterableDataset
 
+from torchspec.data.utils import unpack_loss_mask
+from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 from torchspec.utils.logging import logger
 
 
@@ -41,6 +43,7 @@ class TrainSample:
     tensor_shapes: Dict[str, Tuple[int, ...]]
     tensor_dtypes: Optional[Dict[str, torch.dtype]] = None
     packed_loss_mask: Optional[str] = None
+    last_turn_loss_only: Optional[bool] = None
 
 
 class MooncakeDataset(IterableDataset):
@@ -57,6 +60,10 @@ class MooncakeDataset(IterableDataset):
         device: torch.device,
         prefetch_factor: int = 2,
         timeout: Optional[float] = None,
+        assistant_header_ids: Optional[List[int]] = None,
+        end_token_ids: Optional[List[int]] = None,
+        dynamic_loss_mask: bool = False,
+        last_turn_loss_only: bool = False,
     ):
         """
         Args:
@@ -65,12 +72,20 @@ class MooncakeDataset(IterableDataset):
             device: Target device for tensors.
             prefetch_factor: Number of samples to prefetch in background thread.
             timeout: Timeout in seconds for waiting on queue. None means wait forever.
+            assistant_header_ids: Token IDs for assistant header (for loss mask skip check).
+            end_token_ids: Token IDs for end of turn (for loss mask skip check).
+            dynamic_loss_mask: Whether loss mask is computed dynamically from input_ids.
+            last_turn_loss_only: Global fallback for last-turn-only loss masking.
         """
         self.ray_queue = ray_queue
         self.mooncake_store = mooncake_store
         self.device = device
         self.prefetch_factor = prefetch_factor
         self.timeout = timeout
+        self.assistant_header_ids = assistant_header_ids
+        self.end_token_ids = end_token_ids
+        self.dynamic_loss_mask = dynamic_loss_mask
+        self.last_turn_loss_only = last_turn_loss_only
 
     def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
         """Load tensors from mooncake key into device memory."""
@@ -104,6 +119,8 @@ class MooncakeDataset(IterableDataset):
         result = tensors.to_tensor_dict()
         if sample.packed_loss_mask is not None:
             result["packed_loss_mask"] = sample.packed_loss_mask
+        if sample.last_turn_loss_only is not None:
+            result["last_turn_loss_only"] = sample.last_turn_loss_only
         return result
 
     def _cleanup_mooncake_data(self, sample: TrainSample) -> None:
@@ -118,12 +135,51 @@ class MooncakeDataset(IterableDataset):
             has_target=has_target,
         )
 
+    def _compute_loss_mask(self, data: Dict[str, Any]) -> torch.Tensor | None:
+        """Compute the loss mask for a sample and store it on the data dict.
+
+        This is the single place where loss masks are resolved for mooncake
+        samples, so the collator never needs to recompute.
+
+        Returns the 1-D mask tensor, or None if the mask is all zeros.
+        """
+        packed = data.get("packed_loss_mask")
+        if packed is not None:
+            mask = unpack_loss_mask(packed)
+            if not mask.any():
+                return None
+            data["loss_mask"] = mask
+            return mask
+
+        if self.dynamic_loss_mask and self.assistant_header_ids and self.end_token_ids:
+            input_ids = data.get("input_ids")
+            if input_ids is None:
+                return None
+            if input_ids.dim() == 2:
+                input_ids = input_ids.squeeze(0)
+            per_sample = data.get("last_turn_loss_only")
+            last_turn_only = per_sample if per_sample is not None else self.last_turn_loss_only
+            mask = compute_assistant_loss_mask(
+                input_ids,
+                self.assistant_header_ids,
+                self.end_token_ids,
+                last_turn_only=last_turn_only,
+            )
+            if not mask.any():
+                return None
+            data["loss_mask"] = mask
+            return mask
+
+        return torch.ones(1)  # non-None signals "don't skip"
+
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Iterate over samples synchronously.
 
         Blocks waiting for each item from the queue and loads from mooncake.
+        Skips samples whose loss mask is all zeros to avoid wasted compute.
         """
         yield_count = 0
+        skip_count = 0
         while True:
             logger.debug(f"__iter__: waiting for item from ray_queue (yield_count={yield_count})")
             try:
@@ -138,6 +194,15 @@ class MooncakeDataset(IterableDataset):
 
             logger.debug(f"__iter__: got item, mooncake_key={item.mooncake_key}")
             data = self._load_from_mooncake(item)
+
+            if self._compute_loss_mask(data) is None:
+                skip_count += 1
+                logger.warning(
+                    f"Skipping sample with all-zero loss mask "
+                    f"(mooncake_key={item.mooncake_key}, total_skipped={skip_count})"
+                )
+                continue
+
             # Note: target is computed in the collator from last_hidden_states for sglang mode
 
             # Add batch dimension if missing (sglang stores without batch dim)
@@ -174,6 +239,10 @@ def create_mooncake_dataloader(
     batch_size: int = 1,
     prefetch_factor: int = 2,
     timeout: Optional[float] = None,
+    assistant_header_ids: Optional[List[int]] = None,
+    end_token_ids: Optional[List[int]] = None,
+    dynamic_loss_mask: bool = False,
+    last_turn_loss_only: bool = False,
 ) -> DataLoader:
     """Create a DataLoader that fetches from mooncake via queue.
 
@@ -193,11 +262,25 @@ def create_mooncake_dataloader(
         batch_size: Number of samples per batch (= per_dp_rank_batch_size).
         prefetch_factor: Unused, kept for API compatibility.
         timeout: Timeout in seconds for waiting on queue. None means wait forever.
+        assistant_header_ids: Token IDs for assistant header (for loss mask skip check).
+        end_token_ids: Token IDs for end of turn (for loss mask skip check).
+        dynamic_loss_mask: Whether loss mask is computed dynamically from input_ids.
+        last_turn_loss_only: Global fallback for last-turn-only loss masking.
 
     Returns:
         DataLoader instance.
     """
-    dataset = MooncakeDataset(ray_queue, mooncake_store, device, prefetch_factor, timeout)
+    dataset = MooncakeDataset(
+        ray_queue,
+        mooncake_store,
+        device,
+        prefetch_factor,
+        timeout,
+        assistant_header_ids=assistant_header_ids,
+        end_token_ids=end_token_ids,
+        dynamic_loss_mask=dynamic_loss_mask,
+        last_turn_loss_only=last_turn_loss_only,
+    )
 
     return DataLoader(
         dataset,
@@ -232,6 +315,10 @@ class MooncakeDataFetcher:
         batch_size: int = 1,
         prefetch_factor: int = 2,
         timeout: Optional[float] = None,
+        assistant_header_ids: Optional[List[int]] = None,
+        end_token_ids: Optional[List[int]] = None,
+        dynamic_loss_mask: bool = False,
+        last_turn_loss_only: bool = False,
     ):
         self.batch_size = batch_size
         self._dataloader = create_mooncake_dataloader(
@@ -242,6 +329,10 @@ class MooncakeDataFetcher:
             batch_size=batch_size,
             prefetch_factor=prefetch_factor,
             timeout=timeout,
+            assistant_header_ids=assistant_header_ids,
+            end_token_ids=end_token_ids,
+            dynamic_loss_mask=dynamic_loss_mask,
+            last_turn_loss_only=last_turn_loss_only,
         )
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:

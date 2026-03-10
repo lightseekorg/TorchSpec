@@ -55,6 +55,15 @@ def _init_tokenize_worker(
     _worker_state["last_turn_loss_only"] = last_turn_loss_only
 
 
+def _resolve_last_turn_loss_only(messages):
+    ltlo = _worker_state.get("last_turn_loss_only", False)
+    if ltlo == "auto":
+        from torchspec.data.parse import has_thinking_content
+
+        return has_thinking_content(messages)
+    return bool(ltlo)
+
+
 def _tokenize_single(args):
     """Worker function — tokenize one sample."""
     messages, max_length, train_with_decode = args
@@ -68,7 +77,7 @@ def _tokenize_single(args):
         use_packed_loss_mask=True,
         add_generation_prompt=train_with_decode,
         return_formatted_text=True,
-        last_turn_loss_only=_worker_state.get("last_turn_loss_only", False),
+        last_turn_loss_only=_resolve_last_turn_loss_only(messages),
     )
     if not processed["input_ids"]:
         return None
@@ -82,7 +91,9 @@ def _tokenize_single(args):
     }
 
 
-def _init_format_worker(tokenizer_path, trust_remote_code, chat_template_name):
+def _init_format_worker(
+    tokenizer_path, trust_remote_code, chat_template_name, last_turn_loss_only=False
+):
     from torchspec.data.parse import create_parser
     from torchspec.utils.processing import load_tokenizer
 
@@ -90,6 +101,7 @@ def _init_format_worker(tokenizer_path, trust_remote_code, chat_template_name):
     tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
     _worker_state["template"] = TEMPLATE_REGISTRY.get(chat_template_name)
     _worker_state["parser"] = create_parser(tokenizer, _worker_state["template"])
+    _worker_state["last_turn_loss_only"] = last_turn_loss_only
 
 
 def _format_single(args):
@@ -98,11 +110,20 @@ def _format_single(args):
     """
     messages, _, train_with_decode = args
     messages = _normalize_conversation(messages)
+
+    result = {}
+    ltlo = _worker_state.get("last_turn_loss_only", False)
+    if ltlo == "auto":
+        from torchspec.data.parse import has_thinking_content
+
+        result["has_thinking"] = has_thinking_content(messages)
+
     parser = _worker_state["parser"]
     formatted = parser.format(messages, add_generation_prompt=train_with_decode)
     if not formatted:
         return None
-    return {"formatted_prompt": formatted}
+    result["formatted_prompt"] = formatted
+    return result
 
 
 def load_conversation_dataset(args):
@@ -185,16 +206,17 @@ def load_conversation_dataset(args):
     # Pass 2: process in parallel
     work_items = [(messages, max_length, train_with_decode) for _, messages, _ in raw_samples]
 
+    last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
     if defer_tokenization:
         worker_init = _init_format_worker
-        worker_initargs = (args.target_model_path, True, chat_template_name)
+        worker_initargs = (args.target_model_path, True, chat_template_name, last_turn_loss_only)
         worker_fn = _format_single
         desc = "Formatting dataset"
     else:
-        last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
         if last_turn_loss_only:
             logger.info(
-                "last_turn_loss_only=True: loss mask will only cover the last assistant turn"
+                f"last_turn_loss_only={last_turn_loss_only}: "
+                "loss mask will only cover the last assistant turn"
             )
         worker_init = _init_tokenize_worker
         worker_initargs = (args.target_model_path, True, chat_template_name, last_turn_loss_only)
@@ -221,9 +243,13 @@ def load_conversation_dataset(args):
         if result is None:
             skipped += 1
             continue
+        metadata = {}
+        if "has_thinking" in result:
+            metadata["has_thinking"] = result["has_thinking"]
+
         entry = {
             "data_id": data_id,
-            "metadata": {},
+            "metadata": metadata,
             "multimodal_inputs": multimodal_inputs,
             "formatted_prompt": result["formatted_prompt"],
         }
