@@ -159,6 +159,7 @@ class TestComputeLossMask:
         ds.end_token_ids = [30, 40]
         ds.dynamic_loss_mask = dynamic
         ds.last_turn_loss_only = last_turn_loss_only
+        ds.skip_after_header = 0
         return ds
 
     def test_packed_loss_mask_nonzero(self):

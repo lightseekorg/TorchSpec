@@ -24,7 +24,7 @@ import torch
 
 
 @numba.njit(cache=True)
-def _numba_loss_mask(ids, header, header_len, end, end_len, out):
+def _numba_loss_mask(ids, header, header_len, end, end_len, out, skip_after):
     n = len(ids)
     i = 0
     while i <= n - header_len:
@@ -36,7 +36,7 @@ def _numba_loss_mask(ids, header, header_len, end, end_len, out):
         if not match:
             i += 1
             continue
-        j = i + header_len
+        j = i + header_len + skip_after
         found_end = False
         while j <= n - end_len:
             end_match = True
@@ -70,6 +70,7 @@ def compute_assistant_loss_mask(
     assistant_header_ids: list[int],
     end_token_ids: list[int],
     last_turn_only: bool = False,
+    skip_after_header: int = 0,
 ) -> torch.Tensor:
     """Compute loss mask where 1s mark assistant content tokens only.
 
@@ -82,6 +83,9 @@ def compute_assistant_loss_mask(
         assistant_header_ids: Token ID sequence marking the start of assistant content.
         end_token_ids: Token ID sequence marking the end of assistant content.
         last_turn_only: If True, only the last assistant turn is marked.
+        skip_after_header: Number of tokens to skip after header match before
+            marking content. Use 1 when the header excludes a trailing newline
+            that BPE may merge with subsequent content.
 
     Returns:
         1-D long tensor on the same device as input_ids, with 1s for assistant
@@ -96,7 +100,7 @@ def compute_assistant_loss_mask(
     header_np = np.array(assistant_header_ids, dtype=np.int64)
     end_np = np.array(end_token_ids, dtype=np.int64)
     out = np.zeros(len(ids_np), dtype=np.int64)
-    _numba_loss_mask(ids_np, header_np, len(header_np), end_np, len(end_np), out)
+    _numba_loss_mask(ids_np, header_np, len(header_np), end_np, len(end_np), out, skip_after_header)
 
     if last_turn_only and out.any():
         last_one = len(out) - 1 - np.argmax(out[::-1])

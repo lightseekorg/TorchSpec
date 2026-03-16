@@ -79,7 +79,9 @@ class Trainer(abc.ABC):
 
         self.dynamic_loss_mask = getattr(args, "dynamic_loss_mask", False)
         self.last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
-        self.assistant_header_ids, self.end_token_ids = get_assistant_token_ids(self.args)
+        self.assistant_header_ids, self.end_token_ids, self.skip_after_header = (
+            get_assistant_token_ids(self.args)
+        )
 
         self.save_debug_train_data = getattr(args, "save_debug_train_data", None)
         self.max_dump_steps = getattr(args, "max_dump_steps", 5)
@@ -168,6 +170,7 @@ class Trainer(abc.ABC):
             end_token_ids=self.end_token_ids,
             dynamic_loss_mask=self.dynamic_loss_mask,
             last_turn_loss_only=self.last_turn_loss_only,
+            skip_after_header=self.skip_after_header,
         )
 
         logger.info(
@@ -199,6 +202,7 @@ class Trainer(abc.ABC):
             end_token_ids=self.end_token_ids,
             dynamic_loss_mask=self.dynamic_loss_mask,
             last_turn_loss_only=self.last_turn_loss_only,
+            skip_after_header=self.skip_after_header,
         )
         self._eval_collator = collator
         self._eval_cache: list[dict] = []
