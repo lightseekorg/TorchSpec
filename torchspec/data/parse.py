@@ -33,7 +33,40 @@ if TYPE_CHECKING:
 
     Conversation = List[Dict[str, Any]]
 
-__all__ = ["GeneralParser", "HarmonyParser", "KimiK25Parser", "create_parser"]
+__all__ = [
+    "GeneralParser",
+    "HarmonyParser",
+    "KimiK25Parser",
+    "create_parser",
+    "has_thinking_content",
+]
+
+_HAS_THINKING_RE = re.compile(r"<think>(?!\s*</think>)")
+
+
+def has_thinking_content(conversation: list) -> bool:
+    """Detect whether any assistant message contains real thinking content.
+
+    Checks for non-empty <think> blocks in message content and for
+    separate thinking/thinking_content or reasoning/reasoning_content
+    fields on the message dict. Must be called on the raw conversation
+    BEFORE formatting, since formatters (e.g. KimiK25Parser) inject
+    empty <think></think> tags.
+    """
+    for msg in conversation:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and _HAS_THINKING_RE.search(content):
+            return True
+        if (
+            msg.get("thinking")
+            or msg.get("thinking_content")
+            or msg.get("reasoning")
+            or msg.get("reasoning_content")
+        ):
+            return True
+    return False
 
 
 class Parser(ABC):

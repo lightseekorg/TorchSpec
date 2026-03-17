@@ -280,7 +280,7 @@ class TestPreprocessConversationsIntegration:
             {
                 "input_ids": result["input_ids"][0],
                 "attention_mask": result["attention_mask"][0],
-                "packed_loss_mask": result["packed_loss_mask"][0],
+                "loss_mask": unpack_loss_mask(result["packed_loss_mask"][0])[None, :],
             }
         ]
 

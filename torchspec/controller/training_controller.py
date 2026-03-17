@@ -446,12 +446,15 @@ class AsyncTrainingController:
         partitioned = self._partition_results(batch_results)
         for dp_rank, results in enumerate(partitioned):
             for result in results:
+                metadata = getattr(result, "metadata", {}) or {}
+                last_turn_loss_only = metadata.get("has_thinking")
                 queues[dp_rank].put(
                     TrainSample(
                         mooncake_key=result.mooncake_key,
                         tensor_shapes=result.tensor_shapes,
                         tensor_dtypes=result.tensor_dtypes,
                         packed_loss_mask=result.packed_loss_mask,
+                        last_turn_loss_only=last_turn_loss_only,
                     )
                 )
 

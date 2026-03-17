@@ -217,3 +217,49 @@ class TestLongContext:
         result = compute_assistant_loss_mask(ids_open, self.H, self.E)
         assert torch.equal(result, ref)
         assert result[-100:].sum() == 100
+
+
+# ── last_turn_only ───────────────────────────────────────────────────
+
+
+class TestLastTurnOnly:
+    H = [10, 20]
+    E = [30, 40]
+
+    def test_single_turn_unchanged(self):
+        ids = torch.tensor([10, 20, 1, 2, 3, 30, 40], dtype=torch.long)
+        result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)
+        assert result.tolist() == [0, 0, 1, 1, 1, 0, 0]
+
+    def test_two_turns_keeps_last(self):
+        ids = torch.tensor([10, 20, 1, 2, 30, 40, 10, 20, 3, 4, 30, 40], dtype=torch.long)
+        result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)
+        assert result.tolist() == [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0]
+
+    def test_three_turns_keeps_last(self):
+        ids = torch.tensor(
+            [10, 20, 1, 30, 40, 10, 20, 2, 30, 40, 10, 20, 3, 4, 5, 30, 40], dtype=torch.long
+        )
+        result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)
+        assert result.tolist() == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0]
+
+    def test_truncated_last_turn(self):
+        """Sequence cut mid-response — last turn has no end token."""
+        ids = torch.tensor([10, 20, 1, 30, 40, 10, 20, 2, 3], dtype=torch.long)
+        result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)
+        assert result.tolist() == [0, 0, 0, 0, 0, 0, 0, 1, 1]
+
+    def test_no_assistant_turns(self):
+        ids = torch.tensor([5, 6, 7, 8], dtype=torch.long)
+        result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)
+        assert result.tolist() == [0, 0, 0, 0]
+
+    def test_empty_input(self):
+        ids = torch.tensor([], dtype=torch.long)
+        result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)
+        assert result.tolist() == []
+
+    def test_false_flag_returns_all_turns(self):
+        ids = torch.tensor([10, 20, 1, 2, 30, 40, 10, 20, 3, 4, 30, 40], dtype=torch.long)
+        result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=False)
+        assert result.tolist() == [0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0]

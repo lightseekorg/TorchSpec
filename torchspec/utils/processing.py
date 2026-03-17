@@ -28,22 +28,41 @@ def load_tokenizer(name_or_path: str, **kwargs):
     return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
 
 
-def get_assistant_token_ids(args) -> tuple[list[int] | None, list[int] | None]:
-    """Derive assistant_header_ids and end_token_ids from chat_template config."""
+def get_assistant_token_ids(
+    args,
+) -> tuple[list[int] | None, list[int] | None, int]:
+    """Derive assistant_header_ids, end_token_ids, and skip_after_header.
+
+    Returns:
+        (header_ids, end_ids, skip_after_header) where skip_after_header is the
+        number of trailing-newline tokens stripped from the header to avoid BPE
+        merge issues. Pass this to ``compute_assistant_loss_mask`` so it skips
+        the formatting newline after the role name.
+    """
     from torchspec.data.template import TEMPLATE_REGISTRY
 
     chat_template_name = getattr(args, "chat_template", None)
     if not chat_template_name:
-        return None, None
+        return None, None, 0
 
     template = TEMPLATE_REGISTRY.get(chat_template_name)
     if not template.assistant_header or not template.end_of_turn_token:
-        return None, None
+        return None, None, 0
 
     tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
-    assistant_header_ids = tokenizer.encode(template.assistant_header, add_special_tokens=False)
+
+    full_ids = tokenizer.encode(template.assistant_header, add_special_tokens=False)
+    header_text = template.assistant_header.rstrip("\n")
+    stripped_ids = tokenizer.encode(header_text, add_special_tokens=False)
+    # BPE tokenizers may merge the header's trailing \n with content-leading
+    # newlines into a single multi-char token, breaking subsequence matching.
+    # We tokenize without the trailing \n and tell the mask function to skip
+    # the newline token(s) that follow.
+    skip_after_header = len(full_ids) - len(stripped_ids)
+
     end_token_ids = tokenizer.encode(template.end_of_turn_token, add_special_tokens=False)
     logger.info(
-        f"Assistant loss mask token IDs: header={assistant_header_ids}, end={end_token_ids}"
+        f"Assistant loss mask token IDs: header={stripped_ids}, end={end_token_ids}, "
+        f"skip_after_header={skip_after_header}"
     )
-    return assistant_header_ids, end_token_ids
+    return stripped_ids, end_token_ids, skip_after_header

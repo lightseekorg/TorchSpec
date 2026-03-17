@@ -78,7 +78,10 @@ class Trainer(abc.ABC):
         self.prof = TrainProfiler(args)
 
         self.dynamic_loss_mask = getattr(args, "dynamic_loss_mask", False)
-        self.assistant_header_ids, self.end_token_ids = get_assistant_token_ids(self.args)
+        self.last_turn_loss_only = getattr(args, "last_turn_loss_only", False)
+        self.assistant_header_ids, self.end_token_ids, self.skip_after_header = (
+            get_assistant_token_ids(self.args)
+        )
 
         self.save_debug_train_data = getattr(args, "save_debug_train_data", None)
         self.max_dump_steps = getattr(args, "max_dump_steps", 5)
@@ -155,11 +158,7 @@ class Trainer(abc.ABC):
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding(
-            assistant_header_ids=self.assistant_header_ids,
-            end_token_ids=self.end_token_ids,
-            dynamic_loss_mask=self.dynamic_loss_mask,
-        )
+        collator = DataCollatorWithPadding()
 
         self.data_fetcher = MooncakeDataFetcher(
             queue=self.train_queue,
@@ -167,6 +166,11 @@ class Trainer(abc.ABC):
             collator=collator,
             device=torch.cuda.current_device(),
             batch_size=per_dp_rank_batch_size,
+            assistant_header_ids=self.assistant_header_ids,
+            end_token_ids=self.end_token_ids,
+            dynamic_loss_mask=self.dynamic_loss_mask,
+            last_turn_loss_only=self.last_turn_loss_only,
+            skip_after_header=self.skip_after_header,
         )
 
         logger.info(
@@ -186,11 +190,7 @@ class Trainer(abc.ABC):
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding(
-            assistant_header_ids=self.assistant_header_ids,
-            end_token_ids=self.end_token_ids,
-            dynamic_loss_mask=self.dynamic_loss_mask,
-        )
+        collator = DataCollatorWithPadding()
 
         self._eval_data_fetcher = MooncakeDataFetcher(
             queue=queue,
@@ -198,6 +198,11 @@ class Trainer(abc.ABC):
             collator=collator,
             device=torch.cuda.current_device(),
             batch_size=per_dp_rank_batch_size,
+            assistant_header_ids=self.assistant_header_ids,
+            end_token_ids=self.end_token_ids,
+            dynamic_loss_mask=self.dynamic_loss_mask,
+            last_turn_loss_only=self.last_turn_loss_only,
+            skip_after_header=self.skip_after_header,
         )
         self._eval_collator = collator
         self._eval_cache: list[dict] = []
