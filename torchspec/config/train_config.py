@@ -97,6 +97,9 @@ class TrainingConfig:
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1
     fsdp_strategy: str = "REPLICATE"
+    # Controls which workload claims head-node GPUs first under PACK strategy.
+    # "training_first" (default) or "inference_first". Extensible to custom mappings later.
+    placement_strategy: str = "training_first"
 
     gradient_checkpointing: bool = False
     learning_rate: float = 1e-4

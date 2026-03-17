@@ -193,15 +193,30 @@ def create_placement_groups(args):
         f"{num_training_gpus} GPUs for training..."
     )
 
-    logger.info("Creating inference placement group...")
-    inference_pg, inference_bundle_indices, inference_gpu_ids = _create_placement_group(
-        num_inference_gpus, strategy="PACK", name="inference_pg"
-    )
+    placement_strategy = getattr(args, "placement_strategy", "training_first")
 
-    logger.info("Creating training placement group...")
-    training_pg, training_bundle_indices, training_gpu_ids = _create_placement_group(
-        num_training_gpus, strategy="PACK", name="training_pg"
-    )
+    if placement_strategy == "training_first":
+        logger.info(
+            "Creating training placement group first (placement_strategy=training_first)..."
+        )
+        training_pg, training_bundle_indices, training_gpu_ids = _create_placement_group(
+            num_training_gpus, strategy="PACK", name="training_pg"
+        )
+        logger.info("Creating inference placement group...")
+        inference_pg, inference_bundle_indices, inference_gpu_ids = _create_placement_group(
+            num_inference_gpus, strategy="PACK", name="inference_pg"
+        )
+    else:
+        logger.info(
+            "Creating inference placement group first (placement_strategy=inference_first)..."
+        )
+        inference_pg, inference_bundle_indices, inference_gpu_ids = _create_placement_group(
+            num_inference_gpus, strategy="PACK", name="inference_pg"
+        )
+        logger.info("Creating training placement group...")
+        training_pg, training_bundle_indices, training_gpu_ids = _create_placement_group(
+            num_training_gpus, strategy="PACK", name="training_pg"
+        )
 
     return {
         "training": (training_pg, training_bundle_indices, training_gpu_ids),
