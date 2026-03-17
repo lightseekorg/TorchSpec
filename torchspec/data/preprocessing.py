@@ -76,7 +76,12 @@ def _normalize_conversation(conversation: Conversation) -> Conversation:
         normalized = []
         for msg in conversation:
             role = ROLE_MAPPING.get(msg["from"], msg["from"])
-            normalized.append({"role": role, "content": msg["value"]})
+            entry = {"role": role, "content": msg["value"]}
+            for field in ("thinking", "thinking_content", "reasoning_content", "reasoning"):
+                if msg.get(field):
+                    entry["reasoning_content"] = msg[field]
+                    break
+            normalized.append(entry)
         return normalized
 
     return conversation

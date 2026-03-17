@@ -32,8 +32,7 @@ import torch
 from ray.util.queue import Queue as RayQueue
 from torch.utils.data import DataLoader, IterableDataset
 
-from torchspec.data.utils import unpack_loss_mask
-from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
+from torchspec.data.utils import resolve_loss_mask
 from torchspec.utils.logging import logger
 
 
@@ -126,42 +125,14 @@ class MooncakeDataset(IterableDataset):
         )
 
     def _compute_loss_mask(self, data: Dict[str, Any]) -> torch.Tensor | None:
-        """Compute the loss mask for a sample and store it on the data dict.
-
-        This is the single place where loss masks are resolved for mooncake
-        samples, so the collator never needs to recompute.
-
-        Returns the 1-D mask tensor, or None if the mask is all zeros.
-        """
-        packed = data.get("packed_loss_mask")
-        if packed is not None:
-            mask = unpack_loss_mask(packed)
-            if not mask.any():
-                return None
-            data["loss_mask"] = mask
-            return mask
-
-        if self.dynamic_loss_mask and self.assistant_header_ids and self.end_token_ids:
-            input_ids = data.get("input_ids")
-            if input_ids is None:
-                return None
-            if input_ids.dim() == 2:
-                input_ids = input_ids.squeeze(0)
-            per_sample = data.get("last_turn_loss_only")
-            last_turn_only = per_sample if per_sample is not None else self.last_turn_loss_only
-            mask = compute_assistant_loss_mask(
-                input_ids,
-                self.assistant_header_ids,
-                self.end_token_ids,
-                last_turn_only=last_turn_only,
-                skip_after_header=self.skip_after_header,
-            )
-            if not mask.any():
-                return None
-            data["loss_mask"] = mask
-            return mask
-
-        return torch.ones(1)  # non-None signals "don't skip"
+        return resolve_loss_mask(
+            data,
+            dynamic_loss_mask=self.dynamic_loss_mask,
+            assistant_header_ids=self.assistant_header_ids,
+            end_token_ids=self.end_token_ids,
+            last_turn_loss_only=self.last_turn_loss_only,
+            skip_after_header=self.skip_after_header,
+        )
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Iterate over samples synchronously.

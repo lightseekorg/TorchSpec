@@ -21,31 +21,13 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Union
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from datasets import IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
 
-_IMAGE_CACHE_DIR = os.environ.get("TORCHSPEC_IMAGE_CACHE", "/data/ywang/image_cache")
-
-
-def resolve_image_url(url: str, cache_dir: str = _IMAGE_CACHE_DIR) -> str:
-    """Return local file path if a cached copy exists, otherwise the original URL."""
-    if not url or not url.startswith("http"):
-        return url
-    parsed = urlparse(url)
-    local_path = os.path.join(cache_dir, parsed.netloc, parsed.path.lstrip("/"))
-    if os.path.isfile(local_path):
-        return local_path
-    return url
-
-
-def resolve_image_urls(urls: list[str], cache_dir: str = _IMAGE_CACHE_DIR) -> list[str]:
-    """Resolve a list of image URLs to local paths where cached copies exist."""
-    return [resolve_image_url(u, cache_dir) for u in urls]
-
+from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 _LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
 
@@ -208,6 +190,52 @@ def unpack_loss_mask(packed: Union[List[int], str]) -> torch.Tensor:
         pos += length
 
     return loss_mask
+
+
+def resolve_loss_mask(
+    data: Dict[str, Any],
+    *,
+    dynamic_loss_mask: bool = False,
+    assistant_header_ids: Optional[List[int]] = None,
+    end_token_ids: Optional[List[int]] = None,
+    last_turn_loss_only: bool = False,
+    skip_after_header: int = 0,
+) -> torch.Tensor | None:
+    """
+    Two strategies, tried in order:
+    1. ``packed_loss_mask`` key present → unpack it.
+    2. ``dynamic_loss_mask`` enabled with valid header/end ids → compute from
+       ``input_ids`` via :func:`compute_assistant_loss_mask`.
+    """
+    packed = data.get("packed_loss_mask")
+    if packed is not None:
+        mask = unpack_loss_mask(packed)
+        if not mask.any():
+            return None
+        data["loss_mask"] = mask
+        return mask
+
+    if dynamic_loss_mask and assistant_header_ids and end_token_ids:
+        input_ids = data.get("input_ids")
+        if input_ids is None:
+            return None
+        if input_ids.dim() == 2:
+            input_ids = input_ids.squeeze(0)
+        per_sample = data.get("last_turn_loss_only")
+        last_turn_only = per_sample if per_sample is not None else last_turn_loss_only
+        mask = compute_assistant_loss_mask(
+            input_ids,
+            assistant_header_ids,
+            end_token_ids,
+            last_turn_only=last_turn_only,
+            skip_after_header=skip_after_header,
+        )
+        if not mask.any():
+            return None
+        data["loss_mask"] = mask
+        return mask
+
+    return torch.ones(1)
 
 
 def serialize_packed_loss_mask(packed: List[int]) -> str:

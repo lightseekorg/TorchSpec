@@ -26,7 +26,8 @@ import os
 import torch
 from tqdm import tqdm
 
-from torchspec.data.preprocessing import _normalize_conversation
+from torchspec.data.parse import create_parser, has_thinking_content
+from torchspec.data.preprocessing import _normalize_conversation, preprocess_conversations
 from torchspec.data.template import TEMPLATE_REGISTRY
 from torchspec.data.utils import (
     estimate_row_count,
@@ -35,6 +36,7 @@ from torchspec.data.utils import (
     load_hf_dataset,
 )
 from torchspec.utils.logging import logger
+from torchspec.utils.processing import load_tokenizer
 
 _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
 
@@ -45,9 +47,6 @@ def _init_tokenize_worker(
     tokenizer_path, trust_remote_code, chat_template_name, last_turn_loss_only=False
 ):
     """Initializer for each worker process — loads tokenizer once."""
-    from torchspec.data.preprocessing import preprocess_conversations
-    from torchspec.utils.processing import load_tokenizer
-
     _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
     _worker_state["tokenizer"] = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
     _worker_state["template"] = TEMPLATE_REGISTRY.get(chat_template_name)
@@ -58,8 +57,6 @@ def _init_tokenize_worker(
 def _resolve_last_turn_loss_only(messages):
     ltlo = _worker_state.get("last_turn_loss_only", False)
     if ltlo == "auto":
-        from torchspec.data.parse import has_thinking_content
-
         return has_thinking_content(messages)
     return bool(ltlo)
 
@@ -94,9 +91,6 @@ def _tokenize_single(args):
 def _init_format_worker(
     tokenizer_path, trust_remote_code, chat_template_name, last_turn_loss_only=False
 ):
-    from torchspec.data.parse import create_parser
-    from torchspec.utils.processing import load_tokenizer
-
     _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
     tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
     _worker_state["template"] = TEMPLATE_REGISTRY.get(chat_template_name)
@@ -114,12 +108,12 @@ def _format_single(args):
     result = {}
     ltlo = _worker_state.get("last_turn_loss_only", False)
     if ltlo == "auto":
-        from torchspec.data.parse import has_thinking_content
-
         result["has_thinking"] = has_thinking_content(messages)
 
     parser = _worker_state["parser"]
-    formatted = parser.format(messages, add_generation_prompt=train_with_decode)
+    formatted = parser.format(
+        messages, add_generation_prompt=train_with_decode, expand_media_tokens=False
+    )
     if not formatted:
         return None
     result["formatted_prompt"] = formatted
@@ -162,10 +156,13 @@ def load_conversation_dataset(args):
         file_stat = f"-{st.st_size}-{st.st_mtime}"
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
     train_with_decode = getattr(args, "train_with_decode", False)
+    max_images_cfg = getattr(args, "max_images_per_sample", None)
+    tokens_per_image_cfg = getattr(args, "tokens_per_image", 3000)
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-{chat_template_name}-ltlo={last_turn_loss_only_flag}"
         f"-defer={defer_tokenization}-decode={train_with_decode}"
+        f"-mimg={max_images_cfg}-tpi={tokens_per_image_cfg}"
     )
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
@@ -198,6 +195,43 @@ def load_conversation_dataset(args):
         flatten_multimodal_content(messages, custom_template.image_placeholder)
         data_id = sample.get("id", f"sample_{idx}")
         raw_samples.append((data_id, messages, multimodal_inputs))
+
+    # Filter samples that would exceed max_seq_length after image token expansion
+    max_images = getattr(args, "max_images_per_sample", None)
+    tokens_per_image = getattr(args, "tokens_per_image", 3000)
+    pre_filter_count = len(raw_samples)
+    filtered_samples = []
+    for data_id, messages, multimodal_inputs in raw_samples:
+        num_images = 0
+        if multimodal_inputs and multimodal_inputs.get("images"):
+            num_images = len(multimodal_inputs["images"])
+
+        if max_images is not None and num_images > max_images:
+            logger.debug(
+                f"Dropping sample {data_id}: {num_images} images > max_images_per_sample={max_images}"
+            )
+            continue
+
+        text_chars = sum(
+            len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str)
+        )
+        estimated_tokens = text_chars // 4 + num_images * tokens_per_image
+        if estimated_tokens > max_length:
+            logger.debug(
+                f"Dropping sample {data_id}: estimated {estimated_tokens} tokens "
+                f"({text_chars} text chars + {num_images} images) > max_seq_length={max_length}"
+            )
+            continue
+
+        filtered_samples.append((data_id, messages, multimodal_inputs))
+
+    raw_samples = filtered_samples
+    if pre_filter_count - len(raw_samples) > 0:
+        logger.info(
+            f"Filtered {pre_filter_count - len(raw_samples)}/{pre_filter_count} samples "
+            f"exceeding estimated token budget (max_seq_length={max_length}, "
+            f"tokens_per_image={tokens_per_image}, max_images_per_sample={max_images})"
+        )
 
     logger.info(
         f"Loaded {len(raw_samples)} samples, {mode_label.lower()} with {num_proc} workers..."

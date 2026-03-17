@@ -3,7 +3,7 @@
 import torch
 
 from torchspec.data.parse import has_thinking_content
-from torchspec.data.utils import DataCollatorWithPadding
+from torchspec.data.utils import DataCollatorWithPadding, resolve_loss_mask
 
 # ── has_thinking_content detection ────────────────────────────────────
 
@@ -118,6 +118,34 @@ class TestHasThinkingContent:
         ]
         assert has_thinking_content(conv) is False
 
+    def test_reasoning_content_field(self):
+        conv = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!", "reasoning_content": "Let me think..."},
+        ]
+        assert has_thinking_content(conv) is True
+
+    def test_reasoning_field(self):
+        conv = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!", "reasoning": "step by step"},
+        ]
+        assert has_thinking_content(conv) is True
+
+    def test_empty_reasoning_content_field(self):
+        conv = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!", "reasoning_content": ""},
+        ]
+        assert has_thinking_content(conv) is False
+
+    def test_none_reasoning_content_field(self):
+        conv = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!", "reasoning_content": None},
+        ]
+        assert has_thinking_content(conv) is False
+
 
 # ── Collator reads pre-computed loss_mask from MooncakeDataset ────────
 
@@ -145,78 +173,87 @@ class TestCollatorPrecomputedMask:
             collator._get_loss_mask(item)
 
 
-# ── MooncakeDataset._compute_loss_mask (single source of truth) ──────
+# ── resolve_loss_mask (single source of truth in data/utils.py) ───────
+
+_HEADER = [10, 20]
+_END = [30, 40]
 
 
-class TestComputeLossMask:
-    """Test that _compute_loss_mask computes, stores, and skips correctly."""
-
-    def _make_dataset(self, dynamic=True, last_turn_loss_only=False):
-        from torchspec.training.data_fetcher import MooncakeDataset
-
-        ds = MooncakeDataset.__new__(MooncakeDataset)
-        ds.assistant_header_ids = [10, 20]
-        ds.end_token_ids = [30, 40]
-        ds.dynamic_loss_mask = dynamic
-        ds.last_turn_loss_only = last_turn_loss_only
-        ds.skip_after_header = 0
-        return ds
+class TestResolveLossMask:
+    """Test that resolve_loss_mask computes, stores, and skips correctly."""
 
     def test_packed_loss_mask_nonzero(self):
-        ds = self._make_dataset(dynamic=False)
         data = {"packed_loss_mask": "2,3,2"}
-        mask = ds._compute_loss_mask(data)
+        mask = resolve_loss_mask(data)
         assert mask is not None
         assert mask.tolist() == [0, 0, 1, 1, 1, 0, 0]
         assert "loss_mask" in data
 
     def test_packed_loss_mask_zero(self):
-        ds = self._make_dataset(dynamic=False)
         data = {"packed_loss_mask": "10"}
-        assert ds._compute_loss_mask(data) is None
+        assert resolve_loss_mask(data) is None
 
     def test_dynamic_mask_nonzero(self):
-        ds = self._make_dataset(dynamic=True)
         data = {"input_ids": torch.tensor([10, 20, 1, 2, 30, 40], dtype=torch.long)}
-        mask = ds._compute_loss_mask(data)
+        mask = resolve_loss_mask(
+            data,
+            dynamic_loss_mask=True,
+            assistant_header_ids=_HEADER,
+            end_token_ids=_END,
+        )
         assert mask is not None
         assert mask.tolist() == [0, 0, 1, 1, 0, 0]
         assert "loss_mask" in data
 
     def test_dynamic_mask_zero(self):
-        ds = self._make_dataset(dynamic=True)
         data = {"input_ids": torch.tensor([5, 6, 7, 8], dtype=torch.long)}
-        assert ds._compute_loss_mask(data) is None
+        assert (
+            resolve_loss_mask(
+                data,
+                dynamic_loss_mask=True,
+                assistant_header_ids=_HEADER,
+                end_token_ids=_END,
+            )
+            is None
+        )
 
     def test_dynamic_mask_per_sample_last_turn_only(self):
-        ds = self._make_dataset(dynamic=True, last_turn_loss_only=False)
         ids = [10, 20, 1, 30, 40, 10, 20, 2, 30, 40]
         data = {
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "last_turn_loss_only": True,
         }
-        mask = ds._compute_loss_mask(data)
+        mask = resolve_loss_mask(
+            data,
+            dynamic_loss_mask=True,
+            assistant_header_ids=_HEADER,
+            end_token_ids=_END,
+            last_turn_loss_only=False,
+        )
         assert mask is not None
         assert mask.tolist() == [0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
         assert "loss_mask" in data
 
     def test_dynamic_mask_per_sample_all_turns(self):
-        ds = self._make_dataset(dynamic=True, last_turn_loss_only=True)
         ids = [10, 20, 1, 2, 30, 40, 10, 20, 3, 4, 30, 40]
         data = {
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "last_turn_loss_only": False,
         }
-        mask = ds._compute_loss_mask(data)
+        mask = resolve_loss_mask(
+            data,
+            dynamic_loss_mask=True,
+            assistant_header_ids=_HEADER,
+            end_token_ids=_END,
+            last_turn_loss_only=True,
+        )
         assert mask is not None
         assert mask.tolist() == [0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0]
 
     def test_no_params_defaults_nonzero(self):
-        ds = self._make_dataset(dynamic=False)
         data = {"input_ids": torch.tensor([1, 2, 3], dtype=torch.long)}
-        assert ds._compute_loss_mask(data) is not None
+        assert resolve_loss_mask(data) is not None
 
     def test_empty_packed_loss_mask(self):
-        ds = self._make_dataset(dynamic=False)
         data = {"packed_loss_mask": ""}
-        assert ds._compute_loss_mask(data) is None
+        assert resolve_loss_mask(data) is None
