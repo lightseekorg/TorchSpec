@@ -241,6 +241,20 @@ def _prepare_sgl_engines(
                 dist_init_addrs[replica_idx] = addr
                 logger.info(f"Replica {replica_idx}: auto-negotiated dist_init_addr: {addr}")
 
+    # Step 2.5: Pre-allocate ports to avoid TOCTOU races between parallel engines.
+    # Each engine needs 2 consecutive ports; allocate sequentially so engines
+    # on the same node never collide.
+    pre_allocated_ports: dict[int, int] = {}
+    next_start = 10000
+    for i in range(num_engines):
+        port = ray.get(
+            engines[i].find_free_port.remote(start_port=next_start, consecutive=2),
+            timeout=30,
+        )
+        pre_allocated_ports[i] = port
+        next_start = port + 2
+        logger.info(f"Engine {i}: pre-allocated ports {port}, {port + 1}")
+
     # Step 3: Fire init() on all engines (non-blocking)
     init_handles = []
     for i, engine in enumerate(engines):
@@ -249,6 +263,7 @@ def _prepare_sgl_engines(
             engine.init.remote(
                 mooncake_config=mooncake_config,
                 dist_init_addr=dist_init_addrs.get(replica_idx),
+                pre_allocated_port=pre_allocated_ports.get(i),
             )
         )
 

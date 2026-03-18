@@ -40,7 +40,7 @@ from torchspec.inference.engine.base import InferenceEngine
 from torchspec.inference.engine.sgl_engine_decode import SglDecodeEngineMixin
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
-from torchspec.utils.misc import get_default_eagle3_aux_layer_ids, get_free_port
+from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
 
 # Keys that users might plausibly put in extra_args but are managed by
 # TorchSpec.  Used only to emit a warning — the actual protection comes
@@ -103,7 +103,12 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         self.local_gpu_id = None
         setup_file_logging("inference", self.rank, group=engine_group)
 
-    def init(self, mooncake_config=None, dist_init_addr: str | None = None) -> None:
+    def init(
+        self,
+        mooncake_config=None,
+        dist_init_addr: str | None = None,
+        pre_allocated_port: int | None = None,
+    ) -> None:
         """Initialize the sgl.Engine on the allocated GPU.
 
         This is called after the Ray actor is scheduled on a node.
@@ -111,6 +116,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         Args:
             mooncake_config: MooncakeConfig object for distributed storage.
             dist_init_addr: Address for sglang cross-node NCCL init (auto-negotiated by factory).
+            pre_allocated_port: Base port pre-allocated by the factory. Required for
+                single-node setups; multi-node engines fall back to local scan.
         """
         if self.base_gpu_id is not None:
             self.local_gpu_id = self.setup_gpu(self.base_gpu_id)
@@ -245,12 +252,12 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         else:
             engine_kwargs["disable_cuda_graph"] = True
 
-        # Each engine needs 2 consecutive ports (service + NCCL).  Offset the
-        # search start by rank so parallel engines on the same node never probe
-        # the same range.
-        base_port = get_free_port(start_port=10000 + self.rank * 2, consecutive=2)
-        engine_kwargs["port"] = base_port
-        engine_kwargs["nccl_port"] = base_port + 1
+        assert pre_allocated_port is not None, (
+            f"SglEngine rank {self.rank}: pre_allocated_port is required "
+            "(ports must be pre-allocated by the factory)"
+        )
+        engine_kwargs["port"] = pre_allocated_port
+        engine_kwargs["nccl_port"] = pre_allocated_port + 1
 
         # Multi-node TP support — always set nnodes/node_rank
         engine_kwargs["nnodes"] = nnodes
