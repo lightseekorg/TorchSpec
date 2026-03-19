@@ -1,0 +1,79 @@
+# MiniMax-M2.5 Eagle3 training — 5-node setup
+#
+# GPU allocation (40 GPUs across 5 nodes):
+#   - Node 0-2: 24 GPUs for inference (6 engines x TP=4)
+#   - Node 3-4: 16 GPUs for training (FSDP across 16 GPUs)
+#
+# Usage:
+#   ./examples/minimax-m25-5node-h200/run.sh [CONFIG_FILE] [EXTRA_ARGS...]
+
+model:
+  target_model_path: MiniMaxAI/MiniMax-M2.5
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ???
+  eval_data_path: ???
+  chat_template: minimax-m2
+  prompt_key: conversations
+  defer_tokenization: true
+  eval_interval: 100
+
+training:
+  max_seq_length: 120000
+  seed: 42
+  micro_batch_size: 1
+  num_epochs: 2
+  # save_interval: 100
+  learning_rate: 5e-5
+  warmup_ratio: 0.015
+  max_grad_norm: 1
+  ttt_length: 4
+  draft_accumulation_steps: 1
+  training_num_nodes: 2
+  training_num_gpus_per_node: 8
+  attention_backend: flex_attention
+  max_concurrent_batches: 1
+  gradient_checkpointing: true
+  distributed_timeout_minutes: 30
+
+inference:
+  inference_engine_type: sgl
+  inference_num_gpus: 24
+  inference_num_gpus_per_engine: 4
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 32
+  inference_batch_size: 2
+  sglang:
+    tp_size: 4
+    mem_fraction_static: 0.6
+    init_timeout: 1800
+    extra_args:
+      context_length: 196608
+      model_loader_extra_config:
+        enable_multithread_load: true
+        num_threads: 32
+      disable_flashinfer_autotune: true
+      watchdog_timeout: 1800
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  hidden_dim: 3072
+  global_segment_size: 256GB
+  local_buffer_size: 32GB
+  protocol: rdma
+  device_name: mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11
+  enable_gpu_direct: false
+  kv_lease_ttl_s: 3.0
+
+output_dir: ./outputs/sglang_minimax_m25_5node
+cache_dir: ./cache/sglang_minimax_m25_5node
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false
