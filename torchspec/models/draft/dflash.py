@@ -328,15 +328,25 @@ class DFlashDecoderLayer(nn.Module):
 def build_target_layer_ids(num_target_layers: int, num_hidden_layers: int) -> List[int]:
     """Compute uniformly spaced layer IDs from the target model.
 
-    Matches SpecForge's build_target_layer_ids():
+    Matches SpecForge's build_target_layer_ids() exactly:
+      start = 1, end = num_hidden_layers - 3, span = end - start
       For num_target_layers=5 and num_hidden_layers=36:
-        interval = (36-1) / (5-1) = 8.75
-        → [1, 9, 17, 25, 33]  (rounded from [1, 9.75, 18.5, 27.25, 36-1=35] → adjusted)
+        start=1, end=33, span=32
+        → [1, 9, 17, 25, 33]
+
+    Note: SpecForge convention — num_target_layers here is the number of layers
+    to capture (called num_draft_layers in SpecForge). num_hidden_layers is the
+    total number of target model decoder layers.
     """
     if num_target_layers == 1:
-        return [num_hidden_layers - 1]
-    interval = (num_hidden_layers - 2) / (num_target_layers - 1)
-    return [max(1, round(1 + i * interval)) for i in range(num_target_layers)]
+        return [num_hidden_layers // 2]
+    start = 1
+    end = num_hidden_layers - 3
+    span = end - start
+    return [
+        int(round(start + (i * span) / (num_target_layers - 1)))
+        for i in range(num_target_layers)
+    ]
 
 
 class DFlashDraftModel(PreTrainedModel):

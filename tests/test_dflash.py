@@ -89,20 +89,18 @@ class TestDFlashConfig(unittest.TestCase):
 class TestBuildTargetLayerIds(unittest.TestCase):
     def test_single_layer(self):
         ids = build_target_layer_ids(1, 36)
-        self.assertEqual(ids, [35])
+        self.assertEqual(ids, [18])  # num_hidden_layers // 2
 
     def test_five_layers_36(self):
+        """Must match SpecForge: [1, 9, 17, 25, 33] for Qwen3-8B (36 layers)."""
         ids = build_target_layer_ids(5, 36)
-        self.assertEqual(len(ids), 5)
-        self.assertGreaterEqual(ids[0], 1)
-        self.assertLessEqual(ids[-1], 35)
-        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(ids, [1, 9, 17, 25, 33])
 
     def test_two_layers(self):
         ids = build_target_layer_ids(2, 36)
         self.assertEqual(len(ids), 2)
         self.assertEqual(ids[0], 1)
-        self.assertEqual(ids[1], 35)
+        self.assertEqual(ids[1], 33)  # end = 36 - 3 = 33
 
     def test_monotonically_increasing(self):
         for n in range(1, 8):
@@ -696,10 +694,7 @@ class TestDFlashAuxLayerIds(unittest.TestCase):
         from torchspec.models.draft.dflash import build_target_layer_ids
 
         ids = build_target_layer_ids(5, 28)
-        self.assertEqual(len(ids), 5)
-        self.assertGreaterEqual(ids[0], 1)
-        self.assertLessEqual(ids[-1], 27)
-        self.assertEqual(ids, sorted(ids))
+        self.assertEqual(ids, [1, 7, 13, 19, 25])
 
 
 class TestTrainEntryDFlashIntegration(unittest.TestCase):
