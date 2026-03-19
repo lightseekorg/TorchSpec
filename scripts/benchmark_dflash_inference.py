@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import time
 from typing import List, Optional, Tuple
@@ -124,15 +125,9 @@ def generate_dflash_spec(
 
     t0 = time.perf_counter()
 
-    # Prefill target
-    out = target(
-        input_ids,
-        use_cache=True,
-        output_hidden_states=True,
-    )
+    # Prefill target (single call)
     past_kv_target = DynamicCache()
-    # Rebuild cache from prefill (since we need hidden_states, can't use cache)
-    out_cached = target(
+    out = target(
         input_ids,
         past_key_values=past_kv_target,
         use_cache=True,
@@ -140,11 +135,11 @@ def generate_dflash_spec(
     )
 
     # First token from target
-    first_token = _sample(out_cached.logits[:, -1:, :], temperature)
+    first_token = _sample(out.logits[:, -1:, :], temperature)
     output_ids[:, num_input] = first_token.squeeze()
 
     # Extract context feature for draft
-    ctx_hidden = extract_context_feature(out_cached.hidden_states, target_layer_ids)
+    ctx_hidden = extract_context_feature(out.hidden_states, target_layer_ids)
     ctx_feature = context_norm(context_proj(ctx_hidden.to(context_proj.weight.dtype)))
 
     acceptance_lengths = []
@@ -154,28 +149,20 @@ def generate_dflash_spec(
         # Build draft block: [anchor_token, MASK, MASK, ..., MASK]
         block_ids = output_ids[:, start : start + block_size].clone()
 
-        # Embed via target's embedding
-        block_embed = target.model.embed_tokens(block_ids).to(ctx_feature.dtype)
-
-        # Position IDs for draft
+        # Position IDs for draft block and context
         draft_pos = torch.arange(
             start, start + block_size, device=device
         ).unsqueeze(0)
-
-        # Context position IDs
         ctx_pos = torch.arange(start, device=device).unsqueeze(0)
 
-        # Draft forward (no KV cache for simplicity — recompute each cycle)
-        draft_hidden = block_embed
-        for layer in draft_model.layers:
-            draft_hidden = layer(
-                draft_hidden=draft_hidden,
-                context_hidden=ctx_feature[:, :start, :],
-                draft_position_ids=draft_pos,
-                context_position_ids=ctx_pos,
-                block_mask=None,  # No FlexAttention at inference — use SDPA
-            )
-        draft_hidden = draft_model.final_norm(draft_hidden)
+        # Draft forward (no KV cache — recompute each cycle)
+        draft_hidden = draft_model(
+            draft_input_ids=block_ids,
+            context_feature=ctx_feature[:, :start, :],
+            draft_position_ids=draft_pos,
+            context_position_ids=ctx_pos,
+            block_mask=None,  # No FlexAttention at inference — bidirectional SDPA
+        )
 
         # Get logits from target's LM head — skip anchor (pos 0), predict pos 1..block_size-1
         draft_logits = target.lm_head(draft_hidden[:, 1:, :])
@@ -254,6 +241,32 @@ def _has_stop_token(token_ids: torch.Tensor, tokenizer) -> bool:
     return (token_ids == eos_id).any().item()
 
 
+def _generate_training_sequences(
+    target: nn.Module,
+    tokenizer,
+    prompts: list[str],
+    gen_len: int = 128,
+    device: str = "cuda",
+) -> list[torch.Tensor]:
+    """Generate long sequences from target model for training data.
+
+    Each prompt is extended to gen_len new tokens via greedy autoregressive decoding,
+    ensuring training sequences are long enough for block_size=16.
+    """
+    sequences = []
+    for prompt in prompts:
+        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+        with torch.no_grad():
+            out = target.generate(
+                input_ids,
+                max_new_tokens=gen_len,
+                do_sample=False,
+                use_cache=True,
+            )
+        sequences.append(out[0])  # [seq_len]
+    return sequences
+
+
 def train_draft_quick(
     target: nn.Module,
     draft_config: DFlashConfig,
@@ -262,6 +275,9 @@ def train_draft_quick(
     device: str = "cuda",
 ) -> Tuple[DFlashDraftModel, nn.Linear, nn.Module]:
     """Quick-train a DFlash draft model for benchmarking.
+
+    Generates long sequences from target, pre-computes hidden states, then trains
+    the draft model using cached data for fast iteration.
 
     Returns the trained draft model, context_proj, and context_norm.
     """
@@ -280,47 +296,71 @@ def train_draft_quick(
     dflash = DFlashModel(
         draft_model=draft,
         block_size=16,
-        num_anchors=512,
+        num_anchors=256,
         loss_decay_gamma=7.0,
+        gradient_checkpointing=True,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        [p for p in draft.parameters() if p.requires_grad], lr=3e-4
+        [p for p in draft.parameters() if p.requires_grad], lr=1e-3, weight_decay=0.01
     )
+    # Cosine schedule with 10% warmup
+    warmup_steps = max(1, num_steps // 10)
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, num_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Generate training data from target
-    prompts = [
-        "Explain quantum computing in simple terms.",
-        "Write a Python function to sort a list.",
-        "What is the capital of France and why is it important?",
-        "Describe the process of photosynthesis.",
-        "How does a neural network learn?",
-        "Tell me about the history of the internet.",
-        "What are the benefits of exercise?",
-        "Explain how encryption works.",
-        "What is machine learning?",
-        "Describe the water cycle.",
-    ]
+    # Load diverse training sequences from wikitext dataset (much more diverse than generated text)
+    seq_len_train = 256
+    num_train_seqs = 100
+    print(f"  Loading {num_train_seqs} training sequences ({seq_len_train} tokens each)...")
+    try:
+        from datasets import load_dataset
+        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+        all_text = " ".join([t for t in ds["text"] if len(t.strip()) > 50])
+        tokens = tokenizer(all_text, return_tensors="pt", truncation=False)["input_ids"][0]
+        train_seqs = []
+        for i in range(0, len(tokens) - seq_len_train, seq_len_train):
+            train_seqs.append(tokens[i : i + seq_len_train].to(device))
+            if len(train_seqs) >= num_train_seqs:
+                break
+        print(f"  Got {len(train_seqs)} sequences of {seq_len_train} tokens from wikitext")
+    except Exception as e:
+        print(f"  Wikitext failed ({e}), falling back to target-generated sequences...")
+        prompts = [
+            "Explain quantum computing in simple terms.",
+            "Write a Python function to sort a list.",
+            "What is the capital of France and why is it important?",
+            "Describe the process of photosynthesis.",
+            "How does a neural network learn?",
+        ]
+        train_seqs_raw = _generate_training_sequences(
+            target, tokenizer, prompts, gen_len=256, device=device,
+        )
+        train_seqs = train_seqs_raw
+
+    # Pre-compute target hidden states for all sequences
+    print(f"  Pre-computing target hidden states for {len(train_seqs)} sequences...")
+    cached_data = []
+    for i, seq in enumerate(train_seqs):
+        input_ids = seq.unsqueeze(0) if seq.dim() == 1 else seq
+        with torch.no_grad():
+            out = target(input_ids, output_hidden_states=True)
+        hidden_list = [out.hidden_states[lid + 1].detach() for lid in target_layer_ids]
+        cached_data.append((input_ids, hidden_list))
+        if (i + 1) % 20 == 0:
+            print(f"    Cached {i+1}/{len(train_seqs)} sequences")
+    print(f"  Cached {len(cached_data)} sequences with hidden states")
 
     print(f"Quick-training DFlash draft for {num_steps} steps...")
     draft.train()
 
     for step in range(num_steps):
-        prompt = prompts[step % len(prompts)]
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        input_ids = inputs["input_ids"]
-
-        # Get target hidden states
-        with torch.no_grad():
-            out = target(
-                input_ids,
-                output_hidden_states=True,
-            )
-
-        hidden_list = [
-            out.hidden_states[lid + 1].detach() for lid in target_layer_ids
-        ]
-        loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+        input_ids, hidden_list = cached_data[step % len(cached_data)]
+        loss_mask = torch.ones(1, input_ids.shape[1], dtype=torch.float32, device=device)
 
         loss, acc = dflash(
             input_ids=input_ids,
@@ -334,9 +374,11 @@ def train_draft_quick(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(draft.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
 
-        if (step + 1) % 20 == 0:
-            print(f"  Step {step+1}/{num_steps}: loss={loss.item():.4f}, acc={acc.item():.4f}")
+        if (step + 1) % 50 == 0:
+            lr_now = optimizer.param_groups[0]["lr"]
+            print(f"  Step {step+1}/{num_steps}: loss={loss.item():.4f}, acc={acc.item():.4f}, lr={lr_now:.6f}")
 
     draft.eval()
     return draft, draft.context_proj, draft.context_norm
@@ -350,7 +392,7 @@ def main():
     parser.add_argument("--draft_config", default="torchspec/config/dflash_draft_config.json")
     parser.add_argument("--num_prompts", type=int, default=10)
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--quick_train_steps", type=int, default=200,
+    parser.add_argument("--quick_train_steps", type=int, default=1000,
                         help="If no checkpoint, quick-train for this many steps")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--block_size", type=int, default=16)

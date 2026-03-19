@@ -715,4 +715,187 @@ as constants in the base Trainer class.
 
 ---
 
-*Implementation Log v8 — 2026-03-19*
+## Session 7: 2026-03-19 — Inference Benchmark & Analysis
+
+### Goal
+
+Verify DFlash **inference** performance (speculative decoding speedup), not just training
+metrics. The user's key requirement: "we need to verify inference performance as they are
+train a draft model for inference."
+
+### Files Created / Modified
+
+1. **`scripts/benchmark_dflash_inference.py`** — DFlash inference benchmark script (NEW)
+   - `generate_baseline()`: target-only autoregressive generation with KV cache
+   - `generate_dflash_spec()`: DFlash speculative decoding loop
+     - Prefill target → extract context features → draft block → verify → accept/reject
+     - Context feature accumulation across cycles (no draft KV cache)
+   - `train_draft_quick()`: quick-train fallback when no checkpoint is provided
+   - Metrics: acceptance length (τ), wall-clock speedup, tokens/sec
+
+2. **`scripts/extract_dflash_checkpoint.py`** — FSDP checkpoint extraction (REWRITTEN)
+   - Uses `dist_cp.state_dict_loader._load_state_dict()` with `no_dist=True`
+   - Custom `_WrappedStorageReader` and `_EmptyStateDictLoadPlanner` (same pattern as
+     `tools/convert_to_hf.py`)
+   - Extracts `draft_model.*` keys, strips prefix
+   - Previous version used `dcp_to_torch_save()` which failed on `.distcp` format
+
+3. **`configs/hf_qwen3_8b_dflash_1gpu_bench.yaml`** — Training config for benchmark (NEW)
+   - 1000 steps, `save_per_epoch: true`, output to `/workspace/outputs/qwen3-8b-dflash-bench`
+
+### Inference Architecture (TorchSpec vs SpecForge)
+
+| | TorchSpec (current) | SpecForge (reference) |
+|---|---|---|
+| Draft KV cache | **None** — recompute full context each cycle | DynamicCache with `.crop()` |
+| Context feature | Accumulate projected features across cycles | Re-project from target hidden states |
+| Verify → Accept | Count matching cumprod, crop target KV | Same logic + crop draft KV |
+| Forward call | `draft_model.forward()` with `block_mask=None` | `draft_model.forward()` with KV cache |
+
+**Key limitation**: Without draft KV cache, TorchSpec recomputes attention over all past
+context positions every cycle. This scales O(n²) with generated length, making it slower
+for long sequences. SpecForge's draft KV cache makes each cycle O(block_size) after prefill.
+
+### Training Results (Full Pipeline)
+
+Training completed 1000 steps on 1x H100 80GB via `torchspec.train_entry`:
+
+| Metric | Value |
+|--------|-------|
+| Final loss (CE) | 0.03-0.29 |
+| Final accuracy | 90-99% |
+| Training time | ~2 min 11s |
+| Data | 1000 conversations from `sample_conversations.jsonl` |
+| Checkpoint | FSDP `.distcp` format → extracted to simple `.pt` |
+
+### Checkpoint Extraction
+
+FSDP2 saves checkpoints in `.distcp` distributed format. Extraction required:
+
+1. **`dcp_to_torch_save()`** — Failed with `RuntimeError: unexpected pos` (zip format corruption)
+2. **Direct shard loading** — Failed (`.distcp` files aren't regular torch archives)
+3. **`dist_cp.state_dict_loader._load_state_dict(no_dist=True)`** — **SUCCESS**
+
+Extracted 13 keys (1 transformer layer + context_proj + context_norm + embed_tokens + final_norm):
+```
+context_proj.weight: [4096, 20480]    # Projects 5 target layers × 4096 → 4096
+embed_tokens.weight: [151936, 4096]   # Qwen3 vocab (frozen)
+layers.0.self_attn.{q,k,v,o}_proj.weight  # Single decoder layer
+layers.0.mlp.{gate,up,down}_proj.weight
+context_norm.weight, final_norm.weight, layers.0.*.layernorm.weight
+```
+
+Total checkpoint size: 1.7 GB. 899.2M trainable parameters.
+
+### Inference Benchmark Results
+
+Benchmark: 10 prompts, max_new_tokens=128, greedy decoding, 1x H100 80GB.
+
+| Method | Tokens/sec | τ (acceptance length) | Speedup |
+|--------|-----------|----------------------|---------|
+| Baseline (target-only) | **59.4** | N/A | 1.0x |
+| DFlash speculative | 42.5 | **1.01** | **0.72x** (slower) |
+
+**Result: DFlash speculative decoding is slower than baseline.**
+
+### Root Cause Analysis: τ=1.01
+
+Detailed debug comparison of draft predictions vs target (first block after prefill):
+
+```
+Pos   Draft     Target   Match  Draft tok    Target tok
+  1   17039      4285    no     security     simple
+  2    2989      3793    no     important    terms
+  3    2989        11    no     important    ,
+  4   12779       323    no     services     and
+  5    7497      1246    no     testing      how
+  ...  (0/15 tokens match)
+```
+
+Draft model produces **completely wrong predictions** — repetitive tokens like "security",
+"important", "services" with no semantic relation to the correct continuation.
+
+### Why Training Accuracy Was High But Inference Failed
+
+1. **Weight analysis**: Checkpoint weights differ from fresh init (mean_diff ≈ 0.005-0.01)
+   but the changes are small. The model learned something, but not enough.
+
+2. **Training data too small**: 1000 conversations from `sample_conversations.jsonl` is
+   insufficient for a 899M parameter draft model. The model overfits to training distribution
+   but can't generalize to unseen prompts.
+
+3. **Training steps too few**: 1000 steps ≈ 2 minutes. Real DFlash training (per SpecForge
+   paper) requires thousands of steps on large datasets (e.g., ShareGPT, OpenHermes).
+
+4. **Single epoch**: The config ran `num_epochs: 1`. The model saw each sample only once.
+
+5. **Fundamentally different from quick-train**: Quick-train attempts (100-2000 steps on
+   5-100 sequences) all produced τ ≈ 1.03-1.07. Full pipeline produced τ ≈ 1.01. Neither
+   is sufficient.
+
+### What's Needed for Meaningful Inference Performance
+
+Based on SpecForge reference and DFlash paper:
+
+| Parameter | Current (insufficient) | Recommended |
+|-----------|----------------------|-------------|
+| Training data | 1K conversations | **50K-100K+** diverse conversations |
+| Training steps | 1000 | **10K-50K+** |
+| Training time | ~2 min | **2-8 hours** (1x H100) |
+| Data diversity | Single dataset | ShareGPT + OpenHermes + other sources |
+| Expected τ | 1.01 | **3-5** (per DFlash paper) |
+| Expected speedup | 0.72x (slower) | **2-3x** |
+
+### RunPod Configuration Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| GPU | 1x H100 80GB | 1x H100 80GB |
+| Container Disk | 100 GB | 100 GB |
+| Volume Disk | 20 GB (checkpoints only) | **50+ GB** (for large datasets) |
+| Image | `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` | Same |
+| Estimated training time | 2 min (1K steps) | 2-8 hours (10K-50K steps) |
+| Estimated cost | $0.11 (1K steps) | **$6-25** (full training) |
+
+**Important**: Use container disk (`/root/`) for temporary files, not volume disk
+(`/workspace/`). The volume is a shared network mount that can hit quota limits.
+Write checkpoints and large temporary files to container disk first, then copy to
+volume if needed for persistence.
+
+### Issues Encountered & Solutions (continued)
+
+#### Issue 15: RunPod Volume Disk Quota
+
+**Problem**: Writing to `/workspace/` (volume) failed with `Disk quota exceeded`.
+The volume is a shared NFS mount (`mfs#us-mo-1.runpod.net`) with per-pod quotas.
+
+**Solution**: Use container disk (`/root/`, `/tmp/`) for extraction and benchmarking.
+Container disk has 76 GB free (100 GB total, 25 GB used by system/packages).
+
+#### Issue 16: FSDP Checkpoint Extraction
+
+**Problem**: `dcp_to_torch_save()` failed on `.distcp` shards. Direct `torch.load()` on
+shard files also failed ("invalid header or archive is corrupted").
+
+**Root cause**: `.distcp` files use PyTorch's distributed checkpoint format, not regular
+zip-based torch archives.
+
+**Solution**: Use the internal `_load_state_dict()` API with `no_dist=True`, matching the
+pattern in `tools/convert_to_hf.py`.
+
+### Pending Work
+
+1. **Training data**: Need larger, more diverse dataset (ShareGPT, OpenHermes, etc.)
+   - Consider saving curated training data to repo for reproducibility
+   - Minimum: 50K conversations for meaningful draft model quality
+
+2. **Longer training**: Run 10K-50K steps with proper LR schedule and evaluation
+
+3. **Draft KV cache**: Add KV cache support to `DFlashDraftModel.forward()` for efficient
+   inference (currently recomputes full context each cycle)
+
+4. **Eagle3 inference comparison**: Run Eagle3 inference benchmark for side-by-side comparison
+
+---
+
+*Implementation Log v9 — 2026-03-19*
