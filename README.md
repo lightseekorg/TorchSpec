@@ -102,7 +102,7 @@ TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model forw
 | [qwen3-8b-single-node](examples/qwen3-8b-single-node/) | Inference engine | Qwen3-8B |
 | [kimi-k25-2node-h200](examples/kimi-k25-2node-h200/) | Inference engine | Kimi-K2.5 |
 | [kimi-k25-3node-h100](examples/kimi-k25-3node-h100/) | Inference engine | Kimi-K2.5 |
-| [minimax-m25-3node-h200](examples/minimax-m25-3node-h200/) | Inference engine | MiniMax-M2.5 |
+| [minimax-m25-5node-h200](examples/minimax-m25-5node-h200/) | Inference engine | MiniMax-M2.5 |
 
 See [examples/README.md](examples/README.md) for more details about each example.
 
