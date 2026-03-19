@@ -31,7 +31,6 @@ class ChatTemplate(BaseModel):
     parser_type: str = "general"
     enable_thinking: bool = False
     image_placeholder: str = "<image>"
-    reference_model: str | None = None
 
 
 class TemplateRegistry:
@@ -60,7 +59,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|start_header_id|>user<|end_header_id|>",
         system_prompt="You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.\n\nIf a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.",
         end_of_turn_token="<|eot_id|>",
-        reference_model="meta-llama/Llama-3.1-8B-Instruct",
     ),
 )
 
@@ -71,7 +69,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|header_start|>user<|header_end|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|eot|>",
-        reference_model="meta-llama/Llama-4-Scout-17B-16E-Instruct",
     ),
 )
 
@@ -82,7 +79,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
-        reference_model="Qwen/Qwen2.5-7B-Instruct",
     ),
 )
 
@@ -93,7 +89,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
-        reference_model="Qwen/Qwen2-VL-7B-Instruct",
     ),
 )
 
@@ -104,7 +99,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|user|>\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|end|>\n",
-        reference_model="microsoft/Phi-3-mini-4k-instruct",
     ),
 )
 
@@ -115,7 +109,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user<|im_sep|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>",
-        reference_model="microsoft/phi-4",
     ),
 )
 
@@ -126,7 +119,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|user|>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|end|>",
-        reference_model="microsoft/Phi-4-mini-instruct",
     ),
 )
 
@@ -171,7 +163,6 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
         parser_type="thinking",
         enable_thinking=True,
-        reference_model="Qwen/Qwen3-8B",
     ),
 )
 
@@ -183,7 +174,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>\n",
-        reference_model="Qwen/Qwen3-8B",
     ),
 )
 
@@ -196,7 +186,6 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>\n",
         parser_type="thinking",
         enable_thinking=True,
-        reference_model="Qwen/Qwen3-8B",
     ),
 )
 
@@ -209,7 +198,6 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>",
         parser_type="thinking",
         enable_thinking=True,
-        reference_model="moonshotai/Kimi-K2.5",
     ),
 )
 
@@ -220,7 +208,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<|im_start|>user\n",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|im_end|>",
-        reference_model="moonshotai/Kimi-K2.5",
     ),
 )
 
@@ -233,7 +220,6 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<|im_end|>",
         parser_type="kimi-k25",
         image_placeholder="<|image|>",
-        reference_model="moonshotai/Kimi-K2.5",
     ),
 )
 
@@ -244,7 +230,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<｜User｜>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<｜end▁of▁sentence｜>",
-        reference_model="deepseek-ai/DeepSeek-V3",
     ),
 )
 
@@ -255,7 +240,6 @@ TEMPLATE_REGISTRY.register(
         user_header="<role>HUMAN</role>",
         system_prompt="You are a helpful assistant.",
         end_of_turn_token="<|role_end|>",
-        reference_model="inclusionAI/Ling-lite",
     ),
 )
 
@@ -268,7 +252,6 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="<｜end▁of▁sentence｜>",
         parser_type="thinking",
         enable_thinking=True,
-        reference_model="deepseek-ai/DeepSeek-V3",
     ),
 )
 
@@ -281,6 +264,5 @@ TEMPLATE_REGISTRY.register(
         end_of_turn_token="[e~[",
         parser_type="minimax-m2",
         image_placeholder="<image>",
-        reference_model="MiniMaxAI/MiniMax-M2.5",
     ),
 )
