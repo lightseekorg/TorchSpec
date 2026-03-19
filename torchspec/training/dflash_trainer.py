@@ -284,8 +284,8 @@ class DFlashTrainer(Trainer):
         dist.all_reduce(avg_acc, op=dist.ReduceOp.AVG)
 
         metrics = {
-            "eval/loss": avg_loss.item(),
-            "eval/accuracy": avg_acc.item(),
+            "eval/avg_loss": avg_loss.item(),
+            "eval/avg_acc": avg_acc.item(),
         }
 
         if dist.get_rank() == 0:
@@ -327,8 +327,8 @@ class DFlashTrainer(Trainer):
         dist.all_reduce(avg_acc, op=dist.ReduceOp.AVG)
 
         metrics = {
-            "train/loss": avg_loss.item(),
-            "train/accuracy": avg_acc.item(),
+            "train/avg_loss": avg_loss.item(),
+            "train/avg_acc": avg_acc.item(),
             "train/grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
             "train/global_step": self.global_step,
             "train/lr": self.optimizer.get_learning_rate(),
