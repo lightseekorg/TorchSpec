@@ -41,6 +41,7 @@ class DatasetConfig:
     eval_prompt_key: Optional[str] = None
     last_turn_loss_only: Any = "auto"  # bool or "auto"
     prompt_key: str = "conversations"
+    shuffle_dataset: bool = True
     train_data_path: str = ""
 
 

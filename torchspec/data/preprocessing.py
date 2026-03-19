@@ -226,7 +226,8 @@ def build_eagle3_dataset(
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 
-    dataset = dataset.shuffle(seed=shuffle_seed)
+    if shuffle_seed is not None:
+        dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
 
     def preprocess_function(examples):

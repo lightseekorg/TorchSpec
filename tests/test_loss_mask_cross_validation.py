@@ -28,6 +28,26 @@ MESSAGES_LEADING_NEWLINES = [
     {"role": "assistant", "content": "\n\nThe answer is 4."},
 ]
 
+REFERENCE_MODELS: dict[str, str] = {
+    "llama3": "meta-llama/Llama-3.1-8B-Instruct",
+    "llama4": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+    "qwen": "Qwen/Qwen2.5-7B-Instruct",
+    "qwen2-vl": "Qwen/Qwen2-VL-7B-Instruct",
+    "phi3": "microsoft/Phi-3-mini-4k-instruct",
+    "phi4": "microsoft/phi-4",
+    "phi4-mini": "microsoft/Phi-4-mini-instruct",
+    "qwen3-thinking": "Qwen/Qwen3-8B",
+    "qwen3-instruct": "Qwen/Qwen3-8B",
+    "qwen3-next-thinking": "Qwen/Qwen3-8B",
+    "kimi-k2-thinking": "moonshotai/Kimi-K2.5",
+    "kimi-k2-instruct": "moonshotai/Kimi-K2.5",
+    "kimi-k25-vlm": "moonshotai/Kimi-K2.5",
+    "deepseek-v3": "deepseek-ai/DeepSeek-V3",
+    "ling-flash-2.0": "inclusionAI/Ling-lite",
+    "deepseek-v32": "deepseek-ai/DeepSeek-V3",
+    "minimax-m2": "MiniMaxAI/MiniMax-M2.5",
+}
+
 _tokenizer_cache: dict = {}
 
 
@@ -40,10 +60,9 @@ def _testable_templates():
 
 
 def _get_tokenizer(template_name):
-    template = TEMPLATE_REGISTRY.get(template_name)
-    model_path = template.reference_model
+    model_path = REFERENCE_MODELS.get(template_name)
     if model_path is None:
-        pytest.skip(f"No reference_model for template '{template_name}'")
+        pytest.skip(f"No reference model for template '{template_name}'")
 
     if model_path in _tokenizer_cache:
         return _tokenizer_cache[model_path]

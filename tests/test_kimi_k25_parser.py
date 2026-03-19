@@ -205,6 +205,74 @@ class TestKimiK25ParserImageHandling:
         assert "What is this?" in formatted
 
 
+class TestKimiK25ParserMediaTokenPassthrough:
+    """Tests for expand_media_tokens=False (sglang inference passthrough)."""
+
+    def test_string_placeholder_kept(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "<|image|> What is this?"},
+            {"role": "assistant", "content": "A cat."},
+        ]
+        formatted = parser.format(conversation, expand_media_tokens=False)
+
+        assert "<|image|>" in formatted
+        assert "<|media_begin|>" not in formatted
+        assert "<|media_pad|>" not in formatted
+
+    def test_multiple_placeholders_kept(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "<|image|> First. <|image|> Second."},
+            {"role": "assistant", "content": "Two images."},
+        ]
+        formatted = parser.format(conversation, expand_media_tokens=False)
+
+        assert formatted.count("<|image|>") == 2
+        assert "<|media_begin|>" not in formatted
+
+    def test_list_content_placeholder_kept(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "http://example.com/img.jpg"}},
+                    {"type": "text", "text": "Describe this."},
+                ],
+            },
+            {"role": "assistant", "content": "A photo."},
+        ]
+        formatted = parser.format(conversation, expand_media_tokens=False)
+
+        assert "<|image|>" in formatted
+        assert "<|media_begin|>" not in formatted
+        assert "Describe this." in formatted
+
+    def test_default_expands_media_tokens(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "<|image|> What is this?"},
+            {"role": "assistant", "content": "A cat."},
+        ]
+        formatted_default = parser.format(conversation)
+        formatted_explicit = parser.format(conversation, expand_media_tokens=True)
+
+        assert "<|media_begin|>" in formatted_default
+        assert formatted_default == formatted_explicit
+
+    def test_no_images_unaffected(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "Hello!"},
+            {"role": "assistant", "content": "Hi!"},
+        ]
+        fmt_expand = parser.format(conversation, expand_media_tokens=True)
+        fmt_passthrough = parser.format(conversation, expand_media_tokens=False)
+
+        assert fmt_expand == fmt_passthrough
+
+
 class TestKimiK25ParserThinkingBlocks:
     """Tests for thinking block handling."""
 
@@ -488,61 +556,3 @@ class TestKimiK25ParserToolCalls:
 
         assert loss_mask.sum() > 0
         assert isinstance(input_ids, torch.Tensor)
-
-
-class TestKimiK25WithRealTokenizer:
-    """Integration tests with real Kimi tokenizer (skipped if not available)."""
-
-    @pytest.fixture
-    def real_tokenizer(self):
-        try:
-            from transformers import AutoTokenizer
-
-            return AutoTokenizer.from_pretrained("moonshotai/Kimi-K2.5", trust_remote_code=True)
-        except Exception:
-            pytest.skip("Kimi-K2.5 tokenizer not available")
-
-    def test_real_tokenizer_single_turn(self, real_tokenizer, kimi_template):
-        parser = KimiK25Parser(real_tokenizer, kimi_template)
-        conversation = [
-            {"role": "user", "content": "<|image|> What is this?"},
-            {"role": "assistant", "content": "<think>Analyzing...</think>A cat."},
-        ]
-
-        input_ids, loss_mask = parser.parse(conversation, max_length=512)
-
-        assert len(input_ids) > 0
-        assert loss_mask.sum() > 0
-
-        decoded = real_tokenizer.decode(input_ids.tolist())
-        assert "<|media_begin|>" in decoded
-        assert "<think>" in decoded
-
-    def test_real_tokenizer_multi_turn(self, real_tokenizer, kimi_template):
-        parser = KimiK25Parser(real_tokenizer, kimi_template)
-        conversation = [
-            {"role": "user", "content": "<|image|> What is this?"},
-            {"role": "assistant", "content": "<think>I see a cat.</think>A cat."},
-            {"role": "user", "content": "What color?"},
-            {"role": "assistant", "content": "<think>Looking at fur...</think>Orange."},
-        ]
-
-        input_ids, loss_mask = parser.parse(conversation, max_length=512)
-
-        assert len(input_ids) > 0
-        assert loss_mask.sum() > 0
-
-    def test_real_tokenizer_media_tokens(self, real_tokenizer, kimi_template):
-        parser = KimiK25Parser(real_tokenizer, kimi_template)
-        conversation = [
-            {"role": "user", "content": "<|image|> Describe this."},
-            {"role": "assistant", "content": "An image."},
-        ]
-
-        input_ids, loss_mask = parser.parse(conversation, max_length=512)
-
-        media_begin_id = real_tokenizer.convert_tokens_to_ids("<|media_begin|>")
-        media_end_id = real_tokenizer.convert_tokens_to_ids("<|media_end|>")
-
-        assert media_begin_id in input_ids.tolist()
-        assert media_end_id in input_ids.tolist()

@@ -34,6 +34,7 @@ Options:
     --output-dir    Output directory (default: {input_dir}_hf)
     --config        Path to draft model config.json (default: {input_dir}/config.json)
     --target-model-path  Target model (HF hub id or path) — auto-generates config.json if missing
+    --dtype         Output dtype (float16, bfloat16, float32). Use float16 for FP8 target models
     -f, --force     Overwrite output directory if exists
     --analyze-vocab Analyze token coverage at various draft vocab sizes (no conversion)
     --prune-vocab   Enable vocabulary pruning (requires --dataset-path and --draft-vocab-size)
@@ -245,6 +246,8 @@ def _save_with_vocab_pruning(
     save_file(tensors, os.path.join(output_dir, "model.safetensors"))
 
     raw_config["draft_vocab_size"] = draft_vocab_size
+    actual_dtype = next(iter(tensors.values())).dtype
+    raw_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(raw_config, f, indent=2)
 
@@ -368,6 +371,7 @@ def _convert_fsdp_to_hf(
     output_dir: str,
     target_model_path: Optional[str] = None,
     embedding_key: str = "model.embed_tokens",
+    output_dtype: Optional[torch.dtype] = None,
     prune_vocab: bool = False,
     dataset_path: Optional[str] = None,
     draft_vocab_size: Optional[int] = None,
@@ -392,9 +396,9 @@ def _convert_fsdp_to_hf(
     config = AutoDraftModelConfig.from_file(config_path)
     hf_model = AutoEagle3DraftModel.from_config(config)
 
-    # Infer dtype from checkpoint weights so the HF model matches (avoids silent precision changes)
     ckpt_dtype = Counter(v.dtype for v in model_state.values()).most_common(1)[0][0]
-    logger.info("Checkpoint dtype: %s, casting HF model to match", ckpt_dtype)
+    final_dtype = output_dtype or ckpt_dtype
+    logger.info("Checkpoint dtype: %s, output dtype: %s", ckpt_dtype, final_dtype)
     hf_model = hf_model.to(ckpt_dtype)
 
     missing, unexpected = hf_model.load_state_dict(model_state, strict=False)
@@ -420,6 +424,10 @@ def _convert_fsdp_to_hf(
             list(hf_model.embed_tokens.weight.shape),
             hf_model.embed_tokens.weight.dtype,
         )
+
+    if output_dtype and output_dtype != ckpt_dtype:
+        logger.info("Casting model from %s to %s", ckpt_dtype, output_dtype)
+        hf_model = hf_model.to(output_dtype)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -499,6 +507,14 @@ def _parse_args() -> argparse.Namespace:
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading target model config/tokenizer",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default=None,
+        choices=["float16", "bfloat16", "float32"],
+        help="Output dtype for model weights. If not set, uses the checkpoint's native dtype. "
+        "Use float16 when the target model runs FP8 inference (hidden states are float16)",
     )
     parser.add_argument(
         "-f",
@@ -629,6 +645,9 @@ if __name__ == "__main__":
     if os.path.exists(output_dir) and not args.force:
         raise ValueError(f"Output directory {output_dir} already exists. Use -f to overwrite.")
 
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    output_dtype = dtype_map[args.dtype] if args.dtype else None
+
     model_dir = _detect_model_dir(input_dir)
     _convert_fsdp_to_hf(
         config_path=config_path,
@@ -636,6 +655,7 @@ if __name__ == "__main__":
         output_dir=output_dir,
         target_model_path=args.target_model_path,
         embedding_key=args.embedding_key,
+        output_dtype=output_dtype,
         prune_vocab=args.prune_vocab,
         dataset_path=args.dataset_path,
         draft_vocab_size=args.draft_vocab_size,

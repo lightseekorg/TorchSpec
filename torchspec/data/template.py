@@ -254,3 +254,15 @@ TEMPLATE_REGISTRY.register(
         enable_thinking=True,
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="minimax-m2",
+    template=ChatTemplate(
+        assistant_header="]~b]ai\n",
+        user_header="]~b]user\n",
+        system_prompt="You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax.",
+        end_of_turn_token="[e~[",
+        parser_type="minimax-m2",
+        image_placeholder="<image>",
+    ),
+)
