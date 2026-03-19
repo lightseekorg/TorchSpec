@@ -1,0 +1,61 @@
+# DFlash training config — benchmark checkpoint generation
+# Run 200 steps to produce a trained draft model for inference benchmarking.
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: torchspec/config/dflash_draft_config.json
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  colocate: true
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 4096
+  num_epochs: 1
+  seed: 42
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+  train_env_vars: '{"TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS": "ATEN,TRITON"}'
+
+  # DFlash-specific parameters
+  dflash_block_size: 16
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 5
+
+inference:
+  inference_engine_type: hf
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 32
+  inference_buffer_threshold: 16
+  inference_batch_size: 4
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: /workspace/outputs/qwen3-8b-dflash-bench
+cache_dir: /workspace/cache/qwen3-8b-1gpu
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false
