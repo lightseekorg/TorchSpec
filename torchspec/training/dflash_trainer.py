@@ -99,6 +99,7 @@ class DFlashTrainer(Trainer):
             )
 
         draft_model.freeze_embedding()
+        draft_model = draft_model.to(torch.bfloat16)
 
         dist.barrier(group=get_gloo_group())
 
