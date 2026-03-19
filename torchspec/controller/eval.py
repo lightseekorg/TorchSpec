@@ -46,6 +46,7 @@ class EvalSetupState:
     eval_dispatch_bs: int
     eval_dataset_size: int
     dp_size: int
+    initial_eval_submit_count: int = 0
 
 
 def _check_idle_timeout(
@@ -112,6 +113,7 @@ def generate_eval_cache(
         f"({eval_dataset_size} samples, dispatch_bs={dispatch_bs})..."
     )
     dispatched_samples = 0
+    next_submit_idx = eval_state.initial_eval_submit_count
     eval_progress = tqdm(total=eval_dataset_size, desc="Eval caching", unit="sample")
 
     while dispatched_samples < eval_dataset_size:
@@ -119,6 +121,10 @@ def generate_eval_cache(
         if ok:
             train_group.cache_eval_samples(dispatch_bs // dp_size)
             dispatched_samples += dispatch_bs
+            if next_submit_idx < eval_dataset_size:
+                next_end = min(next_submit_idx + dispatch_bs, eval_dataset_size)
+                ray.get(controller.submit_eval_chunk.remote(next_submit_idx, next_end))
+                next_submit_idx = next_end
             last_progress_at = time.monotonic()
             eval_progress.update(dispatch_bs)
         else:
@@ -159,6 +165,7 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
     eval_enabled = eval_dataset_size > 0
     eval_cache_path: str | None = None
     eval_cache_loaded = False
+    initial_eval_submit_count = 0
 
     eval_dispatch_bs = min(args.dp_size, eval_dataset_size)
 
@@ -187,8 +194,12 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
                 f"Eval: loaded cached tensors from {eval_cache_path} ({loaded[0]} batches per rank)"
             )
         else:
-            ray.get(controller.submit_eval_dataset.remote())
-            logger.info(f"Eval: {eval_dataset_size} samples, dispatch_bs={eval_dispatch_bs}")
+            initial_eval_submit_count = min(eval_dataset_size, eval_dispatch_bs * 2)
+            ray.get(controller.submit_eval_chunk.remote(0, initial_eval_submit_count))
+            logger.info(
+                f"Eval: {eval_dataset_size} samples, dispatch_bs={eval_dispatch_bs}, "
+                f"initial_submit={initial_eval_submit_count}"
+            )
 
     return EvalSetupState(
         eval_interval=eval_interval,
@@ -199,4 +210,5 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
         eval_dispatch_bs=eval_dispatch_bs,
         eval_dataset_size=eval_dataset_size,
         dp_size=args.dp_size,
+        initial_eval_submit_count=initial_eval_submit_count,
     )

@@ -247,11 +247,6 @@ class AsyncTrainingController:
         logger.info(f"Controller loaded eval dataset: {count} samples from {eval_data_path}")
         return count
 
-    def submit_eval_dataset(self) -> int:
-        """Submit the stored eval dataset for inference (prepended with high priority)."""
-        assert self._stored_eval_dataset is not None, "No stored eval dataset"
-        return self.set_eval_dataset(self._stored_eval_dataset)
-
     def get_dataset_size(self) -> int:
         if self._stored_dataset is None:
             raise RuntimeError(
@@ -476,19 +471,7 @@ class AsyncTrainingController:
     # Eval Pipeline
     # ─────────────────────────────────────────────────────────────
 
-    def set_eval_dataset(self, dataset: list) -> int:
-        """Push eval samples into the prompt buffer for inference.
-
-        Eval data_ids are tracked so that inference results are routed to
-        the eval pool instead of the training sample pool.
-
-        Eval samples are prepended (high priority) so they are processed
-        before queued training data — otherwise backpressure on the
-        training pool can starve eval indefinitely.
-        """
-        self._eval_expected_count = len(dataset)
-        self._eval_dispatched_samples = 0
-
+    def _build_eval_entries(self, dataset: list) -> list[InferenceInput]:
         eval_entries: list[InferenceInput] = []
         for sample in dataset:
             if isinstance(sample, dict):
@@ -509,11 +492,28 @@ class AsyncTrainingController:
                 self._eval_data_ids.add(data_id)
                 entry = InferenceInput(data_id=data_id, prompt=sample)
             eval_entries.append(entry)
+        return eval_entries
+
+    def submit_eval_chunk(self, start: int, end: int) -> int:
+        """Submit a slice of the stored eval dataset for inference."""
+        assert self._stored_eval_dataset is not None, "No stored eval dataset"
+        chunk = self._stored_eval_dataset[start:end]
+        if not chunk:
+            return 0
+
+        if start == 0:
+            self._eval_expected_count = len(self._stored_eval_dataset)
+            self._eval_dispatched_samples = 0
+
+        eval_entries = self._build_eval_entries(chunk)
 
         with self._prompt_lock:
             self.prompt_buffer.extendleft(reversed(eval_entries))
-        logger.info(f"Eval: prepended {len(dataset)} samples to prompt buffer (high priority)")
-        return len(dataset)
+        logger.info(
+            f"Eval: submitted chunk [{start}:{end}] "
+            f"({len(chunk)} samples, total_expected={self._eval_expected_count})"
+        )
+        return len(chunk)
 
     def get_eval_pool_size(self) -> int:
         with self._eval_pool_lock:

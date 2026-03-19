@@ -494,7 +494,11 @@ class TestEvalDispatch:
     def _setup_eval_and_push(self, controller, num_samples):
         """Set up eval dataset, push all inference results, return the eval data_ids."""
         dataset = [{"prompt": f"eval prompt {i}", "data_id": f"s{i}"} for i in range(num_samples)]
-        controller.set_eval_dataset(dataset)
+        eval_entries = controller._build_eval_entries(dataset)
+        controller._eval_expected_count = num_samples
+        controller._eval_dispatched_samples = 0
+        with controller._prompt_lock:
+            controller.prompt_buffer.extendleft(reversed(eval_entries))
 
         eval_data_ids = sorted(controller._eval_data_ids)
         results = [
@@ -560,7 +564,11 @@ class TestEvalDispatch:
         controller = self._create_controller(max_sample_pool_size=4)
 
         dataset = [{"prompt": f"eval prompt {i}", "data_id": f"s{i}"} for i in range(8)]
-        controller.set_eval_dataset(dataset)
+        eval_entries = controller._build_eval_entries(dataset)
+        controller._eval_expected_count = 8
+        controller._eval_dispatched_samples = 0
+        with controller._prompt_lock:
+            controller.prompt_buffer.extendleft(reversed(eval_entries))
 
         partial_ids = sorted(controller._eval_data_ids)[:4]
         results = [
@@ -603,7 +611,7 @@ class TestEvalDispatch:
 
 
 class TestEvalEndToEnd:
-    """End-to-end eval flow: set_eval_dataset → push results → dispatch batches → finalize."""
+    """End-to-end eval flow: submit chunks → push results → dispatch batches → finalize."""
 
     def _create_controller(self, max_sample_pool_size=2, dp_size=2):
         AsyncTrainingController = _create_controller_class()
@@ -618,7 +626,11 @@ class TestEvalEndToEnd:
 
         num_samples = 7
         dataset = [{"prompt": f"eval prompt {i}", "data_id": f"e{i}"} for i in range(num_samples)]
-        controller.set_eval_dataset(dataset)
+        eval_entries = controller._build_eval_entries(dataset)
+        controller._eval_expected_count = num_samples
+        controller._eval_dispatched_samples = 0
+        with controller._prompt_lock:
+            controller.prompt_buffer.extendleft(reversed(eval_entries))
 
         eval_data_ids = sorted(controller._eval_data_ids)
         results = [

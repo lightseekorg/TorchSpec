@@ -89,6 +89,7 @@ def test_generate_eval_cache_dispatches_and_finalizes():
         eval_dispatch_bs=2,
         eval_dataset_size=8,
         dp_size=2,
+        initial_eval_submit_count=8,
     )
 
     with (
@@ -100,6 +101,48 @@ def test_generate_eval_cache_dispatches_and_finalizes():
     assert train_group.cache_eval_samples.call_count == 4
     train_group.cache_eval_samples.assert_called_with(1)
     controller.finalize_eval_dispatch.remote.assert_called_once()
+
+
+def test_generate_eval_cache_interleaves_refill_and_drain_without_stalling():
+    controller = mock.MagicMock()
+    train_group = mock.MagicMock()
+
+    controller.try_dispatch_eval_batch.remote.side_effect = [
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+    ]
+
+    state = eval_utils.EvalSetupState(
+        eval_interval=0,
+        eval_enabled=True,
+        eval_cache_loaded=False,
+        eval_cache_path=None,
+        best_eval_score=0.0,
+        eval_dispatch_bs=2,
+        eval_dataset_size=8,
+        dp_size=2,
+        initial_eval_submit_count=4,
+    )
+
+    with (
+        mock.patch("torchspec.controller.eval.ray.get", side_effect=lambda x: x),
+        mock.patch("torchspec.controller.eval.time.sleep") as mock_sleep,
+    ):
+        eval_utils.generate_eval_cache(controller, train_group, state)
+
+    assert train_group.cache_eval_samples.call_count == 4
+    assert controller.submit_eval_chunk.remote.call_args_list == [
+        mock.call(4, 6),
+        mock.call(6, 8),
+    ]
+    controller.finalize_eval_dispatch.remote.assert_called_once()
+    assert mock_sleep.call_count == 4
 
 
 def test_generate_eval_cache_times_out_when_eval_never_arrives():
@@ -115,6 +158,7 @@ def test_generate_eval_cache_times_out_when_eval_never_arrives():
         eval_dispatch_bs=2,
         eval_dataset_size=8,
         dp_size=2,
+        initial_eval_submit_count=4,
     )
 
     controller.try_dispatch_eval_batch.remote.return_value = False
@@ -135,7 +179,7 @@ def test_setup_eval_dispatch_bs_is_dp_size():
     controller = mock.MagicMock()
     train_group = mock.MagicMock()
     train_group.load_eval_cache.return_value = [0]
-    controller.submit_eval_dataset.remote.return_value = 16
+    controller.submit_eval_chunk.remote.return_value = 4
 
     args = SimpleNamespace(
         eval_interval=50,
@@ -159,14 +203,15 @@ def test_setup_eval_dispatch_bs_is_dp_size():
     assert state.eval_enabled is True
     assert state.eval_dispatch_bs == 2
     assert state.eval_dataset_size == 16
-    controller.submit_eval_dataset.remote.assert_called_once()
+    assert state.initial_eval_submit_count == 4
+    controller.submit_eval_chunk.remote.assert_called_once_with(0, 4)
 
 
 def test_setup_eval_dispatch_bs_caps_at_dataset_size():
     controller = mock.MagicMock()
     train_group = mock.MagicMock()
     train_group.load_eval_cache.return_value = [0]
-    controller.submit_eval_dataset.remote.return_value = 4
+    controller.submit_eval_chunk.remote.return_value = 4
 
     args = SimpleNamespace(
         eval_interval=50,
@@ -188,3 +233,5 @@ def test_setup_eval_dispatch_bs_caps_at_dataset_size():
         )
 
     assert state.eval_dispatch_bs == 4
+    assert state.initial_eval_submit_count == 4
+    controller.submit_eval_chunk.remote.assert_called_once_with(0, 4)
