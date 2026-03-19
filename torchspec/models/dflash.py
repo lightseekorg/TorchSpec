@@ -32,6 +32,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
+from torchspec.utils.logging import logger
+
+_DFLASH_DEBUG_COUNTER = 0
 
 
 def _sample_anchor_positions(
@@ -44,6 +47,9 @@ def _sample_anchor_positions(
     For each batch element, samples `num_anchors` positions where:
       1. The position is in a valid region (loss_mask == 1)
       2. There is room for a full block after the anchor
+
+    Falls back to uniformly sampling across all valid-end positions if no
+    loss_mask positions satisfy the constraint.
 
     Args:
         loss_mask: [B, seq_len] — 1 for valid positions, 0 for padding
@@ -59,14 +65,20 @@ def _sample_anchor_positions(
 
     for b in range(B):
         valid = loss_mask[b].bool()
-        # Anchor must leave room for block_size tokens after it
         valid_end = seq_len - block_size
         if valid_end <= 0:
             continue
 
         valid_positions = torch.where(valid[:valid_end])[0]
         if len(valid_positions) == 0:
-            continue
+            # Fallback: sample uniformly from all positions that leave room for a block
+            valid_positions = torch.arange(valid_end, device=device)
+            if len(valid_positions) == 0:
+                continue
+            logger.debug(
+                f"[DFlash] batch {b}: loss_mask has no valid anchors before position {valid_end}, "
+                f"falling back to uniform sampling over {valid_end} positions"
+            )
 
         if len(valid_positions) <= num_anchors:
             indices = torch.arange(len(valid_positions), device=device)
@@ -139,29 +151,21 @@ def _prepare_noise_input(
     device = input_ids.device
     total_draft_len = num_anchors * block_size
 
-    draft_input_ids = torch.full(
-        (B, total_draft_len), mask_token_id, dtype=torch.long, device=device
-    )
-    draft_labels = torch.full(
-        (B, total_draft_len), -100, dtype=torch.long, device=device
-    )
-
     offsets = torch.arange(block_size, dtype=torch.long, device=device)
 
-    for b in range(B):
-        for a in range(num_anchors):
-            anchor_pos = anchor_positions[b, a].item()
-            block_start = a * block_size
+    # [B, num_anchors, block_size] — absolute positions for every token in every block
+    all_positions = anchor_positions.unsqueeze(-1) + offsets.unsqueeze(0).unsqueeze(0)
+    all_positions_flat = all_positions.reshape(B, total_draft_len)
 
-            # First position in block = anchor token (real token, not MASK)
-            draft_input_ids[b, block_start] = input_ids[b, anchor_pos]
+    in_bounds = all_positions_flat < seq_len
+    gather_idx = all_positions_flat.clamp(max=seq_len - 1)
+    all_tokens = torch.gather(input_ids, 1, gather_idx)
 
-            # Labels: positions 1..block_size-1 are the tokens to predict
-            # Position 0 (anchor) gets -100 (no loss)
-            for k in range(1, block_size):
-                target_pos = anchor_pos + k
-                if target_pos < seq_len:
-                    draft_labels[b, block_start + k] = input_ids[b, target_pos]
+    pos_in_block = torch.arange(total_draft_len, device=device) % block_size
+    is_anchor = (pos_in_block == 0).unsqueeze(0).expand(B, -1)
+
+    draft_input_ids = torch.where(is_anchor, all_tokens, torch.tensor(mask_token_id, device=device))
+    draft_labels = torch.where(~is_anchor & in_bounds, all_tokens, torch.tensor(-100, device=device))
 
     return draft_input_ids, draft_labels
 
@@ -272,8 +276,21 @@ class DFlashModel(nn.Module):
             loss: scalar loss
             accuracy: scalar accuracy
         """
+        global _DFLASH_DEBUG_COUNTER
+        _DFLASH_DEBUG_COUNTER += 1
+        _debug = _DFLASH_DEBUG_COUNTER <= 5
+
         B, seq_len = input_ids.shape
         device = input_ids.device
+
+        if _debug:
+            logger.info(
+                f"[DFlash DBG step={_DFLASH_DEBUG_COUNTER}] "
+                f"input_ids={input_ids.shape}, "
+                f"hidden_states_list=[{', '.join(str(h.shape) for h in hidden_states_list)}], "
+                f"loss_mask={loss_mask.shape} sum={loss_mask.sum().item():.0f}, "
+                f"lm_head_weight={lm_head_weight.shape}"
+            )
 
         # 1. Extract context features from target hidden states
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
@@ -281,6 +298,11 @@ class DFlashModel(nn.Module):
         # 2. Sample anchor positions
         actual_anchors = min(self.num_anchors, (seq_len - self.block_size))
         if actual_anchors <= 0:
+            if _debug:
+                logger.warning(
+                    f"[DFlash DBG] EARLY RETURN: actual_anchors={actual_anchors}, "
+                    f"seq_len={seq_len}, block_size={self.block_size}"
+                )
             zero = torch.tensor(0.0, device=device, requires_grad=True)
             return zero, torch.tensor(0.0, device=device)
 
@@ -289,6 +311,14 @@ class DFlashModel(nn.Module):
             num_anchors=actual_anchors,
             block_size=self.block_size,
         )
+
+        if _debug:
+            nonzero_anchors = (anchor_positions > 0).sum().item()
+            logger.info(
+                f"[DFlash DBG] actual_anchors={actual_anchors}, "
+                f"anchor_positions nonzero={nonzero_anchors}, "
+                f"min={anchor_positions.min().item()}, max={anchor_positions.max().item()}"
+            )
 
         # 3. Create position IDs
         context_position_ids, draft_position_ids = _create_position_ids(
@@ -304,6 +334,15 @@ class DFlashModel(nn.Module):
             block_size=self.block_size,
             mask_token_id=self.draft_model.mask_token_id,
         )
+
+        if _debug:
+            valid_labels = (draft_labels != -100).sum().item()
+            logger.info(
+                f"[DFlash DBG] draft_input_ids={draft_input_ids.shape}, "
+                f"draft_labels={draft_labels.shape}, "
+                f"valid_labels={valid_labels}/{draft_labels.numel()}, "
+                f"mask_token_id={self.draft_model.mask_token_id}"
+            )
 
         # 5. Create block-causal attention mask (FlexAttention requires CUDA)
         draft_len = actual_anchors * self.block_size
@@ -336,6 +375,13 @@ class DFlashModel(nn.Module):
             block_mask=block_mask,
         )
 
+        if _debug:
+            logger.info(
+                f"[DFlash DBG] draft_hidden={draft_hidden.shape} dtype={draft_hidden.dtype} "
+                f"range=[{draft_hidden.min().item():.4f}, {draft_hidden.max().item():.4f}] "
+                f"has_nan={draft_hidden.isnan().any().item()}"
+            )
+
         # 7. Compute logits via frozen LM head
         logits = F.linear(draft_hidden, lm_head_weight)  # [B, draft_len, vocab]
 
@@ -362,8 +408,20 @@ class DFlashModel(nn.Module):
         B, draft_len, vocab_size = logits.shape
         device = logits.device
 
+        _debug = _DFLASH_DEBUG_COUNTER <= 5
+
         valid_mask = labels != -100
+        if _debug:
+            logger.info(
+                f"[DFlash DBG _compute_loss] logits={logits.shape} "
+                f"labels={labels.shape} valid={valid_mask.sum().item()}/{labels.numel()} "
+                f"logits_range=[{logits.min().item():.4f}, {logits.max().item():.4f}] "
+                f"logits_has_nan={logits.isnan().any().item()} "
+                f"labels_unique_sample={labels[0, :20].tolist()}"
+            )
         if not valid_mask.any():
+            if _debug:
+                logger.warning("[DFlash DBG] ALL labels are -100 → returning zero loss")
             zero = logits.sum() * 0.0
             return zero, torch.tensor(0.0, device=device)
 
@@ -387,6 +445,8 @@ class DFlashModel(nn.Module):
         if weight_sum > 0:
             loss = weighted_loss / weight_sum
         else:
+            if _debug:
+                logger.warning("[DFlash DBG] weight_sum=0 → returning zero loss")
             loss = logits.sum() * 0.0
 
         # Accuracy
@@ -394,6 +454,13 @@ class DFlashModel(nn.Module):
             preds = logits.argmax(dim=-1)
             correct = (preds == labels) & valid_mask
             accuracy = correct.float().sum() / valid_mask.float().sum().clamp(min=1)
+
+        if _debug:
+            logger.info(
+                f"[DFlash DBG] loss={loss.item():.6f}, accuracy={accuracy.item():.6f}, "
+                f"weight_sum={weight_sum.item():.4f}, "
+                f"ce_loss_valid_mean={ce_loss[valid_mask].mean().item():.4f}"
+            )
 
         return loss, accuracy
 
