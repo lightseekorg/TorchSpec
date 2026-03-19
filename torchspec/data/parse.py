@@ -559,7 +559,10 @@ class MiniMaxParser(Parser):
             name = func.get("name", "")
             args = func.get("arguments", {})
             if isinstance(args, str):
-                args = json.loads(args)
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, ValueError):
+                    args = {"raw": args}
             invoke_lines = [f'<invoke name="{name}">']
             if isinstance(args, dict):
                 for k, v in args.items():
