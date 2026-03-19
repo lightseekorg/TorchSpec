@@ -82,41 +82,23 @@ See [examples/README.md](examples/README.md) for details.
 
 ## Resume Vs Continual Training
 
-TorchSpec supports two different ways to start from an existing checkpoint. They both use
-`training.load_path`, but they do different things:
+Both modes use `training.load_path`, but they restore different state:
 
 | Goal | `training.load_path` | `training.continual_training` | What gets restored |
 |------|----------------------|-------------------------------|--------------------|
 | Resume an interrupted run | Required | `false` (default) | Model, optimizer, LR scheduler, RNG, and step metadata |
 | Start a new run from existing weights | Required | `true` | Model weights only |
 
-### 1. Resume training from an existing checkpoint
-
-Use this when a previous run was interrupted and you want to continue as if it never stopped.
+Resume the same run:
 
 ```yaml
 training:
   load_path: /path/to/old_run/checkpoints
-  continual_training: false   # default; can be omitted
 
 output_dir: /path/to/old_run
 ```
 
-Behavior:
-
-- TorchSpec reads the latest checkpoint under `training.load_path` unless you explicitly set `ckpt_step`.
-- It restores model weights, optimizer state, LR scheduler state, RNG state, and step counters.
-- Training resumes from the saved global step, so the old learning-rate schedule continues instead of restarting.
-
-Use resume mode when:
-
-- A job crashed or was preempted.
-- You want to keep the same optimizer momentum and LR schedule.
-- You want the run to continue writing checkpoints for the same training trajectory.
-
-### 2. Continual training from the beginning using an existing checkpoint
-
-Use this when you want to initialize from an existing model checkpoint but start a new training run with new optimization settings.
+Start a new run from existing weights:
 
 ```yaml
 training:
@@ -128,24 +110,6 @@ training:
 
 output_dir: /path/to/new_run
 ```
-
-Behavior:
-
-- TorchSpec loads model weights from `training.load_path`.
-- It does **not** restore optimizer state, LR scheduler state, RNG state, or saved step metadata.
-- The new run starts from step 0 and uses the new config values in your YAML, such as a lower `learning_rate`, different `warmup_ratio`, or a new dataset.
-- For BF16 training, TorchSpec also refreshes the optimizer's fp32 master weights from the checkpointed model so the first optimizer step does not overwrite the loaded weights.
-
-Use continual training when:
-
-- You want to adapt an existing draft model to new data.
-- You want a fresh optimizer and fresh LR schedule.
-- You want the new run to save into a different `output_dir` while reusing old weights.
-
-### Choosing the right mode
-
-If you want to continue the same run, use normal resume mode and leave `continual_training` unset or `false`.
-If you want to start a new run from pretrained draft weights, set `continual_training: true` and point `output_dir` to a new directory.
 
 ## Checkpoint Conversion
 
