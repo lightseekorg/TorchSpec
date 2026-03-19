@@ -246,6 +246,8 @@ def _save_with_vocab_pruning(
     save_file(tensors, os.path.join(output_dir, "model.safetensors"))
 
     raw_config["draft_vocab_size"] = draft_vocab_size
+    actual_dtype = next(iter(tensors.values())).dtype
+    raw_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(raw_config, f, indent=2)
 
