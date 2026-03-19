@@ -149,10 +149,6 @@ def training_loop(
     eval_enabled = eval_state.eval_enabled
     best_eval_score = eval_state.best_eval_score
 
-    # Submit training data AFTER eval hs generation so that training prompts don't
-    # leak into the inference pipeline during eval.
-    ray.get(controller.submit_training_dataset.remote())
-
     dp_size = (
         getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
     )
