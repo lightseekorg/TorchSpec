@@ -94,6 +94,7 @@ class Eagle3TargetModel(ABC):
     ) -> None:
         """
         Set the layers to capture the aux hidden states from the target model outputs.
+        Supports any number of layers (Eagle3 uses 3, DFlash uses 5).
         """
         if aux_hidden_states_layers is None:
             if hasattr(self.model.config, "num_hidden_layers"):
@@ -108,9 +109,8 @@ class Eagle3TargetModel(ABC):
                 num_layers - 4,
             ]
         self.aux_hidden_states_layers = aux_hidden_states_layers
-        assert len(self.aux_hidden_states_layers) == 3, (
-            "aux_hidden_states_layers is expected to be 3 layers for EAGLE3"
-        )
+        if not self.aux_hidden_states_layers:
+            raise ValueError("aux_hidden_states_layers must be a non-empty list")
 
 
 class HFTargetModel(Eagle3TargetModel):
@@ -241,16 +241,17 @@ class HFTargetModel(Eagle3TargetModel):
             for handle in handles:
                 handle.remove()
 
-        if len(captured_states) != 3:
-            raise RuntimeError(f"Expected to capture 3 layers, but captured {len(captured_states)}")
+        expected = len(target_indices)
+        if len(captured_states) != expected:
+            raise RuntimeError(
+                f"Expected to capture {expected} layers, but captured {len(captured_states)}"
+            )
         assert "value" in last_hidden, "Failed to capture last hidden states from final norm layer"
 
         device = input_ids.device
-        hidden_states0 = captured_states[target_indices[0]].to(device)
-        hidden_states1 = captured_states[target_indices[1]].to(device)
-        hidden_states2 = captured_states[target_indices[2]].to(device)
-
-        hidden_states = torch.cat((hidden_states0, hidden_states1, hidden_states2), dim=-1)
+        hidden_states = torch.cat(
+            [captured_states[idx].to(device) for idx in target_indices], dim=-1
+        )
 
         loss_mask = loss_mask[..., None].to(device)
 

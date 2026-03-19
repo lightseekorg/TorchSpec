@@ -224,6 +224,22 @@ def train_async_no_generation(args):
         draft_model_config = _get_draft_model_config(args)
         args.draft_model_config_obj = draft_model_config
 
+        # Auto-set aux layer IDs for DFlash (5 layers) if not explicitly provided
+        from torchspec.models.draft.dflash import DFlashConfig
+
+        if isinstance(draft_model_config, DFlashConfig) and not getattr(
+            args, "aux_hidden_states_layers", None
+        ):
+            from torchspec.models.draft.dflash import build_target_layer_ids
+
+            target_layer_ids = getattr(draft_model_config, "target_layer_ids", None)
+            if target_layer_ids is None:
+                num_target = getattr(draft_model_config, "num_target_layers", 5)
+                target_num_hidden = getattr(draft_model_config, "target_num_hidden_layers", 36)
+                target_layer_ids = build_target_layer_ids(num_target, target_num_hidden)
+            args.aux_hidden_states_layers = target_layer_ids
+            logger.info(f"DFlash: set aux_hidden_states_layers = {target_layer_ids}")
+
         pgs = create_placement_groups(args)
         launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)

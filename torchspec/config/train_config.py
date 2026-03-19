@@ -125,6 +125,12 @@ class TrainingConfig:
     ttt_length: int = 7
     warmup_ratio: float = 0.015
 
+    # DFlash-specific parameters
+    dflash_block_size: int = 16
+    dflash_loss_decay_gamma: float = 7.0
+    dflash_num_anchors: int = 512
+    dflash_num_target_layers: int = 5
+
 
 @dataclass
 class DecodeConfig:
