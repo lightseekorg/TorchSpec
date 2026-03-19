@@ -164,6 +164,15 @@ def training_loop(
         steps_per_epoch = 1
     num_epochs = getattr(args, "num_epochs", 1)
 
+    # Submit training data AFTER eval hs generation so that training prompts don't
+    # leak into the inference pipeline during eval.
+    # Resume is best-effort: completed optimizer steps determine epoch/skip, but
+    # async prompt/result buffers can still lose or replay a small tail.
+    start_step = ray.get(train_group._actor_handlers[0].get_global_step.remote())
+    resume_epoch = start_step // steps_per_epoch if steps_per_epoch > 0 else 0
+    resume_skip = (start_step % steps_per_epoch) * args.global_batch_size if start_step > 0 else 0
+    ray.get(controller.submit_training_dataset.remote(epoch=resume_epoch, skip=resume_skip))
+
     logger.info(
         f"Starting: num_steps={num_steps}, num_epochs={num_epochs}, "
         f"steps_per_epoch={steps_per_epoch}, global_batch_size={args.global_batch_size}, "
@@ -173,8 +182,6 @@ def training_loop(
 
     enable_perf = getattr(args, "enable_perf_metrics", True)
 
-    # Restore step counter from checkpoint (actors load checkpoint in __init__)
-    start_step = ray.get(train_group._actor_handlers[0].get_global_step.remote())
     completed_steps = start_step
     current_epoch = completed_steps // steps_per_epoch + 1
     steps_in_current_epoch = completed_steps % steps_per_epoch
