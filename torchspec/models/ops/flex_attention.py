@@ -59,10 +59,9 @@ class WrappedFlexAttention:
         Initialize or update the singleton instance.
         """
         if not self._is_flex_compiled:
-            # Enable dynamic shapes to handle different input sizes
             self._compiled_flex_attention = torch.compile(
                 flex_attention,
-                # mode="max-autotune-no-cudagraphs",
+                backend="aot_eager",
             )
             self._is_flex_compiled = True
 
