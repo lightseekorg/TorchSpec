@@ -1,0 +1,61 @@
+# Eagle3 training config — single GPU (colocate mode)
+#
+# GPU allocation:
+#   - 1 GPU shared between inference (HF) and training (no FSDP)
+#   - Requires H100 80GB or A100 80GB
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/hf_qwen3_8b_1gpu.yaml
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: ../examples/data/eval_conversations.jsonl
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  colocate: true
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 4096
+  num_epochs: 1
+  seed: 42
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+
+inference:
+  inference_engine_type: hf
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 32
+  inference_buffer_threshold: 16
+  inference_batch_size: 4
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/qwen3-8b-eagle3-1gpu
+cache_dir: ./cache/qwen3-8b-1gpu
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false
