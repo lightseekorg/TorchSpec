@@ -20,11 +20,14 @@
 
 from torchspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.base import Eagle3DraftModel
+from torchspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 
 __all__ = [
     "AutoDraftModelConfig",
     "AutoEagle3DraftModel",
     "Eagle3DraftModel",
+    "DFlashConfig",
+    "DFlashDraftModel",
     "LlamaForCausalLMEagle3",
 ]

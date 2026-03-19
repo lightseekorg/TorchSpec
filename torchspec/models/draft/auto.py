@@ -25,6 +25,7 @@ from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import LlamaConfig, PretrainedConfig, modeling_utils
 
+from torchspec.models.draft.dflash import DFlashConfig, DFlashDraftModel
 from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from torchspec.utils.logging import logger
 
@@ -32,6 +33,7 @@ from torchspec.utils.logging import logger
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
+        DFlashConfig: DFlashDraftModel,
     }
 
     @classmethod
@@ -70,6 +72,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
 class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
+        "DFlashDraftModel": DFlashConfig,
     }
 
     @classmethod
