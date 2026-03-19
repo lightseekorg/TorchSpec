@@ -152,6 +152,7 @@ class AsyncTrainingController:
         self._stored_eval_dataset: list | None = None
         self._dataset_epoch: int = 0
         self._dataset_seed: int = getattr(args, "seed", 42)
+        self._shuffle_dataset: bool = getattr(args, "shuffle_dataset", True)
 
         self._start_time = time.time()
         self._inference_monitor = SpeedMonitor(window_seconds=10.0)
@@ -212,32 +213,36 @@ class AsyncTrainingController:
         logger.info(f"Controller loaded dataset: {len(self._stored_dataset)} samples")
         return len(self._stored_dataset)
 
-    def _shuffled_dataset(self, skip: int = 0) -> list:
-        """Return a shuffled copy using a deterministic per-epoch seed.
+    def _prepare_dataset(self, skip: int = 0) -> list:
+        """Return dataset for the current epoch, optionally shuffled.
 
-        The shuffle is deterministic from (seed + epoch), so resume can
-        reconstruct the same epoch ordering and approximately skip samples
-        consumed by completed optimizer steps. This is best-effort only because
-        async prompt/result buffers may still contain in-flight samples.
+        When shuffle is enabled the ordering is deterministic from
+        (seed + epoch), so resume can reconstruct the same epoch ordering
+        and approximately skip samples consumed by completed optimizer
+        steps.  This is best-effort only because async prompt/result
+        buffers may still contain in-flight samples.
         """
-        import random
+        data = list(self._stored_dataset)
+        if self._shuffle_dataset:
+            import random
 
-        rng = random.Random(self._dataset_seed + self._dataset_epoch)
-        shuffled = list(self._stored_dataset)
-        rng.shuffle(shuffled)
+            rng = random.Random(self._dataset_seed + self._dataset_epoch)
+            rng.shuffle(data)
+
         if skip > 0:
-            skip = min(skip, len(shuffled))
-            shuffled = shuffled[skip:]
-            logger.info(
-                f"Shuffled dataset with seed {self._dataset_seed}+{self._dataset_epoch}, "
-                f"skipped {skip}, submitting {len(shuffled)} samples"
-            )
-        else:
-            logger.info(
-                f"Shuffled dataset ({len(shuffled)} samples) with seed "
-                f"{self._dataset_seed}+{self._dataset_epoch}"
-            )
-        return shuffled
+            skip = min(skip, len(data))
+            data = data[skip:]
+
+        shuffle_tag = (
+            f"seed {self._dataset_seed}+{self._dataset_epoch}"
+            if self._shuffle_dataset
+            else "shuffle disabled"
+        )
+        logger.info(
+            f"Prepared dataset ({len(data)} samples, {shuffle_tag}"
+            + (f", skipped {skip})" if skip > 0 else ")")
+        )
+        return data
 
     def submit_training_dataset(self, epoch: int = 0, skip: int = 0) -> int:
         """Submit the stored training dataset to the prompt buffer for inference.
@@ -248,13 +253,13 @@ class AsyncTrainingController:
         """
         assert self._stored_dataset is not None, "No stored dataset to submit"
         self._dataset_epoch = epoch
-        return self.add_dataset(self._shuffled_dataset(skip=skip))
+        return self.add_dataset(self._prepare_dataset(skip=skip))
 
     def reload_dataset(self) -> int:
         """Re-add the stored dataset to the prompt buffer (epoch reload)."""
         assert self._stored_dataset is not None, "No stored dataset to reload"
         self._dataset_epoch += 1
-        return self.add_dataset(self._shuffled_dataset())
+        return self.add_dataset(self._prepare_dataset())
 
     def load_eval_dataset(self, args) -> int:
         """Load eval dataset on the controller and store it. Returns size (0 if none)."""
