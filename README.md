@@ -1,22 +1,58 @@
 # TorchSpec
 
-TorchSpec is a torch-native speculative decoding training framework. We introduce a disaggregated way of training speculative decoding draft models where inference and training are fully decoupled and stream hidden states directly from inference engine groups to distributed training workers via Mooncake (RDMA/TCP) store, allowing each side to scale independently.
+TorchSpec is a torch-native speculative decoding training framework for disaggregated draft-model training. It decouples target-model inference from draft-model training and streams hidden states directly from inference engine groups to distributed training workers through Mooncake, so inference and training can scale independently.
+
+TorchSpec currently includes training flows and examples for:
+
+- Kimi-K2.5
+- MiniMax-M2.5
+- Qwen3-Coder-Next
+
+## 🚀 Blogs
+
+- Release blog: [TorchSpec: Speculative Decoding Training at Scale](https://lightseek.org/blog/torchspec-speculative-decoding-training-at-scale.html)
+- Released draft model: [lightseekorg/kimi-k2.5-eagle3](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3)
+
+## Table of Contents
+
+- [Architecture Overview](#architecture-overview)
+- [Quick Start](#quick-start)
+- [Setup](#setup)
+- [Examples](#examples)
+- [Training Modes](#training-modes)
+- [Checkpoint Conversion](#checkpoint-conversion)
+- [Metrics Reporting](#metrics-reporting)
+- [Troubleshooting](#troubleshooting)
+
+## Architecture Overview
 
 <p align="center">
   <img src="docs/torchspec_architecture.png" alt="TorchSpec Architecture" width="100%">
 </p>
 
+TorchSpec is built around a disaggregated training pipeline:
+
+- **Inference engines** generate target-model hidden states with either vLLM or SGLang.
+- **Mooncake store** transfers tensors between inference and training without materializing them on disk.
+- **Training workers** consume streamed hidden states to train speculative decoding draft models.
+
+This separation keeps the training side focused on optimization while letting the inference side scale for hidden-state generation throughput.
+
+## Quick Start
+
+Train an Eagle3 draft model for Qwen3-8B on a single node with 4 GPUs (2 for training and 2 for inference):
+
+```bash
+./examples/qwen3-8b-single-node/run.sh
+```
+
+Override config values directly from the CLI:
+
+```bash
+./examples/qwen3-8b-single-node/run.sh training.learning_rate=5e-5 training.num_train_steps=500
+```
+
 ## Setup
-
-### Choose Your Backend
-
-TorchSpec supports two inference backends:
-
-| Backend | Best For | Installation |
-|---------|----------|--------------|
-| **vLLM** | Flexibility, easier deployment | `./tools/build_conda.sh 1 vllm` |
-| **SGLang** | Production workloads, high throughput | `./tools/build_conda.sh 1 sglang` |
-| **Both** | Development, comparison testing | `./tools/build_conda.sh 1 both` |
 
 ### Quick Setup
 
@@ -31,11 +67,12 @@ micromamba activate torchspec
 ```
 
 To install into your current environment instead:
+
 ```bash
 ./tools/build_conda.sh current sglang  # or 'vllm' or 'both'
 ```
 
-Optional — install Flash Attention:
+Optional: install Flash Attention support:
 
 ```bash
 pip install -e ".[fa]"
@@ -43,46 +80,37 @@ pip install -e ".[fa]"
 
 ### Backend-Specific Usage
 
-**vLLM:**
+**vLLM**
+
 ```bash
 ./examples/qwen3-8b-single-node/run.sh --config configs/vllm_qwen3_8b.yaml
 ```
 
-**SGLang:**
-```bash
-./examples/qwen3-8b-single-node/run.sh
-```
-
-TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model's forward pass and capture hidden states directly in the worker processes. This avoids RPC serialization issues and enables reliable hidden states extraction.
-
-## Quick Start
-
-Train an Eagle3 draft model for Qwen3-8B using inference engine (4 GPUs: 2 training + 2 inference):
+**SGLang**
 
 ```bash
 ./examples/qwen3-8b-single-node/run.sh
 ```
 
-Override any config value via CLI:
-
-```bash
-./examples/qwen3-8b-single-node/run.sh training.learning_rate=5e-5 training.num_train_steps=500
-```
+TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model forward pass and capture hidden states directly inside worker processes, which avoids RPC serialization overhead during extraction. For SGLang, TorchSpec applies a patch to the existing codebase to enable hidden-state extraction.
 
 ## Examples
 
 | Example | Backend | Model |
 |---------|---------|-------|
 | [hf-quickstart](examples/hf-quickstart/) | HuggingFace | Qwen3-8B |
-| [qwen3-8b-single-node](examples/qwen3-8b-single-node/) | Inference Engine | Qwen3-8B |
-| [kimi-k25-2node-h200](examples/kimi-k25-2node-h200/) | Inference Engine | Kimi-K2.5 |
-| [kimi-k25-3node-h100](examples/kimi-k25-3node-h100/) | Inference Engine | Kimi-K2.5 |
+| [qwen3-8b-single-node](examples/qwen3-8b-single-node/) | Inference engine | Qwen3-8B |
+| [kimi-k25-2node-h200](examples/kimi-k25-2node-h200/) | Inference engine | Kimi-K2.5 |
+| [kimi-k25-3node-h100](examples/kimi-k25-3node-h100/) | Inference engine | Kimi-K2.5 |
+| [minimax-m25-3node-h200](examples/minimax-m25-3node-h200/) | Inference engine | MiniMax-M2.5 |
 
-See [examples/README.md](examples/README.md) for details.
+See [examples/README.md](examples/README.md) for more details about each example.
 
-## Resume Vs Continual Training
+## Training Modes
 
-Both modes use `training.load_path`, but they restore different state:
+### Resume vs. Continual Training
+
+Both modes use `training.load_path`, but they restore different states:
 
 | Goal | `training.load_path` | `training.continual_training` | What gets restored |
 |------|----------------------|-------------------------------|--------------------|
@@ -119,11 +147,10 @@ Convert an FSDP checkpoint to HuggingFace format:
 python tools/convert_to_hf.py --input-dir ./outputs/my_experiment/iter_0010000/
 ```
 
-Vocabulary pruning — reducing the draft model's `lm_head` to a smaller token set and emitting `d2t`/`t2d` mappings — can be applied either **during training** (pre-pruning) or **at conversion time** (post-pruning):
+Vocabulary pruning, which reduces the draft model `lm_head` to a smaller token set and emits `d2t` and `t2d` mappings, can be applied either during training or at conversion time.
 
-- **Pre-pruning**: set `draft_vocab_size` in your training config. The checkpoint already contains the pruned `lm_head` and `d2t`/`t2d` buffers. Use the basic conversion command above — no extra flags needed.
-
-- **Post-pruning**: train with the full vocabulary, then prune at conversion time by passing `--prune-vocab` along with a representative dataset to compute token frequencies:
+- **Pre-pruning**: set `draft_vocab_size` in your training config. The checkpoint already contains the pruned `lm_head` and `d2t`/`t2d` buffers, so the basic conversion command is enough.
+- **Post-pruning**: train with the full vocabulary, then pass `--prune-vocab` at conversion time together with a representative dataset to compute token frequencies.
 
 ```bash
 python tools/convert_to_hf.py \
@@ -140,11 +167,11 @@ Pass `--cache-dir ./cache` to reuse the tokenized dataset cache from training.
 
 ## Metrics Reporting
 
-W&B logging is disabled by default (`report_to: none`). To enable it, set `report_to: wandb` in your config and supply your API key.
+W&B logging is disabled by default with `report_to: none`. To enable it, set `report_to: wandb` in your config and provide your API key.
 
 ## Troubleshooting
 
-Set `TORCHSPEC_LOG_LEVEL=DEBUG` for verbose logging when diagnosing issues:
+Set `TORCHSPEC_LOG_LEVEL=DEBUG` for more verbose logging when diagnosing issues:
 
 ```bash
 TORCHSPEC_LOG_LEVEL=DEBUG ./examples/qwen3-8b-single-node/run.sh
@@ -152,7 +179,7 @@ TORCHSPEC_LOG_LEVEL=DEBUG ./examples/qwen3-8b-single-node/run.sh
 
 ### Per-Rank File Logging
 
-Set `TORCHSPEC_LOG_DIR` to an <b> absolute path </b> on a shared filesystem (NFS) to enable per-rank log files for every Ray actor (training and inference):
+Set `TORCHSPEC_LOG_DIR` to an absolute path on a shared filesystem (NFS) to enable per-rank log files for every Ray actor on both training and inference:
 
 ```bash
 export TORCHSPEC_LOG_DIR=/my_project/running_logs
@@ -160,7 +187,7 @@ export TORCHSPEC_LOG_DIR=/my_project/running_logs
 
 This creates a structured directory with one file per actor, organized by role and node:
 
-```
+```text
 running_logs/
   training/
     10.0.0.1/
@@ -175,7 +202,7 @@ running_logs/
       inference_g0_rank1_20260301_080015.log
 ```
 
-The path must be an absolute path on a shared filesystem (NFS) accessible from all nodes. If `TORCHSPEC_LOG_DIR` is not set or the path is not writable, per-rank file logging is disabled and only Ray's default stdout/stderr capture is used.
+The path must be absolute and writable from all nodes. If `TORCHSPEC_LOG_DIR` is unset or not writable, per-rank file logging stays disabled and Ray falls back to stdout/stderr capture.
 
 | Issue | Reference |
 |-------|-----------|
