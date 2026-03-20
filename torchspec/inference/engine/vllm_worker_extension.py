@@ -666,7 +666,7 @@ class VllmWorkerExtension:
                 )
 
                 # Store to Mooncake
-                tensor_shapes = self._mooncake_store.put(
+                store_meta = self._mooncake_store.put(
                     key=mooncake_key,
                     hidden_states=hidden_states,
                     input_ids=input_ids,
@@ -676,18 +676,11 @@ class VllmWorkerExtension:
 
                 logger.debug(f"Successfully stored to Mooncake: key={mooncake_key}")
 
-                # Report post-cast dtypes so readers interpret bytes correctly.
-                # EagleMooncakeStore.put() casts to HIDDEN_STATES_STORAGE_DTYPE.
-                from torchspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE
-
-                _hs_dtype_str = str(HIDDEN_STATES_STORAGE_DTYPE).replace("torch.", "")
                 result[req_id] = {
                     "mooncake_key": mooncake_key,
-                    "tensor_shapes": tensor_shapes,
+                    "tensor_shapes": store_meta["shapes"],
                     "tensor_dtypes": {
-                        "hidden_states": _hs_dtype_str,
-                        "input_ids": str(input_ids.dtype).replace("torch.", ""),
-                        "last_hidden_states": _hs_dtype_str,
+                        k: str(v).replace("torch.", "") for k, v in store_meta["dtypes"].items()
                     },
                     "num_layers": len(layer_tensors),
                     "packed_loss_mask": self._packed_loss_mask_map.get(req_id),

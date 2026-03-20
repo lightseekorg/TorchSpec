@@ -36,7 +36,7 @@ import torch.distributed as dist
 from torchspec.config.inference_config import HFInferenceConfig
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.models.target import HFTargetModel
-from torchspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE, EagleMooncakeStore
+from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 from torchspec.utils.logging import logger
 
 
@@ -231,7 +231,7 @@ class HFRunner:
         for i, sample in enumerate(inference_outputs):
             if self.mooncake_store is not None:
                 key = str(uuid.uuid4())
-                shapes = self.mooncake_store.put(
+                store_meta = self.mooncake_store.put(
                     key=key,
                     hidden_states=sample["hidden_states"],
                     target=sample["target"],
@@ -239,15 +239,11 @@ class HFRunner:
                     last_hidden_states=sample["last_hidden_states"],
                 )
 
-                dtypes = {"hidden_states": HIDDEN_STATES_STORAGE_DTYPE}
-                if sample["target"] is not None:
-                    dtypes["target"] = HIDDEN_STATES_STORAGE_DTYPE
-
                 results.append(
                     {
                         "mooncake_key": key,
-                        "tensor_shapes": shapes,
-                        "tensor_dtypes": dtypes,
+                        "tensor_shapes": store_meta["shapes"],
+                        "tensor_dtypes": store_meta["dtypes"],
                         "packed_loss_mask": packed_loss_mask_list[i],
                     }
                 )
