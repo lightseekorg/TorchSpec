@@ -39,6 +39,7 @@ from omegaconf import DictConfig, OmegaConf
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.inference.engine.sgl_engine_decode import SglDecodeEngineMixin
 from torchspec.ray.ray_actor import RayActor
+from torchspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE
 from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
 
@@ -540,7 +541,7 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
     def _get_tensor_dtypes(self) -> dict:
         """Get tensor dtypes for mooncake metadata."""
         return {
-            "hidden_states": torch.bfloat16,
+            "hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
             "input_ids": torch.long,
-            "last_hidden_states": torch.bfloat16,
+            "last_hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
         }
