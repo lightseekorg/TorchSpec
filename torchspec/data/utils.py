@@ -52,12 +52,21 @@ class DataCollatorWithPadding:
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
+        if n > N:
+            return intensors[:, :N, :]
+        if n == N:
+            return intensors
         padding_tensor = torch.zeros(B, N - n, S, dtype=intensors.dtype, device=intensors.device)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
 
     def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n = intensors.shape
+        if n > N:
+            # Truncate if tensor is longer than target length
+            return intensors[:, :N]
+        if n == N:
+            return intensors
         padding_tensor = torch.zeros(B, N - n, dtype=intensors.dtype, device=intensors.device)
         outtensors = torch.cat((intensors, padding_tensor), dim=1)
         return outtensors
