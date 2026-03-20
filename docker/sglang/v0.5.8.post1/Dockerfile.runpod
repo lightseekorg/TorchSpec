@@ -1,0 +1,51 @@
+ARG SGLANG_IMAGE_TAG=v0.5.8-cu129-amd64
+FROM lmsysorg/sglang:${SGLANG_IMAGE_TAG} AS sglang
+
+
+WORKDIR /root/
+
+# Layer 1: System dependencies (stable, small)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        nvtop rsync dnsutils \
+        libibverbs-dev librdmacm-dev libnuma-dev \
+        tmux git vim htop && \
+    rm -rf /var/lib/apt/lists/*
+
+# Layer 2: SGLang at pinned commit with patch (moderately stable)
+ARG SGLANG_COMMIT=0f2df9370a1de1b4fb11b071d39ab3ce2287a350
+COPY patches/sglang/v0.5.8.post1/sglang.patch /sgl-workspace/
+RUN rm -rf /sgl-workspace/sglang && \
+    git clone --depth=1 --branch main https://github.com/sgl-project/sglang.git /sgl-workspace/sglang && \
+    cd /sgl-workspace/sglang && \
+    git fetch --depth=1 origin $SGLANG_COMMIT && \
+    git checkout $SGLANG_COMMIT && \
+    git apply /sgl-workspace/sglang.patch && \
+    rm /sgl-workspace/sglang.patch && \
+    cd python && pip install -e .
+
+# Layer 3: flashinfer (stable)
+# Explicitly install flashinfer-jit-cache because it is not directly depended by sglang.
+RUN pip install flashinfer-jit-cache==0.6.2 --index-url https://flashinfer.ai/whl/cu129
+
+# Layer 4: Pre-download Qwen3-8B model (~16GB, most stable layer)
+# Placed BEFORE code COPY so TorchSpec code changes don't invalidate this layer.
+RUN python3 -c "\
+from huggingface_hub import snapshot_download; \
+snapshot_download('Qwen/Qwen3-8B', cache_dir='/root/models/huggingface')" && \
+    rm -rf /root/.cache/pip
+
+# Layer 5: TorchSpec code and dependencies (changes most frequently)
+COPY . /root/torchspec
+RUN pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base -y 2>/dev/null; \
+    cd /root/torchspec && pip install --no-cache-dir -e ".[fa,dev]"
+
+# Layer 6: Mooncake binary permission fix
+RUN chmod 755 /usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master
+# Avoid mooncake modifying the binary permissions.
+RUN sed -i 's/os.chmod(bin_path, 0o755)/pass/' /usr/local/lib/python3.12/dist-packages/mooncake/cli.py
+
+# Pre-downloaded model location
+ENV HF_HOME=/root/models/huggingface
+
+WORKDIR /root/torchspec
