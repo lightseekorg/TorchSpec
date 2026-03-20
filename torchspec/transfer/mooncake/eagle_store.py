@@ -21,7 +21,7 @@
 import atexit
 import ctypes
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -47,6 +47,9 @@ _DTYPE_ELEMENT_SIZES = {
     torch.uint8: 1,
     torch.bool: 1,
 }
+
+# Canonical dtype for hidden-state tensors written to / read from Mooncake.
+HIDDEN_STATES_STORAGE_DTYPE = torch.bfloat16
 
 
 class EagleMooncakeStore(MooncakeHiddenStateStore):
@@ -118,7 +121,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         input_ids: torch.Tensor,
         last_hidden_states: Optional[torch.Tensor],
         target: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Tuple[int, ...]]:
+    ) -> Dict[str, Any]:
         """Store Eagle3 output tensors via async batch_put_from.
 
         DtoH staging runs on ``_copy_stream`` so the caller's compute stream
@@ -128,9 +131,24 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         still in-flight.
 
         For GPU Direct send the path is synchronous (no DtoH needed).
+
+        Returns a dict with ``"shapes"`` and ``"dtypes"`` sub-dicts that
+        reflect the *actually stored* tensors (post dtype-cast).  Callers
+        should forward these to consumers so metadata always matches bytes.
         """
         self._ensure_initialized()
         logger.debug("put: starting for key=%s", key)
+
+        if hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE:
+            hidden_states = hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
+        if (
+            last_hidden_states is not None
+            and last_hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE
+        ):
+            last_hidden_states = last_hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
+        if target is not None and target.dtype != HIDDEN_STATES_STORAGE_DTYPE:
+            target = target.to(HIDDEN_STATES_STORAGE_DTYPE)
+
         keys = [f"{key}_hs", f"{key}_ids"]
         tensors = [hidden_states, input_ids]
 
@@ -187,13 +205,19 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             "hidden_states": tuple(hidden_states.shape),
             "input_ids": tuple(input_ids.shape),
         }
+        dtypes = {
+            "hidden_states": hidden_states.dtype,
+            "input_ids": input_ids.dtype,
+        }
         if target is not None:
             shapes["target"] = tuple(target.shape)
+            dtypes["target"] = target.dtype
         if last_hidden_states is not None:
             shapes["last_hidden_states"] = tuple(last_hidden_states.shape)
+            dtypes["last_hidden_states"] = last_hidden_states.dtype
 
         logger.debug("put: completed key=%s, shapes=%s", key, shapes)
-        return shapes
+        return {"shapes": shapes, "dtypes": dtypes}
 
     def flush(self) -> None:
         """Block until all in-flight async puts have completed.
@@ -282,14 +306,16 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             (
                 "hidden_states",
                 shapes["hidden_states"],
-                dtypes.get("hidden_states", torch.bfloat16),
+                dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
             ),
             ("input_ids", shapes["input_ids"], torch.int64),
         ]
 
         if "target" in shapes:
             keys.append(f"{key}_tgt")
-            tensor_specs.append(("target", shapes["target"], dtypes.get("target", torch.bfloat16)))
+            tensor_specs.append(
+                ("target", shapes["target"], dtypes.get("target", HIDDEN_STATES_STORAGE_DTYPE))
+            )
 
         if "last_hidden_states" in shapes:
             keys.append(f"{key}_lhs")
@@ -297,7 +323,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                 (
                     "last_hidden_states",
                     shapes["last_hidden_states"],
-                    dtypes.get("hidden_states", torch.bfloat16),
+                    dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
                 )
             )
 
