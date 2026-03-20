@@ -39,6 +39,7 @@ training:
   training_num_nodes: 1
   ttt_length: 7
   save_per_epoch: true
+  max_checkpoints: 1  # Keep only the latest checkpoint to avoid disk quota issues
   warmup_ratio: 0.04
 
   # DFlash-specific parameters

@@ -116,6 +116,7 @@ class TrainingConfig:
     prefetch_depth: int = 4
     save_interval: int = 5000
     save_per_epoch: bool = False
+    max_checkpoints: int = 0  # 0 = keep all, N > 0 = keep only N most recent checkpoints
     seed: int = 0
     train_backend: str = "fsdp"
     train_env_vars: str = "{}"
