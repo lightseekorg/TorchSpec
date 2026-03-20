@@ -1227,13 +1227,114 @@ Restarted training at step 0 with inductor backend (commit `fee3156`).
 - **Log file**: `/tmp/phase_c6.log`
 - **Tmux session**: `phase_c`
 
+### Training Progress (Inductor Run — Attempt 6)
+
+| Time | Step | Progress | Loss | Accuracy | Speed |
+|------|------|----------|------|----------|-------|
+| 30 min | 3,658 | 10% (epoch 1) | 2.9-4.5 | 0.14-0.27 | 2.0 step/s |
+| 1 hr | 7,005 | 20% (epoch 2) | 2.7-3.9 | 0.19-0.30 | 1.9 step/s |
+| 2 hr | 13,262 | 37% (epoch 3) | 2.6-4.1 | 0.20-0.33 | 1.8 step/s |
+| **2 hr 16 min** | **15,000** | **42% (epoch 3)** | **CRASHED** | — | — |
+
+#### Attempt 6 — Disk Quota Exceeded at Checkpoint Save (step 15,000)
+
+**Error**: `OSError: [Errno 122] Disk quota exceeded` during FSDP checkpoint save.
+
+**Root cause**: Each FSDP checkpoint (model + optimizer + lr_scheduler + rng) is **~15 GB** for Qwen3-8B. The training loop saves checkpoints at two triggers:
+- `save_interval=5000` → steps 5000, 10000, 15000, ...
+- `save_per_epoch=true` → steps ~5935, ~11870, ...
+
+The checkpoint at `iter_0011871` (end of epoch 2) consumed 15 GB. When step 15000 triggered another save, the combined ~30 GB exceeded the RunPod per-pod disk quota. The `/workspace` mount shows 67T free on the shared NFS, but per-pod quotas are much smaller.
+
+**Fix**: Added **checkpoint rotation** feature (`max_checkpoints` config option):
+- `max_checkpoints: 0` (default) — keep all checkpoints (backward compatible)
+- `max_checkpoints: 1` — delete oldest checkpoints before saving, keep only N most recent
+- Implemented in `_cleanup_old_checkpoints()` in `loop.py`
+- Wired into all 3 save points: interval save, per-epoch save, final save
+
+**Commit**: `c7c6605` — Add checkpoint rotation to prevent disk quota exceeded during training
+
+#### Issue 20: FSDP Checkpoint Disk Quota (RunPod)
+
+**Problem**: RunPod's `/workspace` volume enforces per-pod disk quotas (~20-30 GB usable). Each FSDP checkpoint for Qwen3-8B is ~15 GB. Without rotation, 2 checkpoints exceed the quota.
+
+**Solution**: `max_checkpoints: 1` in config. Old checkpoints are deleted before saving new ones. With `save_interval=1000`, worst-case data loss on crash is ~9 minutes (1000 steps ÷ 1.9 step/s).
+
+**Alternative**: Increase pod volume to 500 GB (costs more). Not necessary with checkpoint rotation.
+
+**Recommended config for RunPod**:
+```yaml
+training:
+  save_interval: 1000       # Save every 1000 steps (~9 min of work)
+  save_per_epoch: true       # Also save at epoch boundaries
+  max_checkpoints: 1         # Keep only latest checkpoint (15 GB)
+```
+
+#### Issue 21: Eval Cache Timeout on Restart
+
+**Problem**: After killing and restarting training, the eval cache generation step times out:
+```
+TimeoutError: Timed out while waiting for eval cache generation
+(no progress during eval for 300.0s, dispatched=0/64 samples)
+```
+This happens before training starts — inference engines don't respond to eval dispatch.
+
+**When it occurs**: Consistently after rapid kill/restart cycles (tmux kill → immediate relaunch). The SGLang inference engines start up and load models (~57 GB each), but the eval dispatcher fails to communicate with them within the 300s timeout.
+
+**Root cause hypothesis**: Stale Ray state or Mooncake metadata server state from the previous run. When `tmux kill-session` terminates the process tree, Ray actors and Mooncake connections may not clean up properly. The new run inherits zombie resources or port conflicts.
+
+**Solution**: Disable eval entirely for DFlash training runs:
+```
+dataset.eval_interval=0
+```
+Eval during training is not critical for DFlash — we benchmark inference performance (τ) separately after training completes using `scripts/benchmark_dflash_inference.py`. The eval cache mechanism was designed for Eagle3's online weight sync (decode mode), which DFlash doesn't use.
+
+**Note**: This issue was also seen in Session 8, Run 1, where the eval data path didn't exist. The eval cache step is fragile and should be skipped unless specifically needed.
+
+#### Attempt 7-9 — Config errors and eval timeout
+
+| Attempt | Error | Fix |
+|---------|-------|-----|
+| 7 | Disk quota (restarted before rotation fix) | Added `save_interval=0, save_per_epoch=false` |
+| 8 | Disk quota fix applied, but `save_interval=5000` | Changed to `save_interval=1000` |
+| 9 | `ConfigKeyError: compile_backend not in TrainingConfig` | Removed invalid config key (inductor is automatic via FlexAttention) |
+| 10 | Eval cache timeout (0/64 samples dispatched in 300s) | Added `dataset.eval_interval=0` |
+
+**Lesson**: `compile_backend` is NOT a TorchSpec config option. The inductor backend is used automatically by FlexAttention's internal `torch.compile(flex_attention)` call in `torchspec/models/ops/flex_attention.py`. No user configuration needed.
+
+#### Attempt 11 — RUNNING (current)
+
+**Config** (final, all issues resolved):
+```yaml
+micro_batch_size: 1
+draft_accumulation_steps: 4
+num_epochs: 6
+max_seq_length: 4096
+learning_rate: 6e-4
+warmup_ratio: 0.04
+max_grad_norm: 1.0
+save_per_epoch: true
+save_interval: 1000
+max_checkpoints: 1
+eval_interval: 0              # Disabled — benchmark τ post-training
+dflash_block_size: 16
+dflash_num_anchors: 512
+dflash_loss_decay_gamma: 7.0
+PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+```
+
+**Dataset**: `/workspace/data/perfectblend_50k.jsonl` (47,480 samples)
+**Log**: `/tmp/phase_c11.log`
+**ETA**: ~5.5 hours
+
 ### Commits
 
 | Hash | Description |
 |------|-------------|
 | `398138a` | Fix collator crash when loss_mask length differs from input_ids |
 | `fee3156` | Switch FlexAttention from aot_eager to inductor backend for 3x speedup |
+| `c7c6605` | Add checkpoint rotation to prevent disk quota exceeded during training |
 
 ---
 
-*Implementation Log v11 — 2026-03-20*
+*Implementation Log v12 — 2026-03-20*
