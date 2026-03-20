@@ -666,7 +666,7 @@ class VllmWorkerExtension:
                 )
 
                 # Store to Mooncake
-                tensor_shapes = self._mooncake_store.put(
+                store_meta = self._mooncake_store.put(
                     key=mooncake_key,
                     hidden_states=hidden_states,
                     input_ids=input_ids,
@@ -676,15 +676,11 @@ class VllmWorkerExtension:
 
                 logger.debug(f"Successfully stored to Mooncake: key={mooncake_key}")
 
-                # Convert dtype to string for RPC serialization
-                # Include input_ids as a list for reconstruction (avoids Mooncake storage issues)
                 result[req_id] = {
                     "mooncake_key": mooncake_key,
-                    "tensor_shapes": tensor_shapes,
+                    "tensor_shapes": store_meta["shapes"],
                     "tensor_dtypes": {
-                        "hidden_states": str(hidden_states.dtype).replace("torch.", ""),
-                        "input_ids": str(input_ids.dtype).replace("torch.", ""),
-                        "last_hidden_states": str(last_hidden_states.dtype).replace("torch.", ""),
+                        k: str(v).replace("torch.", "") for k, v in store_meta["dtypes"].items()
                     },
                     "num_layers": len(layer_tensors),
                     "packed_loss_mask": self._packed_loss_mask_map.get(req_id),
