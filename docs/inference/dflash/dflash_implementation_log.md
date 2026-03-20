@@ -1137,55 +1137,94 @@ if n > N:
 
 **Solution**: `rm -rf /root/.cache/huggingface && ln -s /workspace/.cache/huggingface /root/.cache/huggingface` + `export HF_HOME=/workspace/.cache/huggingface`
 
-### Performance Analysis: Why 15 Hours?
+### Performance Analysis: `aot_eager` vs `inductor` Compile Backend
 
-Current rate: ~1.5s/step × 35,610 steps = ~14.8 hours
+#### How `torch.compile` works
 
-**Bottleneck identified: `aot_eager` compile backend**
+`torch.compile(fn)` has two phases:
+1. **Frontend (TorchDynamo)** — Traces Python code into an FX graph (a DAG of PyTorch ops). Same regardless of backend.
+2. **Backend** — Takes the FX graph and decides *how* to execute it. This is where `aot_eager` and `inductor` diverge.
 
-TorchSpec's `flex_attention.py` (line 62-64):
-```python
-self._compiled_flex_attention = torch.compile(
-    flex_attention,
-    backend="aot_eager",  # ← SLOW: eager fallback, no kernel fusion
-)
+#### `aot_eager` (what TorchSpec was using)
+
+```
+Python → FX Graph → AOT Autograd (decompose backward) → Run ops one-by-one on GPU
 ```
 
-SpecForge's `flex_attention.py` (line 36-39):
-```python
-self._compiled_flex_attention = torch.compile(
-    flex_attention,
-    # mode="max-autotune-no-cudagraphs",  # ← Uses DEFAULT inductor backend
-)
+- **AOT** = "Ahead Of Time" — pre-computes the backward graph at compile time (vs lazy `.backward()`)
+- **Eager** = each op dispatched individually to CUDA, exactly like normal PyTorch
+- **No kernel fusion** — `matmul → add → softmax → matmul` = 4 separate CUDA kernels, each writing intermediates to GPU global memory
+- **Pros**: Very safe, correct results guaranteed, no compilation overhead
+- **Cons**: Memory bandwidth bottleneck from materializing every intermediate tensor
+
+#### `inductor` (default backend, what SpecForge uses)
+
+```
+Python → FX Graph → AOT Autograd → Inductor IR → Triton kernels → Run fused kernels on GPU
 ```
 
-**Impact**: `aot_eager` only decomposes autograd but runs ops eagerly (no Triton kernel fusion, no memory planning). The default `inductor` backend generates fused Triton kernels that can be 2-10x faster for attention backward.
+- Same AOT Autograd step (identical backward graph)
+- **Then Inductor takes over**: analyzes the graph, identifies fusible op sequences, generates custom **Triton GPU kernels**
+- **Kernel fusion** = multiple ops compiled into one GPU kernel that runs without writing intermediates to global memory
 
-**Why TorchSpec used `aot_eager`**: Session 5 Issue 10 — the `inductor` backend crashed with `NoValidChoicesError` during kernel autotuning. The workaround was to switch to `aot_eager`. The `max_autotune_gemm_backends = "ATEN,TRITON"` fix was added at the same time but `aot_eager` was kept.
+#### Why fusion matters (concrete example)
 
-**Additional optimization: `dynamic=True`**
+FlexAttention backward involves something like:
+```python
+grad_scores = grad_output @ V.T          # matmul
+grad_scores = grad_scores * scale         # elementwise multiply
+grad_scores = grad_scores - sum_scores    # elementwise subtract
+grad_scores = grad_scores + grad_logsumexp  # elementwise add
+```
 
-Neither TorchSpec nor SpecForge pass `dynamic=True` to `torch.compile`. For variable-length sequences, this causes recompilation for each new shape. The `recompile_limit = 64` workaround allows up to 64 cached specializations before erroring, but recompilation overhead is significant.
+**`aot_eager`** (4 kernel launches):
+```
+Kernel 1: matmul → write 9 GB to GPU memory
+Kernel 2: read 9 GB, multiply → write 9 GB
+Kernel 3: read 9 GB, subtract → write 9 GB
+Kernel 4: read 9 GB, add → write 9 GB
+Total memory traffic: ~72 GB (read + write intermediates)
+```
 
-**Optimization plan** (for next run or mid-training restart if worth it):
-1. Remove `backend="aot_eager"` → use default inductor backend
-2. The `max_autotune_gemm_backends = "ATEN,TRITON"` fix from Issue 10 should prevent the original crash
-3. Consider adding `dynamic=True` if recompilation is still an issue
-4. Estimated speedup: 2-5x on FlexAttention ops → total training time ~5-8 hours
+**`inductor`** (1 fused kernel):
+```
+Kernel 1: matmul → multiply → subtract → add (all in GPU registers/shared memory)
+Total memory traffic: ~18 GB (input + output only, no intermediates)
+```
 
-### Training Speed Comparison (Estimates)
+This explains both the **3x speed** (fewer launches + less bandwidth) and **20 GB less GPU memory** (intermediates live in registers, never materialize in global memory).
 
-| Configuration | Steps/sec | Total Time | Notes |
-|--------------|-----------|-----------|-------|
-| Current (aot_eager, 256 anchors, 2 train GPUs) | ~0.67 | ~15 hours | Running now |
-| With inductor backend (estimated) | ~1.5-3.0 | ~4-7 hours | Fix compile backend |
-| SpecForge (8 GPU, 512 anchors, 4 train GPUs) | ~5-10 | ~1-2 hours | More parallelism |
+#### Why TorchSpec originally used `aot_eager`
 
-### Current Status
+Session 5, Issue 10: inductor crashed with `NoValidChoicesError` because the kernel autotuner had no GEMM backends. Quick fix was `backend="aot_eager"`. The real fix (`max_autotune_gemm_backends = "ATEN,TRITON"` at import time in `flex_attention.py`) was added simultaneously but never re-tested with inductor — `aot_eager` was kept as the safe fallback.
 
-- **Training**: Running stable at ~1.5s/step, loss decreasing (12.5 → 7.0 in 71 steps)
-- **ETA**: ~15 hours from 2026-03-20 00:37 UTC → completion ~2026-03-20 15:30 UTC
-- **Log file**: `/tmp/phase_c5.log`
+#### Measured Results After Switching to Inductor
+
+Restarted training at step 0 with inductor backend (commit `fee3156`).
+
+| Metric | `aot_eager` (old) | `inductor` (new) | Improvement |
+|--------|-------------------|------------------|-------------|
+| Speed | 0.67 step/s (1.5s/step) | **2.0 step/s (0.5s/step)** | **3x faster** |
+| ETA | ~15 hours | **~5 hours** | Saves 10 hours |
+| Throughput | 5.5 samples/s | **17 samples/s** | 3x |
+| GPU memory (training) | 48-52 GB | **31-34 GB** | **20 GB less** |
+| GPU memory (inference) | 58 GB | 58 GB | Same |
+
+#### Inductor Backend Risks
+
+| Risk | Severity | Status |
+|------|----------|--------|
+| **`NoValidChoicesError`** — inductor autotuner crash (Issue 10) | High | **Resolved** — `ATEN,TRITON` fix works |
+| **First-step compilation** — Triton kernel generation adds ~30-60s to step 1 | Low | Expected, one-time cost |
+| **Numerical differences** — fused kernels may differ in float reduction order | Negligible | bf16 training is already noisy |
+| **Shape recompilation** — variable seq lengths trigger recompilation | Medium | `recompile_limit=64` allows 64 cached shapes; no issues seen at 193 steps |
+| **OOM on rare long sequences** — different memory patterns in fused kernels | Low | Uses *less* memory overall; collator truncation fix provides safety net |
+
+### Current Status (Inductor Run)
+
+- **Training**: Running stable at ~2.0 step/s, loss decreasing
+- **ETA**: ~5 hours from 2026-03-20 01:10 UTC → completion ~2026-03-20 06:00 UTC
+- **Log file**: `/tmp/phase_c6.log`
 - **Tmux session**: `phase_c`
 
 ### Commits
@@ -1193,6 +1232,7 @@ Neither TorchSpec nor SpecForge pass `dynamic=True` to `torch.compile`. For vari
 | Hash | Description |
 |------|-------------|
 | `398138a` | Fix collator crash when loss_mask length differs from input_ids |
+| `fee3156` | Switch FlexAttention from aot_eager to inductor backend for 3x speedup |
 
 ---
 
