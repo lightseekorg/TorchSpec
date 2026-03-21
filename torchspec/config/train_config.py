@@ -117,7 +117,7 @@ class TrainingConfig:
     prefetch_depth: int = 4
     save_interval: int = 5000
     save_per_epoch: bool = False
-    max_checkpoints: int = 0  # 0 = keep all, N > 0 = keep only N most recent checkpoints
+    max_checkpoints: int = 0  # 0 = keep all, N > 0 = rotate and keep only N most recent
     seed: int = 0
     train_backend: str = "fsdp"
     train_env_vars: str = "{}"
@@ -127,7 +127,7 @@ class TrainingConfig:
     ttt_length: int = 7
     warmup_ratio: float = 0.015
 
-    # DFlash-specific parameters
+    # DFlash-specific parameters (ignored for Eagle3 training)
     dflash_block_size: int = 16
     dflash_loss_decay_gamma: float = 7.0
     dflash_num_anchors: int = 512

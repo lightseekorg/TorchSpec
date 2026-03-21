@@ -99,7 +99,7 @@ def preprocess_conversations(
     add_generation_prompt: bool = False,
     return_formatted_text: bool = False,
     last_turn_loss_only: bool = False,
-    min_loss_tokens: int = 0,
+    min_loss_tokens: int = 0,  # DFlash: skip sequences with too few supervised tokens for anchor sampling
     **kwargs,
 ) -> Dict[str, List]:
     """
@@ -162,6 +162,9 @@ def preprocess_conversations(
             last_turn_only=last_turn_loss_only,
         )
 
+        # Skip sequences with insufficient supervised tokens. For DFlash, anchor
+        # sampling needs enough valid positions; sequences with near-zero loss_mask
+        # produce zero gradients and waste training compute.
         if loss_mask.sum() < max(1, min_loss_tokens):
             continue
 

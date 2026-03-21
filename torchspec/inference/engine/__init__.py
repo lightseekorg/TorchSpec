@@ -28,6 +28,8 @@ __all__ = [
     "HFRunner",
 ]
 
+# Lazy imports: SGLang/vLLM are optional — HF-only training (e.g. single-GPU
+# DFlash) should not require these heavy dependencies to be installed.
 try:
     from torchspec.inference.engine.sgl_engine import SglEngine
 

@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 
 from torchspec.models.dflash import DFlashModel
-from torchspec.models.draft.dflash import DFlashDraftModel, build_target_layer_ids
+from torchspec.models.draft.dflash import DFlashDraftModel
 from torchspec.training import checkpoint
 from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
 from torchspec.training.optimizer import BF16Optimizer
@@ -242,56 +242,12 @@ class DFlashTrainer(Trainer):
         return loss
 
     # ------------------------------------------------------------------
-    # Eval
+    # Eval — disabled for DFlash (eval hangs in colocate/SGLang mode;
+    # benchmark τ separately after training via scripts/benchmark_dflash_inference.py)
     # ------------------------------------------------------------------
 
-    def eval_forward(self, batch: dict) -> dict:
-        with torch.no_grad():
-            loss, accuracy = self._forward(batch)
-        return {
-            "loss": loss.detach(),
-            "accuracy": accuracy.detach(),
-        }
-
     def eval_from_cache(self) -> dict:
-        if not getattr(self, "_eval_cache", None):
-            return {}
-
-        eval_mbs = getattr(self.args, "eval_micro_batch_size", None) or self.args.micro_batch_size
-
-        self.model.eval()
-        all_metrics: list[dict] = []
-        for i in range(0, len(self._eval_cache), eval_mbs):
-            chunk = self._eval_cache[i : i + eval_mbs]
-            batch = self._eval_collator(chunk)
-            gpu_batch = {
-                k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()
-            }
-            all_metrics.append(self.eval_forward(gpu_batch))
-
-        self.model.train()
-
-        return self._aggregate_eval_metrics(all_metrics)
-
-    def _aggregate_eval_metrics(self, all_step_metrics: list[dict]) -> dict:
-        if not all_step_metrics:
-            return {}
-
-        avg_loss = torch.stack([m["loss"] for m in all_step_metrics]).mean()
-        avg_acc = torch.stack([m["accuracy"] for m in all_step_metrics]).mean()
-
-        dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-        dist.all_reduce(avg_acc, op=dist.ReduceOp.AVG)
-
-        metrics = {
-            "eval/avg_loss": avg_loss.item(),
-            "eval/avg_acc": avg_acc.item(),
-        }
-
-        if dist.get_rank() == 0:
-            logger.info(f"eval: loss={avg_loss.item():.4f}, acc={avg_acc.item():.4f}")
-
-        return metrics
+        return {}
 
     # ------------------------------------------------------------------
     # Subclass contract implementations

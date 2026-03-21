@@ -28,11 +28,16 @@ from torch.nn.attention.flex_attention import (
 )
 from transformers.utils import is_torchdynamo_compiling
 
+# DFlash's block-causal mask generates different mask_mod closures per step
+# (varying anchor positions), causing frequent recompilation. Raise the limit
+# to avoid constant re-tracing.
 try:
     dynamo.config.recompile_limit = 64
 except AttributeError:
     dynamo.config.cache_size_limit = 64
 
+# Without ATEN fallback, inductor's GEMM autotuner can fail with
+# NoValidChoicesError during FlexAttention backward (Issue 10).
 if "ATEN" not in getattr(inductor_config, "max_autotune_gemm_backends", ""):
     inductor_config.max_autotune_gemm_backends = "ATEN,TRITON"
 

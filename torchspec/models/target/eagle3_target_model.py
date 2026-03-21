@@ -92,9 +92,10 @@ class Eagle3TargetModel(ABC):
     def set_aux_hidden_states_layers(
         self, aux_hidden_states_layers: Optional[List[int]] = None
     ) -> None:
-        """
-        Set the layers to capture the aux hidden states from the target model outputs.
-        Supports any number of layers (Eagle3 uses 3, DFlash uses 5).
+        """Set the layers to capture aux hidden states from the target model.
+
+        Generalized to support any number of layers: Eagle3 uses 3, DFlash uses 5.
+        When called with None, defaults to 3 Eagle3-style layers for backward compat.
         """
         if aux_hidden_states_layers is None:
             if hasattr(self.model.config, "num_hidden_layers"):

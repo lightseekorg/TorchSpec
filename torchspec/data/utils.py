@@ -52,6 +52,8 @@ class DataCollatorWithPadding:
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
+        # Truncate if longer than target (can happen when loss_mask/hidden_states
+        # length differs from input_ids after unpacking).
         if n > N:
             return intensors[:, :N, :]
         if n == N:
@@ -62,8 +64,9 @@ class DataCollatorWithPadding:
 
     def paddingtensor2D(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n = intensors.shape
+        # Truncate if longer than target (prevents negative padding dimension
+        # when loss_mask length differs from input_ids after collation).
         if n > N:
-            # Truncate if tensor is longer than target length
             return intensors[:, :N]
         if n == N:
             return intensors

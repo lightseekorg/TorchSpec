@@ -69,6 +69,7 @@ class TrainerActor(RayActor):
         if draft_model_config is None and getattr(args, "draft_model_config", None):
             draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
+        # Config-based trainer dispatch: DFlashConfig → DFlashTrainer, else Eagle3
         if isinstance(draft_model_config, DFlashConfig):
             from torchspec.training.dflash_trainer import DFlashTrainer
 
