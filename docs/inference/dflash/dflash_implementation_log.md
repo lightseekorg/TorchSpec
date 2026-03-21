@@ -723,14 +723,96 @@ The speed regression is at the **PyTorch 2.9.1 runtime level**, not code-level. 
 
 ---
 
+## Session 12: Inference Benchmark & SpecForge Comparison (2026-03-21)
+
+### Benchmark Results — Step 18,001
+
+Extracted checkpoint from FSDP shards to `/workspace/dflash_step18001.pt` (59 keys).
+
+| Metric | Value |
+|--------|-------|
+| Acceptance length (τ) | **1.86** |
+| Wall-clock speedup | **1.27x** |
+| Target | τ ≥ 3.0 |
+
+For comparison, Eagle3 achieves τ = 2.4–3.2 on similar models (Qwen3-8B).
+
+**Conclusion**: τ = 1.86 is significantly below target. Investigation into code-level bugs follows.
+
+### SpecForge DFlash Comparison
+
+Compared TorchSpec `torchspec/models/dflash.py` against SpecForge `specforge/core/dflash.py` at HEAD, and reviewed three relevant SpecForge commits:
+
+| Commit | Description |
+|--------|-------------|
+| `3cebdf5` | fix mask (#453) — Changed `H=num_heads` → `H=None` in `create_block_mask` (was creating per-head masks unnecessarily) |
+| `ffc4ab7` | Feat/dflash training improvements (#463) — Added random anchor sampling, exponential loss decay, per-sample block isolation |
+| `507da3e` | fix: resolve extremely low acceptance rate (#473) — **Critical fix**: aligned training labels with inference, fixed context mask |
+
+### Key Fixes in SpecForge `507da3e` (Already Ported)
+
+These fixes from the critical acceptance-rate commit are **already present** in TorchSpec:
+
+1. **Label alignment**: `label_offsets = [0, ..., block_size-1]` (same-position prediction, matching inference). The old code used `[1, ..., block_size]` (shifted), causing a train/inference mismatch.
+2. **Context mask**: `kv_idx < anchor_pos` (strict less-than). Old code used `kv_idx <= anchor_pos`, but during inference `target_hidden[anchor_pos]` is NOT available as context — only the anchor's token embedding via `noise_embedding`.
+3. **Exclude anchor from loss**: `pos_in_block > 0` — anchor token (position 0 in block) is already known input, not a prediction.
+4. **Loss decay shift**: `exp(-(k-1)/γ)` so k=1 gets weight 1.0 (was `exp(-k/γ)`).
+5. **Loss mask at label positions**: `original_loss_mask_gathered` checks `loss_mask` at each label position, not just the anchor.
+
+### Bugs Identified in TorchSpec (NOT in SpecForge)
+
+#### Bug 1: Zero-loss dummy on empty anchors (`dflash.py:128-134`)
+
+**TorchSpec** (current):
+```python
+if max_n <= 0:
+    anchors = torch.zeros(bsz, 1, dtype=torch.long, device=device)
+    keep_mask = torch.zeros(bsz, 1, dtype=torch.bool, device=device)
+    return anchors, keep_mask
+```
+Returns dummy tensors with `keep_mask=False` everywhere → zero loss, zero gradients. Training steps are wasted silently.
+
+**SpecForge** (fixed):
+```python
+if max_n <= 0:
+    raise ValueError("should preprocess the data.")
+```
+Raises an error, forcing data preprocessing to ensure valid anchors exist.
+
+**Impact**: If any batch has no valid anchor positions (e.g., very short sequences or mostly-masked data), TorchSpec silently produces zero gradients. This wastes training compute and dilutes gradient signal.
+
+#### Bug 2: Anchor filtering by anchor position's mask (`dflash.py:126`)
+
+```python
+valid = loss_mask[:, : max_anchor + 1] > 0.5
+```
+
+This filters candidate anchors by whether the **anchor token itself** has `loss_mask=1`. But the labels predicted by the block are at positions `anchor+1` through `anchor+block_size-1`. This means:
+
+- An anchor at a prompt position (loss_mask=0) is excluded, even though its block's labels at completion positions (loss_mask=1) would be valid training signal.
+- The first supervised token after a masked→unmasked boundary is never trainable as a block's position-1 prediction.
+
+**Note**: This same pattern exists in SpecForge's current code (`specforge/core/dflash.py:102`). Both implementations have this limitation. However, the downstream `original_loss_mask_gathered` multiplication (line 301-306 in TorchSpec) correctly zeros out any labels that fall in masked regions, so the bug's impact is limited to **reduced anchor diversity** near prompt→completion boundaries, not incorrect gradients.
+
+### Action Items
+
+1. **Fix Bug 1**: Replace zero-loss dummy with `raise ValueError` or a proper fallback (e.g., uniform stride anchors on valid positions).
+2. **Investigate Bug 2**: Benchmark whether allowing anchors at prompt positions (where labels are in completion region) improves τ.
+3. **Retrain**: Apply fixes and retrain from scratch or resume, then re-benchmark τ.
+4. **Port any remaining SpecForge improvements**: Check for additional commits after `507da3e`.
+
+---
+
 ## Pending Work
 
 1. ~~**Resume Phase C training**~~: ✅ Resumed from step 17,001 (2026-03-21)
-2. **Inference benchmark**: Extract converged checkpoint, target τ ≥ 3.0
-3. **Draft KV cache**: Add KV cache support to `DFlashDraftModel.forward()` (currently recomputes full context each cycle — O(n²) scaling)
-4. **Eagle3 inference comparison**: Side-by-side benchmark
-5. **Commit factory.py timeout fix**: Increase `find_free_port` timeout from 30s to 120s for PyTorch 2.9+ compatibility
-6. **Update resume guide**: Reflect PyTorch 2.9.1 changes (env var rename, skip standalone flashinfer, factory.py patch)
+2. ~~**Inference benchmark**~~: ✅ τ = 1.86 at step 18,001 (below target 3.0)
+3. **Fix anchor sampling bugs**: Bug 1 (zero-loss dummy) and Bug 2 (anchor mask filtering)
+4. **Retrain with fixes**: Target τ ≥ 3.0
+5. **Draft KV cache**: Add KV cache support to `DFlashDraftModel.forward()` (currently recomputes full context each cycle — O(n²) scaling)
+6. **Eagle3 inference comparison**: Side-by-side benchmark
+7. **Commit factory.py timeout fix**: Increase `find_free_port` timeout from 30s to 120s for PyTorch 2.9+ compatibility
+8. **Update resume guide**: Reflect PyTorch 2.9.1 changes (env var rename, skip standalone flashinfer, factory.py patch)
 
 ---
 
@@ -747,4 +829,4 @@ The speed regression is at the **PyTorch 2.9.1 runtime level**, not code-level. 
 
 ---
 
-*Implementation Log v17 — 2026-03-21*
+*Implementation Log v18 — 2026-03-21*
