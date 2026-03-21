@@ -90,7 +90,6 @@ class DFlashRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    @torch.compile(dynamic=True)
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -249,22 +248,22 @@ class DFlashAttention(nn.Module):
         sin_k = sin.squeeze(1).squeeze(0)[full_position_ids].unsqueeze(1)
         k = (k * cos_k) + (_rotate_half(k) * sin_k)
 
-        # GQA expansion
-        k = _repeat_kv(k, self.num_kv_groups)
-        v = _repeat_kv(v, self.num_kv_groups)
-
         if block_mask is not None:
             from torchspec.models.ops.flex_attention import compile_friendly_flex_attention
 
+            # Use enable_gqa=True to let FlexAttention handle GQA internally
+            # instead of materializing expanded KV via _repeat_kv
             attn_output = compile_friendly_flex_attention(
                 query=q,
                 key=k,
                 value=v,
                 block_mask=block_mask,
-                enable_gqa=False,
+                enable_gqa=True,
             )
         else:
-            # Fallback: bidirectional attention (no mask)
+            # Fallback: bidirectional attention (no mask) — expand KV for SDPA
+            k = _repeat_kv(k, self.num_kv_groups)
+            v = _repeat_kv(v, self.num_kv_groups)
             attn_output = F.scaled_dot_product_attention(
                 q, k, v, is_causal=False, dropout_p=0.0
             )

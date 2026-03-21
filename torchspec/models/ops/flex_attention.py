@@ -87,26 +87,6 @@ def compile_friendly_flex_attention(
     )
 
 
-class WrappedCreateBlockMask:
-    _instance = None
-    _is_create_block_mask_compiled = False
-    _compiled_create_block_mask = None
-
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    @torch.compiler.disable(recursive=False)
-    def __init__(self):
-        if not self._is_create_block_mask_compiled:
-            self._compiled_create_block_mask = torch.compile(create_block_mask)
-            self._is_create_block_mask_compiled = True
-
-    def __call__(self):
-        return self._compiled_create_block_mask
-
-
 def compile_friendly_create_block_mask(
     mask_mod,
     B,
@@ -115,10 +95,12 @@ def compile_friendly_create_block_mask(
     KV_LEN,
     device,
 ):
-    create_block_mask_compiled = (
-        WrappedCreateBlockMask()() if not is_torchdynamo_compiling() else create_block_mask
-    )
-    return create_block_mask_compiled(
+    """Create block mask directly (no compilation wrapper).
+
+    Matches SpecForge behavior — create_block_mask is fast enough without
+    torch.compile, and compiling it adds overhead with torch 2.9.1.
+    """
+    return create_block_mask(
         mask_mod,
         B,
         H,
