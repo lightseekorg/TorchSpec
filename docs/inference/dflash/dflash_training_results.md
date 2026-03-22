@@ -382,6 +382,19 @@ Adding a second inference engine caused **-62% speed regression** (2.9→1.1 ste
 
 **Lesson**: Do not add inference GPUs beyond 1 for this workload. The pipeline is training-bound, not inference-bound.
 
+### Hardware Topology & Mooncake Bottleneck Analysis
+
+**Hardware**: 4x H100 80GB on single node with full-mesh **NV18 NVLink** (478 GB/s per GPU). Intel Xeon Platinum 8468, 1.5 TiB RAM, single NUMA node. No InfiniBand.
+
+**The problem**: Mooncake only supports TCP or RDMA. On this pod, TCP is the only option — data goes `GPU → CPU RAM → TCP loopback → CPU RAM → GPU`, taking ~145ms for ~40MB of hidden states. The NVLink interconnect (478 GB/s, <0.1ms for same transfer) is **completely unused** by Mooncake.
+
+| Transport | Time for 40MB | Available? |
+|-----------|---------------|------------|
+| NVLink p2p | <0.1 ms | Hardware yes, Mooncake no |
+| Mooncake TCP | **~145 ms** | **Currently used** |
+
+This TCP overhead is 40-60% of step time and the single biggest bottleneck. Implementing a same-node NVLink/NCCL bypass for Mooncake would reduce data_time from ~145ms to <1ms, potentially enabling 4+ step/s.
+
 ---
 
 ## Commits

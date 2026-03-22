@@ -242,8 +242,19 @@ Setting `mooncake.enable_gpu_direct=True` causes `torch.AcceleratorError: CUDA e
 
 **Status**: **Expected on RunPod**. GPU Direct only works on RDMA-capable clusters.
 
-### Issue 29: No same-node Mooncake bypass
+### Issue 29: No same-node Mooncake bypass — **Critical Bottleneck**
 
-`EagleMooncakeStore` always uses Mooncake TCP protocol (200ms overhead) even when inference and training are on the same node. No config option to use NCCL p2p or shared memory.
+`EagleMooncakeStore` always uses Mooncake TCP protocol even when inference and training are on the same node. No config option to use NVLink, NCCL p2p, or shared memory.
 
-**Status**: **Needs code changes**. Would require new transfer backend in `data_fetcher.py` and `eagle_store.py`. Colocate mode is the only workaround (but OOMs with 8B target).
+**Hardware context**: Pod has 4x H100 with full-mesh **NV18 NVLink** (478 GB/s per GPU). Mooncake uses TCP over loopback (~0.3 GB/s effective), wasting **1500x available bandwidth**. Transfer of ~40MB hidden states takes ~145ms via TCP vs <0.1ms via NVLink.
+
+**Impact**: data_time is 40-60% of step time across all configs. This is the **single biggest performance bottleneck**.
+
+| Transport | Bandwidth | 40MB latency | Supported by Mooncake? |
+|-----------|-----------|-------------|----------------------|
+| NV18 NVLink | 478 GB/s | <0.1 ms | No |
+| NCCL (NVLink) | ~450 GB/s | <0.1 ms | No |
+| Mooncake TCP | ~0.3 GB/s | **~145 ms** | **Yes (only option)** |
+| Mooncake RDMA | 25-100 GB/s | ~1-5 ms | No (no IB on RunPod) |
+
+**Status**: **Needs code changes**. Would require new `local` transport backend in `data_fetcher.py` and `eagle_store.py` using `torch.distributed.send/recv` (NCCL) or CUDA IPC. Colocate mode is the only workaround (but OOMs with 8B target).

@@ -36,6 +36,7 @@
 
 - [ ] **Commit factory.py timeout fix**: Increase `find_free_port` timeout from 30s to 120s for PyTorch 2.9+ compatibility (currently local pod patch only).
 - [ ] **Draft KV cache**: Add KV cache support to `DFlashDraftModel.forward()` (currently recomputes full context each cycle — O(n²) scaling).
+- [ ] **Mooncake NVLink bypass** (P0): Implement NCCL/CUDA-IPC transport for same-node GPU-to-GPU transfers. Current TCP loopback wastes 1500x available NVLink bandwidth (145ms vs <0.1ms). Would push training from ~2.9 to ~4+ step/s.
 
 ## Future
 

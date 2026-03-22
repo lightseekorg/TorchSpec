@@ -386,9 +386,53 @@ Tested FULL_SHARD (parameter sharding) vs REPLICATE (DDP-like gradient allreduce
 | Test 4: 2T+2I | 2 | 2 | FULL_SHARD | **1.1** | 0.850s | 22 | 400 | 37,500 | **9.5 hr** | — |
 
 **Recommendation**:
-- **Best config**: Test 1 (FULL_SHARD, 2 train + 1 infer) — 2.9 step/s, best per-step throughput, simplest setup
+- **Best per-step throughput**: Test 1 (FULL_SHARD, 2 train + 1 infer) — 2.9 step/s, simplest setup
 - **Fastest wall-clock**: Test 3 (FULL_SHARD + 3 train + 1 infer) — ~3.0 hr total, uses more GPU-hours
 - **Avoid**: 2+ inference GPUs — creates Mooncake/PCIe contention, strictly worse
+
+#### 2.5.11 Hardware Topology Analysis
+
+**GPU Interconnect**: All 4x H100 80GB are on the **same node** with full-mesh **NV18 NVLink** (18 links × 26.562 GB/s = **478 GB/s per GPU bidirectional**). Single NUMA node, Intel Xeon Platinum 8468, 1.5 TiB RAM.
+
+```
+nvidia-smi topo -m (GPU-GPU only):
+        GPU0    GPU1    GPU2    GPU3
+GPU0     X      NV18    NV18    NV18
+GPU1    NV18     X      NV18    NV18
+GPU2    NV18    NV18     X      NV18
+GPU3    NV18    NV18    NV18     X
+```
+
+**No InfiniBand**: `ibstat` not available. 8x mlx5 NICs visible in topology but not exposed as RDMA interfaces. `mooncake.protocol="rdma"` and `enable_gpu_direct=True` both fail (Issue 28).
+
+**The Mooncake overhead problem**:
+
+Mooncake transfer engine only supports two protocols: **TCP** and **RDMA**. On this pod:
+- **TCP**: Data path is `GPU → cudaMemcpy → CPU RAM → TCP loopback → CPU RAM → cudaMemcpy → GPU`. ~145ms per transfer for ~40MB hidden states.
+- **RDMA**: Requires InfiniBand/RoCE hardware — not available on this RunPod.
+- **No NVLink/NCCL transport**: Mooncake has no option to use NVLink p2p, NCCL, or CUDA IPC for same-node GPU-to-GPU transfers.
+
+**What the hardware can do vs what Mooncake uses**:
+
+| Transport | Bandwidth | Latency for 40MB | Used? |
+|-----------|-----------|-------------------|-------|
+| NVLink p2p (NV18) | **478 GB/s** | **<0.1 ms** | No — Mooncake doesn't support it |
+| NCCL (NVLink backend) | ~450 GB/s | **<0.1 ms** | No — Mooncake doesn't support it |
+| CUDA IPC / shared memory | ~400 GB/s | **<0.1 ms** | No — Mooncake doesn't support it |
+| **Mooncake TCP (loopback)** | **~0.3 GB/s** | **~145 ms** | **Yes — only option** |
+| Mooncake RDMA | 25-100 GB/s | ~1-5 ms | No — no IB hardware |
+
+**Impact**: Mooncake TCP adds **145-240ms per step** (~40-60% of step time) on hardware that could do the same transfer in <0.1ms. This is the single biggest performance bottleneck, wasting **1500x available bandwidth**.
+
+**Why more training GPUs don't help proportionally**: Adding training GPUs increases the number of Mooncake TCP consumers sharing the same loopback network. Each additional GPU adds ~80ms to data_time because TCP transfers are serialized through the CPU.
+
+**Why 2 inference GPUs made things worse**: 2 inference engines double the Mooncake TCP traffic to each training GPU (receiving from 2 engines), saturating the loopback path in both directions simultaneously.
+
+**Solution — same-node NVLink bypass**: Replace Mooncake TCP with NCCL p2p or `torch.distributed.send/recv` for same-node transfers. This would:
+1. Reduce data_time from ~145ms to <1ms
+2. Enable all 4 GPUs to communicate at NVLink speed
+3. Allow 3T+1I config to achieve ~4+ step/s (currently limited by data pipeline)
+4. Requires code changes to `data_fetcher.py` and `eagle_store.py` — add a `local` transport backend that uses NCCL or CUDA IPC when all GPUs are on the same node.
 
 ---
 
