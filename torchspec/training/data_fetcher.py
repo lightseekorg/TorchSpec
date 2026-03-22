@@ -66,6 +66,7 @@ class MooncakeDataset(IterableDataset):
         dynamic_loss_mask: bool = False,
         last_turn_loss_only: bool = False,
         skip_after_header: int = 0,
+        batch_size: int = 1,
     ):
         self.ray_queue = ray_queue
         self.mooncake_store = mooncake_store
@@ -77,6 +78,7 @@ class MooncakeDataset(IterableDataset):
         self.dynamic_loss_mask = dynamic_loss_mask
         self.last_turn_loss_only = last_turn_loss_only
         self.skip_after_header = skip_after_header
+        self._batch_size = batch_size
 
     def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
         """Load tensors from mooncake key into device memory."""
@@ -105,11 +107,17 @@ class MooncakeDataset(IterableDataset):
             device=self.device,
         )
 
-        # Clone tensors before cleanup: to_tensor_dict() returns views into
-        # Mooncake buffers. With batch_size>1, the collator holds sample N
-        # while waiting for sample N+1. If we free the buffer now, the buffer
-        # may be reused by new data, corrupting the held tensors.
-        result = {k: v.clone() for k, v in tensors.to_tensor_dict().items()}
+        tensor_dict = tensors.to_tensor_dict()
+        if self._batch_size > 1:
+            # Clone to prevent use-after-free: collator holds sample N while
+            # fetching N+1, but cleanup frees the Mooncake buffer (Issue 31).
+            # Note: clone() converts pinned → unpinned, breaking non_blocking
+            # H2D transfers. Only do this when actually needed.
+            result = {k: v.clone() for k, v in tensor_dict.items()}
+        else:
+            # batch_size=1: safe to use pinned views — consumed immediately.
+            # Preserves pinned memory for async H2D via non_blocking=True.
+            result = dict(tensor_dict)
 
         self._cleanup_mooncake_data(sample)
         if sample.packed_loss_mask is not None:
@@ -250,6 +258,7 @@ def create_mooncake_dataloader(
         dynamic_loss_mask=dynamic_loss_mask,
         last_turn_loss_only=last_turn_loss_only,
         skip_after_header=skip_after_header,
+        batch_size=batch_size,
     )
 
     return DataLoader(

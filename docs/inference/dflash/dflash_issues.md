@@ -300,4 +300,25 @@ result = {k: v.clone() for k, v in tensors.to_tensor_dict().items()}
 self._cleanup_mooncake_data(sample)
 ```
 
+**Status**: **RESOLVED** (2026-03-22). See Issue 32 for performance regression caused by this fix.
+
+### Issue 32: clone() breaks pinned memory async transfers — **5x speed regression**
+
+The `.clone()` fix for Issue 31 inadvertently breaks the async CPU→GPU transfer path for ALL batch sizes, causing a 5x speed regression (1 step/s vs 5.3 step/s).
+
+**Root cause**: Mooncake host buffers are allocated with `pin_memory=True`. `torch.frombuffer()` creates views preserving pinned status. `.clone()` creates **unpinned** tensors. With unpinned memory, `tensor.to(device, non_blocking=True)` is **silently ignored** — PyTorch falls back to blocking synchronous transfer (~300ms+ per batch for 80MB hidden states).
+
+**Symptoms** (Phase 3, step 100+):
+- `data_time=300-1100ms` (vs Phase F's 1-9ms)
+- `step_time=1.0-1.5s` (vs Phase F's 0.19s)
+- Prefetch queue drains because blocking H2D stalls the main thread
+
+**Solution**: Make clone conditional on batch_size — only needed for batch>1 (Issue 31). With batch=1, use pinned views directly:
+```python
+if self._batch_size > 1:
+    result = {k: v.clone() for k, v in tensor_dict.items()}
+else:
+    result = dict(tensor_dict)  # preserves pinned memory
+```
+
 **Status**: **RESOLVED** (2026-03-22).
