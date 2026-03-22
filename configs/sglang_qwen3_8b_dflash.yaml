@@ -31,12 +31,12 @@ dataset:
 
 training:
   attention_backend: flex_attention
-  micro_batch_size: 1
-  draft_accumulation_steps: 1
+  micro_batch_size: 2
+  draft_accumulation_steps: 2
   learning_rate: 6e-4
   max_concurrent_batches: 1
   max_grad_norm: 1.0
-  max_seq_length: 4096
+  max_seq_length: 2048
   num_epochs: 2
   seed: 42
   training_num_gpus_per_node: 3   # 3 GPUs for training (was 2)
