@@ -205,6 +205,20 @@ class DFlashModel(nn.Module):
             torch.tensor(self.draft_model.mask_token_id, dtype=torch.long, device=device),
         )
 
+        # Debug: check for out-of-bounds token IDs
+        vocab_size = self.draft_model.embed_tokens.num_embeddings
+        if noise_ids.max() >= vocab_size or noise_ids.min() < 0:
+            bad_mask = (noise_ids >= vocab_size) | (noise_ids < 0)
+            bad_ids = noise_ids[bad_mask]
+            raise ValueError(
+                f"noise_ids out of bounds: min={noise_ids.min().item()}, "
+                f"max={noise_ids.max().item()}, vocab_size={vocab_size}, "
+                f"bad_ids={bad_ids[:10].tolist()}, "
+                f"mask_token_id={self.draft_model.mask_token_id}, "
+                f"input_ids range=[{input_ids.min().item()}, {input_ids.max().item()}], "
+                f"anchor_positions range=[{anchor_positions.min().item()}, {anchor_positions.max().item()}], "
+                f"bsz={bsz}, n={n}, seq_len={seq_len}"
+            )
         return self.draft_model.embed_tokens(noise_ids)
 
     def forward(
