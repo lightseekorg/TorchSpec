@@ -259,6 +259,29 @@ Tested `training.max_concurrent_batches=2`. Result: **same ~2.5 step/s** as base
 
 Inference throughput increased (I=48-52 vs I=30-33 samples/s), but training was not bottlenecked on inference supply — data fetcher always has samples ready.
 
+#### 2.5.4 Compute Speed Optimizations (no_sync + compile + bf16 reduce)
+
+Tested three optimizations to reduce compute time:
+
+| Optimization | Result |
+|-------------|--------|
+| **no_sync() + bf16 reduce** | ~2.7 step/s (**+8%** vs 2.5 baseline) |
+| **Full model torch.compile** | **Worse** — recompilation overhead from dynamic shapes (variable anchor counts, seq lengths). Steps 2-30 at 1-3s/step. |
+
+**no_sync + bf16 reduce detailed comparison (steps 5-50):**
+
+| Metric | Baseline | Optimized | Change |
+|--------|----------|-----------|--------|
+| step_time | 0.370s | 0.353s | -5% |
+| backward | 138ms | 133ms | -4% |
+| forward | 78ms | 81ms | +4% |
+| optimizer | 41ms | 41ms | 0% |
+| data | 162ms | 147ms | -9% |
+
+**Conclusion**: no_sync saves ~5ms/step on backward (skips 1 allreduce per step with accum=2). bf16 reduce gives minor comm savings. Full model compile is not viable due to dynamic tensor shapes in DFlash (anchor sampling, variable-length sequences). Total improvement is modest (+8%) — the pipeline is already well-optimized.
+
+**Updated training time**: 37,500 steps / 2.7 step/s = **~3.9 hours** (was 4.2h).
+
 ---
 
 ## Phase 3: Acceptance Length (τ) Benchmark Matrix
