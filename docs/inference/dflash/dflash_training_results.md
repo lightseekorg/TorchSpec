@@ -326,6 +326,55 @@ Training converged well: loss 12.35→0.12, accuracy 0%→96.2%.
 
 **Full model torch.compile:** Tested but not viable. Step 1 = 111s warmup. Steps 2-50 averaged 1-3s/step due to repeated recompilation from dynamic tensor shapes. Discarded.
 
+### FSDP Strategy & GPU Scaling Tests (2026-03-22)
+
+#### Test 1: FULL_SHARD (2 training GPUs, bf16 reduce)
+
+FULL_SHARD distributes parameters across GPUs, halving optimizer memory and time.
+
+| Metric | REPLICATE (baseline) | FULL_SHARD | Change |
+|--------|---------------------|------------|--------|
+| step/s | 2.5 | **2.9** | **+16%** |
+| optimizer | 41ms | **22ms** | **-46%** |
+| forward | ~82ms | ~100ms | +22% |
+| backward | ~138ms | ~134ms | -3% |
+| 200-step wall time | 244.5s | **220.5s** | **-10%** |
+| Final accuracy | 96.2% | **97.1%** | +0.9% |
+
+#### Test 2: 3 Training GPUs (REPLICATE, bf16 reduce)
+
+3-way DP: slower per-step (higher Mooncake data_time), but 50% more data per step.
+
+| Metric | 2-GPU REPLICATE | 3-GPU REPLICATE |
+|--------|----------------|-----------------|
+| step/s | 2.5 | **2.2** |
+| data_time | 162ms | **240ms** |
+| 200-step wall time | 244.5s | 285.4s |
+| Effective total steps | 37,500 | **25,000** |
+| Est. training time | 4.2 hr | **3.2 hr** |
+
+#### Test 3: FULL_SHARD + 3 Training GPUs (concurrent=3, bf16 reduce)
+
+Combines FULL_SHARD optimizer savings with 3-way DP throughput.
+
+| Metric | Value |
+|--------|-------|
+| step/s | **2.3** |
+| optimizer | **16-22ms** |
+| data_time | ~220ms |
+| 200-step wall time | 255.4s |
+| Est. training time | **~3.0 hr** |
+
+#### Configuration Comparison
+
+| Config | GPUs | FSDP | step/s | opt (ms) | data (ms) | Est. Train Time |
+|--------|------|------|--------|----------|-----------|-----------------|
+| Baseline | 2 | REPLICATE | 2.5 | 41 | 162 | 4.2 hr |
+| + no_sync + bf16 | 2 | REPLICATE | 2.7 | 41 | 147 | 3.9 hr |
+| **Test 1** | 2 | FULL_SHARD | **2.9** | **22** | 145 | **3.6 hr** |
+| Test 2 | 3 | REPLICATE | 2.2 | 41 | 240 | 3.2 hr |
+| **Test 3** | 3 | FULL_SHARD | **2.3** | **16-22** | 220 | **3.0 hr** |
+
 ---
 
 ## Commits
@@ -340,3 +389,4 @@ Training converged well: loss 12.35→0.12, accuracy 0%→96.2%.
 | `c5b71e8` | Optimize DFlash training speed: remove compile overhead and enable GQA |
 | `dcd5f45` | Add compute sub-breakdown profiling instrumentation |
 | `949c744` | Add no_sync, compile_model, bf16 reduce optimizations |
+| `641802f` | Add FSDP strategy config (FULL_SHARD/REPLICATE) |

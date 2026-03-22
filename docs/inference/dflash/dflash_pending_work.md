@@ -21,6 +21,9 @@
 - [x] **max_concurrent_batches=2 test** — no improvement, not bottlenecked on inference
 - [x] **GPU Direct RDMA test** — failed, RunPod lacks RDMA hardware
 - [x] **Speed optimizations** — no_sync + bf16 reduce → 2.7 step/s (+8%). torch.compile not viable.
+- [x] **FULL_SHARD benchmark (Test 1)** — 2.9 step/s, optimizer halved (41→22ms), best per-step throughput
+- [x] **3-GPU scaling benchmark (Test 2)** — 2.2 step/s per-step, but 3.2hr total (50% more data/step)
+- [x] **FULL_SHARD + 3-GPU benchmark (Test 3)** — 2.3 step/s, optimizer 16-22ms, ~3.0hr total
 
 ## Active — Training
 

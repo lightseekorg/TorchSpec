@@ -282,6 +282,75 @@ Tested three optimizations to reduce compute time:
 
 **Updated training time**: 37,500 steps / 2.7 step/s = **~3.9 hours** (was 4.2h).
 
+#### 2.5.5 FSDP Strategy: FULL_SHARD vs REPLICATE
+
+Tested FULL_SHARD (parameter sharding) vs REPLICATE (DDP-like gradient allreduce) with bf16 reduce enabled.
+
+**Test 1 — FULL_SHARD, 2 training GPUs, bf16 reduce (200 steps):**
+
+| Metric | REPLICATE (baseline) | FULL_SHARD | Change |
+|--------|---------------------|------------|--------|
+| step_time | 0.370s | **0.350s** | -5% |
+| step/s | 2.5 | **2.9** | **+16%** |
+| forward | ~82ms | ~100ms | +22% |
+| backward | ~138ms | ~134ms | -3% |
+| optimizer | 41ms | **22ms** | **-46%** |
+| data | 162ms | 145ms | -10% |
+| 200-step wall time | 244.5s | **220.5s** | **-10%** |
+| Final accuracy | 96.2% | **97.1%** | +0.9% |
+| Final loss | 0.12 | **0.101** | -16% |
+
+**Key insight**: FULL_SHARD halves optimizer time (41ms→22ms) because each GPU only updates its local shard. Forward is slightly slower (+22%) due to parameter gather, but the optimizer savings more than compensate.
+
+#### 2.5.6 Scaling: 3 Training GPUs + 1 Inference GPU
+
+**Test 2 — REPLICATE, 3 training GPUs, bf16 reduce (200 steps):**
+
+| Metric | 2-GPU REPLICATE | 3-GPU REPLICATE | Change |
+|--------|----------------|-----------------|--------|
+| step_time | 0.370s | **0.450s** | +22% |
+| step/s | 2.5 | **2.2** | -12% |
+| forward | ~82ms | ~85ms | +4% |
+| backward | ~138ms | ~140ms | +1% |
+| optimizer | 41ms | 41ms | 0% |
+| data | 162ms | **240ms** | **+48%** |
+| 200-step wall time | 244.5s | **285.4s** | +17% |
+| Final accuracy | 96.2% | **96.3%** | 0% |
+| Final loss | 0.12 | **0.126** | +5% |
+
+**Key finding**: 3-GPU is slower per-step due to higher data_time (3-way Mooncake fetch: 240ms vs 160ms for 2-way). However, 3-way DP processes 50% more samples per optimizer step, so **fewer total steps** are needed (37,500 / 1.5 = 25,000 steps). Net training time: 25,000 / 2.2 = **~3.2 hours** vs 37,500 / 2.5 = **~4.2 hours** for 2-GPU.
+
+#### 2.5.7 Combined: FULL_SHARD + 3 Training GPUs
+
+**Test 3 — FULL_SHARD, 3 training GPUs, max_concurrent_batches=3, bf16 reduce (200 steps):**
+
+| Metric | Value | vs Test 1 (FULL_SHARD 2GPU) | vs Test 2 (3GPU REPLICATE) |
+|--------|-------|-----------------------------|----------------------------|
+| step_time | **0.440s** | +26% | -2% |
+| step/s | **2.3** | -21% | +5% |
+| forward | ~115ms | +15% | +35% |
+| backward | ~136ms | +1% | -3% |
+| optimizer | **16-22ms** | -27% | **-61%** |
+| data | ~220ms | +52% | -8% |
+| 200-step wall time | **255.4s** | +16% | **-11%** |
+
+**Key finding**: FULL_SHARD + 3 GPU gives the lowest optimizer time (16-22ms) but data pipeline remains the bottleneck. Effective training time: 25,000 / 2.3 = **~3.0 hours**.
+
+#### 2.5.8 Configuration Comparison Summary
+
+| Config | GPUs | FSDP | step/s | step_time | opt_time | data_time | Eff. Steps | Est. Train Time | Acc |
+|--------|------|------|--------|-----------|----------|-----------|-----------|-----------------|-----|
+| Baseline | 2 train | REPLICATE | 2.5 | 0.370s | 41ms | 162ms | 37,500 | 4.2 hr | 96.2% |
+| + no_sync + bf16 | 2 train | REPLICATE | 2.7 | 0.353s | 41ms | 147ms | 37,500 | 3.9 hr | ~96% |
+| **Test 1: FULL_SHARD** | 2 train | FULL_SHARD | **2.9** | 0.350s | **22ms** | 145ms | 37,500 | **3.6 hr** | **97.1%** |
+| Test 2: 3 GPU | 3 train | REPLICATE | 2.2 | 0.450s | 41ms | 240ms | 25,000 | 3.2 hr | 96.3% |
+| Test 3: FULL_SHARD+3GPU | 3 train | FULL_SHARD | 2.3 | 0.440s | 16-22ms | 220ms | 25,000 | **3.0 hr** | ~96% |
+
+**Recommendation**:
+- **Best per-step throughput**: Test 1 (FULL_SHARD, 2 GPU) — 2.9 step/s, simplest setup
+- **Fastest wall-clock training**: Test 3 (FULL_SHARD + 3 GPU) — ~3.0 hr total, but 3-GPU uses more GPU hours
+- **Best efficiency**: Test 1 — fewest GPU-hours for comparable quality
+
 ---
 
 ## Phase 3: Acceptance Length (τ) Benchmark Matrix
@@ -547,4 +616,4 @@ Report with: `--report-to wandb --wandb-project torchspec-dflash-benchmark`
 
 ---
 
-*Plan v4 — 2026-03-22 (Phase 1 complete, Phase 2.1 resolved)*
+*Plan v5 — 2026-03-22 (Phase 1 complete, Phase 2 complete — FULL_SHARD recommended)*
