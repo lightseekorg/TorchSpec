@@ -312,6 +312,21 @@ def training_loop(
                     if step_time > 0:
                         metrics["perf/train_capacity"] = args.global_batch_size / step_time
 
+                    if completed_steps % 5 == 0 or completed_steps <= 5:
+                        data_t = metrics.get("perf/data_time", 0)
+                        compute_t = metrics.get("perf/compute_time", 0)
+                        fwd_t = metrics.get("perf/forward_time", 0)
+                        bwd_t = metrics.get("perf/backward_time", 0)
+                        opt_t = metrics.get("perf/optimizer_time", 0)
+                        logger.info(
+                            f"TIMING step={completed_steps}: "
+                            f"step={step_time:.3f}s "
+                            f"data={data_t:.3f}s "
+                            f"compute={compute_t:.3f}s "
+                            f"[fwd={fwd_t:.3f}s bwd={bwd_t:.3f}s opt={opt_t:.3f}s] "
+                            f"dispatch={dispatch_wait:.3f}s"
+                        )
+
                 if getattr(wandb, "run", None) is not None:
                     wandb.log(metrics)
 

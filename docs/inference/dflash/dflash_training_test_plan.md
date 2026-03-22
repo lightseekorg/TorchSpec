@@ -165,6 +165,48 @@ This resolves both the speed regression AND the `NoValidChoicesError` in FlexAtt
 | **P1** | FSDP CPU offload to fit batch=4+anchors=512 | May help if compute scales sublinearly | Needs testing |
 | **P2** | Colocate mode if memory allows | 3-5x (eliminates data_time + FSDP overhead) | OOM risk with 8B target + draft on same GPU |
 
+### 2.4 Speed Analysis Summary (for project owner)
+
+**Setup**: 4x H100 80GB, 2 training + 1 inference (SGLang + Mooncake), torch 2.9.1 + sglang 0.5.9. DFlash config: block_size=16, anchors=512, seq_len=2048, batch=2, accum=2.
+
+**Result**: All configurations converge to **~1.0 step/s**. Full training (50K × 6 epochs) = **~10 hours**.
+
+**Instrumented timing breakdown (averaged over steps 10-30):**
+
+| Component | Time (s) | % of Step |
+|-----------|----------|-----------|
+| **GPU compute** (forward+backward+optimizer+FSDP allreduce) | **0.68** | **~70%** |
+| **Data pipeline** (Mooncake KV queue fetch) | **0.40** | **~30%** |
+| **Ray dispatch** | **0.07** | **~7%** |
+| **Total step time** | **~0.95** | — |
+
+Note: data and compute partially overlap (async pipeline), so percentages sum to >100%.
+
+**Key observations:**
+1. **Compute dominates at 70%** — reducing anchors 512→256 doesn't change speed, so FlexAttention is NOT the bottleneck within compute. FSDP allreduce or optimizer step may dominate.
+2. **Data pipeline is 30%** — Mooncake KV transfer ~400ms/step. For same-node setups, NCCL/shared memory should be <10ms.
+3. **1-GPU colocate is 5x faster** (~5 step/s) — eliminates both Mooncake and multi-GPU FSDP overhead.
+4. **batch=4 + anchors=512 OOMs** — backward needs 9.27 GB extra.
+
+**Questions for discussion:**
+1. Why is compute 0.68s for a ~1B draft model? Is FSDP allreduce the dominant cost? Can we use REPLICATE for a model this small?
+2. Is Mooncake needed for single-node? NCCL p2p should be <10ms for this data volume.
+3. Can `fsdp_cpu_offload` or reduced FSDP sharding help fit batch=4+anchors=512?
+
+### 2.5 Speed Optimization Tests (Phase 2 continued)
+
+#### 2.5.1 Compute Sub-Breakdown (P0)
+
+Profile forward vs backward vs optimizer vs FSDP allreduce within the 0.68s compute time. Use `torch.cuda.Event` timing in `dflash_trainer._train_step()`.
+
+#### 2.5.2 Bypass Mooncake for Same-Node (P0)
+
+Test whether disabling Mooncake TCP transport and using direct NCCL or shared memory reduces data_time from 0.4s.
+
+#### 2.5.3 max_concurrent_batches > 1 (P1)
+
+Test `training.max_concurrent_batches=2` to overlap inference and training pipeline stages.
+
 ---
 
 ## Phase 3: Acceptance Length (τ) Benchmark Matrix

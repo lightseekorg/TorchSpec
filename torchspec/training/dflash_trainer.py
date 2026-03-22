@@ -261,13 +261,25 @@ class DFlashTrainer(Trainer):
         batch_idx: int,
         num_batches: int,
     ) -> dict:
+        evt_fwd_s = torch.cuda.Event(enable_timing=True)
+        evt_fwd_e = torch.cuda.Event(enable_timing=True)
+        evt_bwd_s = torch.cuda.Event(enable_timing=True)
+        evt_bwd_e = torch.cuda.Event(enable_timing=True)
+
+        evt_fwd_s.record()
         loss, accuracy = self._forward(batch)
+        evt_fwd_e.record()
+
+        evt_bwd_s.record()
         total_loss = self._backward(loss, accumulation_steps=accumulation_steps)
+        evt_bwd_e.record()
 
         return {
             "loss": loss.detach(),
             "accuracy": accuracy.detach(),
             "total_loss": total_loss.detach(),
+            "_fwd_events": (evt_fwd_s, evt_fwd_e),
+            "_bwd_events": (evt_bwd_s, evt_bwd_e),
         }
 
     def _aggregate_metrics(
@@ -290,6 +302,24 @@ class DFlashTrainer(Trainer):
             "train/lr": self.optimizer.get_learning_rate(),
             "train/step": step,
         }
+
+        # Sub-timing breakdown (forward vs backward)
+        fwd_ms = sum(
+            m["_fwd_events"][0].elapsed_time(m["_fwd_events"][1])
+            for m in all_step_metrics if "_fwd_events" in m
+        )
+        bwd_ms = sum(
+            m["_bwd_events"][0].elapsed_time(m["_bwd_events"][1])
+            for m in all_step_metrics if "_bwd_events" in m
+        )
+        metrics["perf/forward_time"] = fwd_ms / 1000.0
+        metrics["perf/backward_time"] = bwd_ms / 1000.0
+
+        if dist.get_rank() == 0 and (step % 5 == 0 or step <= 5):
+            logger.info(
+                f"COMPUTE_BREAKDOWN step={step}: "
+                f"forward={fwd_ms:.1f}ms backward={bwd_ms:.1f}ms"
+            )
 
         if dist.get_rank() == 0:
             logger.debug(f"step {step}: {metrics}")

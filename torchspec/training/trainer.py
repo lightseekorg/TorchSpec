@@ -318,7 +318,12 @@ class Trainer(abc.ABC):
 
             if is_last:
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
+                _evt_opt_s = torch.cuda.Event(enable_timing=True)
+                _evt_opt_e = torch.cuda.Event(enable_timing=True)
+                _evt_opt_s.record()
                 grad_norm = self.optimizer.step()
+                _evt_opt_e.record()
+                step_metrics["_opt_events"] = (_evt_opt_s, _evt_opt_e)
 
             if perf:
                 evt_end.record()
@@ -338,6 +343,12 @@ class Trainer(abc.ABC):
             compute_time_ms = sum(s.elapsed_time(e) for s, e in compute_events)
             metrics["perf/data_time"] = data_time
             metrics["perf/compute_time"] = compute_time_ms / 1000.0
+            # Optimizer timing (only recorded in last micro-batch)
+            opt_ms = 0.0
+            for m in all_step_metrics:
+                if "_opt_events" in m:
+                    opt_ms += m["_opt_events"][0].elapsed_time(m["_opt_events"][1])
+            metrics["perf/optimizer_time"] = opt_ms / 1000.0
 
         return metrics
 
