@@ -5,10 +5,18 @@
 # Pre-bakes all dependencies so pod setup takes <1 min instead of 20+ min.
 # Based on lmsysorg/sglang which includes PyTorch + CUDA + flashinfer.
 #
-# Build:
-#   cd /path/to/TorchSpec
+# Build (two variants):
+#
+#   # Slim (~4GB) — deps only, model downloaded at runtime:
+#   docker build -t xingh3/torchspec-dflash:slim \
+#     --build-arg INCLUDE_MODEL=0 \
+#     -f docker/sglang/v0.5.8.post1/Dockerfile.runpod .
+#
+#   # Full (~20GB) — deps + Qwen3-8B pre-downloaded:
 #   docker build -t xingh3/torchspec-dflash:latest \
 #     -f docker/sglang/v0.5.8.post1/Dockerfile.runpod .
+#
+#   docker push xingh3/torchspec-dflash:slim
 #   docker push xingh3/torchspec-dflash:latest
 #
 # RunPod pod setup:
@@ -61,14 +69,18 @@ RUN rm -rf /sgl-workspace/sglang && \
 # Not directly depended on by sglang but needed at runtime
 RUN pip install flashinfer-jit-cache==0.6.2 --index-url https://flashinfer.ai/whl/cu129
 
-# ── Layer 4: Pre-download Qwen3-8B model (~16GB, most stable layer) ──
+# ── Layer 4: Optionally pre-download Qwen3-8B model (~16GB) ──
 # Placed BEFORE code COPY so TorchSpec code changes don't invalidate this layer.
+# Set INCLUDE_MODEL=0 to skip (slim image). Default: 1 (full image).
 # Issue 19: Set HF_HOME early so model lands in the right cache dir
+ARG INCLUDE_MODEL=1
 ENV HF_HOME=/root/models/huggingface
-RUN python3 -c "\
+RUN if [ "$INCLUDE_MODEL" = "1" ]; then \
+    python3 -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('Qwen/Qwen3-8B', cache_dir='$HF_HOME')" && \
-    rm -rf /root/.cache/pip
+    rm -rf /root/.cache/pip; \
+    else echo "Skipping model download (INCLUDE_MODEL=0)"; fi
 
 # ── Layer 5: TorchSpec code and dependencies (changes most frequently) ──
 COPY . /root/torchspec
