@@ -255,8 +255,76 @@ Steady-state speed: **~2.5 step/s** (step_time ~0.4s). Backward dominates comput
 
 ### Training Time Estimate
 
-With 2.5 step/s:
-- 50K samples × 6 epochs / (batch=2 × dp=2) = **37,500 optimizer steps → ~4.2 hours**
+With 2.5 step/s (2.7 with optimizations):
+- 50K samples × 6 epochs / (batch=2 × dp=2) = **37,500 optimizer steps → ~3.9 hours**
+
+### Speed Optimization Attempts (2026-03-22)
+
+| Optimization | Speed | Impact | Status |
+|-------------|-------|--------|--------|
+| **no_sync()** — skip allreduce on non-last micro-batches | Saves ~5ms/step | +4% on backward | **Implemented** (commit `949c744`) |
+| **bf16 reduce** — halve allreduce volume | Minor | +4% overall | **Implemented** (commit `949c744`) |
+| **Full model torch.compile** | 1-3s/step | **-10x worse** | **Not viable** — dynamic shapes cause recompilation |
+| **GPU Direct RDMA** | CUDA assert | N/A | **Failed** — RunPod lacks RDMA hardware |
+| **max_concurrent_batches=2** | Same 2.5 step/s | 0% | **No effect** — not bottlenecked on inference |
+| **Mooncake same-node bypass** | N/A | N/A | **Needs code changes** — no config option exists |
+
+**Best config**: no_sync + bf16 reduce → **~2.7 step/s** (+8% over baseline).
+
+**Why torch.compile fails**: DFlash has dynamic tensor shapes (variable anchor count per sample, variable sequence lengths after filtering). torch.compile (inductor) recompiles for each new shape, causing 1-3s overhead per step for the first ~50 steps, never reaching steady state.
+
+---
+
+## Phase F: Speed Optimization Session (2026-03-22)
+
+### Environment
+- torch 2.9.1 + sglang 0.5.9 (patched) + CUDA 12.4
+- `TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS=ATEN,TRITON`
+- 4x H100 80GB: 2 training + 1 inference + 1 idle
+- Data: `perfectblend_50k.jsonl`
+
+### Compute Sub-Breakdown (CUDA Event Profiling)
+
+Instrumented `dflash_trainer._train_step()` with forward/backward events and `trainer._train_core_from_queue()` with optimizer events.
+
+**Steady-state breakdown (steps 2-200, batch=2, accum=2, anchors=512, seq=2048):**
+
+| Component | Time (ms) | % of Step |
+|-----------|----------|-----------|
+| **Backward** (gradient compute + FSDP allreduce) | 138 | 37% |
+| **Data pipeline** (Mooncake TCP fetch) | 162 | 44% |
+| **Forward** (FlexAttention + CE loss) | 78 | 21% |
+| **Optimizer** (FSDP step) | 41 | 11% |
+| **Dispatch** (Ray overhead) | 36 | 10% |
+| **Step total** | ~370 | — |
+
+> Sum > 100% because data and compute overlap (async pipeline).
+
+### 200-Step Stability Test
+
+Verified speed is stable over 200 steps (2 epochs) with no degradation:
+
+| Step Range | step/s | step (s) | compute (s) | data (s) |
+|-----------|--------|----------|-------------|----------|
+| 2-30 | 2.7 | 0.370 | 0.263 | 0.160 |
+| 30-100 | 2.8 | 0.360 | 0.255 | 0.162 |
+| 100-200 | 2.8 | 0.356 | 0.255 | 0.162 |
+
+Training converged well: loss 12.35→0.12, accuracy 0%→96.2%.
+
+### Optimization Tests
+
+**no_sync + bf16 reduce (commit `949c744`):**
+
+| Metric | Baseline | Optimized | Change |
+|--------|----------|-----------|--------|
+| step_time | 0.370s | 0.353s | **-5%** |
+| backward | 138ms | 133ms | -4% |
+| optimizer | 41ms | 41ms | 0% |
+| data | 162ms | 147ms | -9% |
+| **Speed** | **2.5 step/s** | **2.7 step/s** | **+8%** |
+
+**Full model torch.compile:** Tested but not viable. Step 1 = 111s warmup. Steps 2-50 averaged 1-3s/step due to repeated recompilation from dynamic tensor shapes. Discarded.
 
 ---
 
@@ -270,3 +338,5 @@ With 2.5 step/s:
 | `ba3cd02` | Document Phase C crash debugging: disk quota, eval timeout, checkpoint rotation |
 | `dddcd2a` | Document training speed optimization: 6.6hr → 3.1hr |
 | `c5b71e8` | Optimize DFlash training speed: remove compile overhead and enable GQA |
+| `dcd5f45` | Add compute sub-breakdown profiling instrumentation |
+| `949c744` | Add no_sync, compile_model, bf16 reduce optimizations |

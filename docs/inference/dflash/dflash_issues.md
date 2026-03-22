@@ -221,3 +221,29 @@ Filters candidate anchors by whether the **anchor token itself** has `loss_mask=
 **Note**: Same pattern exists in SpecForge's code. Impact is limited to **reduced anchor diversity** near prompt→completion boundaries (downstream `original_loss_mask_gathered` correctly zeros out labels in masked regions).
 
 **Status**: Needs investigation — benchmark whether allowing anchors at prompt positions improves τ.
+
+---
+
+## Speed Optimization Issues (Phase E/F)
+
+### Issue 27: torch.compile on full DFlash model causes recompilation storm
+
+Applying `torch.compile(dflash_model)` causes 1-3s/step overhead for 50+ steps (vs 0.37s baseline). Step 1 warmup = 111s.
+
+**Root cause**: DFlash has dynamic tensor shapes — anchor count varies per sample (depends on `loss_mask`), sequence lengths vary after `min_loss_tokens` filtering. Inductor recompiles for each new shape combination.
+
+**Status**: **Not viable**. `compile_model=true` config option added but should NOT be used. Individual op-level compiles (FlexAttention, RoPE, loss) already cover the hot paths.
+
+### Issue 28: GPU Direct RDMA fails on RunPod
+
+Setting `mooncake.enable_gpu_direct=True` causes `torch.AcceleratorError: CUDA error: device-side assert triggered` during training.
+
+**Root cause**: RunPod H100 pods use PCIe interconnect without RDMA NIC. Mooncake GPU Direct requires InfiniBand or RoCE for RDMA registration.
+
+**Status**: **Expected on RunPod**. GPU Direct only works on RDMA-capable clusters.
+
+### Issue 29: No same-node Mooncake bypass
+
+`EagleMooncakeStore` always uses Mooncake TCP protocol (200ms overhead) even when inference and training are on the same node. No config option to use NCCL p2p or shared memory.
+
+**Status**: **Needs code changes**. Would require new transfer backend in `data_fetcher.py` and `eagle_store.py`. Colocate mode is the only workaround (but OOMs with 8B target).
