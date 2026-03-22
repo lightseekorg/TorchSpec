@@ -318,6 +318,10 @@ class PrefetchedDataFetcher:
     Without prefetch: [data] → [compute] → [data] → [compute]  (sequential)
     With prefetch:    [compute] → [compute] → [compute]         (overlapped)
                       [data]      [data]      [data]
+
+    The background thread starts lazily on the first ``__iter__`` call and
+    keeps running across multiple ``itertools.islice`` invocations (one per
+    training step).  The training loop simply reads from the shared queue.
     """
 
     _SENTINEL = object()
@@ -327,6 +331,7 @@ class PrefetchedDataFetcher:
         self.prefetch_depth = prefetch_depth
         self._queue: queue.Queue = queue.Queue(maxsize=prefetch_depth)
         self._thread: Optional[threading.Thread] = None
+        self._started = False
         self._error: Optional[BaseException] = None
 
     def _prefetch_loop(self) -> None:
@@ -338,15 +343,22 @@ class PrefetchedDataFetcher:
         finally:
             self._queue.put(self._SENTINEL)
 
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        self._error = None
-        self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
-        self._thread.start()
+    def _ensure_started(self) -> None:
+        if not self._started:
+            self._started = True
+            self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+            self._thread.start()
 
-        while True:
-            item = self._queue.get()
-            if item is self._SENTINEL:
-                if self._error is not None:
-                    raise self._error
-                return
-            yield item
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        self._ensure_started()
+        return self
+
+    def __next__(self) -> Dict[str, torch.Tensor]:
+        if self._error is not None:
+            raise self._error
+        item = self._queue.get()
+        if item is self._SENTINEL:
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+        return item
