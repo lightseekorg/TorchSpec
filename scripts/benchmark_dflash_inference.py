@@ -397,6 +397,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--block_size", type=int, default=16)
     parser.add_argument("--skip_baseline", action="store_true")
+    parser.add_argument("--prompt_file", default=None,
+                        help="JSONL file with prompts. Each line: {\"prompt\": \"...\"} or plain text")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -438,10 +440,26 @@ def main():
     print(f"Target layer IDs: {target_layer_ids}")
     print(f"Draft model: {sum(p.numel() for p in draft.parameters() if p.requires_grad) / 1e6:.1f}M trainable params")
 
-    # Benchmark prompts — diverse topics for reliable τ measurement
-    prompts = [
-        # Science & Physics
-        "Explain the theory of relativity in simple terms.",
+    # Load prompts from file or use built-in defaults
+    if args.prompt_file:
+        prompts = []
+        with open(args.prompt_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    prompts.append(obj.get("prompt", obj.get("text", line)))
+                except json.JSONDecodeError:
+                    prompts.append(line)  # plain text, one prompt per line
+        prompts = prompts[:args.num_prompts]
+        print(f"Loaded {len(prompts)} prompts from {args.prompt_file}")
+    else:
+        # Benchmark prompts — diverse topics for reliable τ measurement
+        prompts = [
+            # Science & Physics
+            "Explain the theory of relativity in simple terms.",
         "What is quantum entanglement?",
         "How does nuclear fusion work and why is it hard to achieve?",
         "Describe the Big Bang theory and the evidence supporting it.",
@@ -498,8 +516,8 @@ def main():
         # Creative & Language
         "Write a short story about a robot learning to paint.",
         "Explain the rules of haiku poetry with examples.",
-        "What makes a good persuasive essay?",
-    ][:args.num_prompts]
+            "What makes a good persuasive essay?",
+        ][:args.num_prompts]
 
     print(f"\n{'='*60}")
     print(f"Benchmark: {len(prompts)} prompts, max_new_tokens={args.max_new_tokens}")
