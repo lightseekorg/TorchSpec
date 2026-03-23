@@ -438,23 +438,67 @@ def main():
     print(f"Target layer IDs: {target_layer_ids}")
     print(f"Draft model: {sum(p.numel() for p in draft.parameters() if p.requires_grad) / 1e6:.1f}M trainable params")
 
-    # Benchmark prompts
+    # Benchmark prompts — diverse topics for reliable τ measurement
     prompts = [
+        # Science & Physics
         "Explain the theory of relativity in simple terms.",
+        "What is quantum entanglement?",
+        "How does nuclear fusion work and why is it hard to achieve?",
+        "Describe the Big Bang theory and the evidence supporting it.",
+        "What are gravitational waves and how were they first detected?",
+        # Computer Science
         "Write a Python function that implements binary search.",
-        "What are the main causes of climate change?",
         "Describe how a transformer neural network works.",
         "What is the difference between TCP and UDP?",
-        "Explain the process of making bread from scratch.",
-        "How do vaccines work to protect against diseases?",
-        "What are the key principles of object-oriented programming?",
-        "Describe the solar system and its planets.",
-        "What is blockchain technology and how does it work?",
         "Explain how a compiler works step by step.",
-        "What are the benefits and risks of artificial intelligence?",
+        "What are the key principles of object-oriented programming?",
+        "How does garbage collection work in modern programming languages?",
+        "Explain the CAP theorem in distributed systems.",
+        # Biology & Medicine
+        "How do vaccines work to protect against diseases?",
         "How does the human immune system fight infections?",
-        "Describe the process of machine learning model training.",
-        "What is quantum entanglement?",
+        "Explain the process of DNA replication in cells.",
+        "What is CRISPR and how does it edit genes?",
+        "Describe the stages of mitosis and meiosis.",
+        # Technology
+        "What is blockchain technology and how does it work?",
+        "What are the benefits and risks of artificial intelligence?",
+        "How do self-driving cars perceive their environment?",
+        "Explain how 5G networks differ from 4G.",
+        "What is edge computing and when should it be used?",
+        # Math & Logic
+        "Explain the Monty Hall problem and its solution.",
+        "What is Bayes' theorem and how is it applied?",
+        "Describe the P vs NP problem in computer science.",
+        "What is the traveling salesman problem?",
+        # Everyday Science
+        "What are the main causes of climate change?",
+        "Explain the process of making bread from scratch.",
+        "Describe the solar system and its planets.",
+        "How does a microwave oven heat food?",
+        "Why is the sky blue during the day and red at sunset?",
+        # History & Culture
+        "Describe the key events of the French Revolution.",
+        "What caused the fall of the Roman Empire?",
+        "Explain the significance of the printing press.",
+        "How did the Industrial Revolution change society?",
+        "What were the main causes of World War I?",
+        # Engineering
+        "How does a jet engine produce thrust?",
+        "Explain how bridges are designed to handle stress.",
+        "What is the difference between AC and DC electricity?",
+        "How do solar panels convert sunlight to electricity?",
+        "Describe how a lithium-ion battery works.",
+        # Philosophy & Social Science
+        "What is the trolley problem in ethics?",
+        "Explain the concept of supply and demand in economics.",
+        "What is cognitive dissonance in psychology?",
+        "Describe the scientific method step by step.",
+        "What is game theory and how is it applied?",
+        # Creative & Language
+        "Write a short story about a robot learning to paint.",
+        "Explain the rules of haiku poetry with examples.",
+        "What makes a good persuasive essay?",
     ][:args.num_prompts]
 
     print(f"\n{'='*60}")
@@ -531,8 +575,34 @@ def main():
     print(f"\n  DFlash avg: {avg_dflash_tokens:.0f} tokens, "
           f"{avg_dflash_time:.2f}s, {avg_dflash_tps:.1f} tok/s, τ={avg_tau:.2f}\n")
 
-    # ── Summary ──
+    # ── Per-prompt breakdown ──
+    print(f"\n{'='*60}")
+    print("PER-PROMPT BREAKDOWN")
     print(f"{'='*60}")
+    per_prompt_taus = []
+    for i, prompt in enumerate(prompts):
+        # Compute per-prompt τ from acceptance_lengths
+        prompt_start = sum(len(a) for a in [[] for _ in range(i)])  # not tracked per-prompt
+        tok_s = dflash_tokens[i] / dflash_times[i] if dflash_times[i] > 0 else 0
+        print(f"  [{i+1:2d}] {dflash_tokens[i]:3d} tok, {dflash_times[i]:.2f}s, "
+              f"{tok_s:.1f} tok/s  | {prompt[:60]}")
+
+    # ── τ distribution ──
+    print(f"\n{'='*60}")
+    print("τ DISTRIBUTION (per draft cycle)")
+    print(f"{'='*60}")
+    if all_acc_lens:
+        tau_counts = {}
+        for a in all_acc_lens:
+            tau_counts[a] = tau_counts.get(a, 0) + 1
+        for k in sorted(tau_counts.keys()):
+            bar = "█" * int(tau_counts[k] / max(tau_counts.values()) * 40)
+            print(f"  τ={k:2d}: {tau_counts[k]:4d} ({tau_counts[k]/len(all_acc_lens)*100:5.1f}%) {bar}")
+        print(f"  Total cycles: {len(all_acc_lens)}, mean τ={avg_tau:.2f}, "
+              f"median τ={sorted(all_acc_lens)[len(all_acc_lens)//2]}")
+
+    # ── Summary ──
+    print(f"\n{'='*60}")
     print("RESULTS SUMMARY")
     print(f"{'='*60}")
     if not args.skip_baseline:
