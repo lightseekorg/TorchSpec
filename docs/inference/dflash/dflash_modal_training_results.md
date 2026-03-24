@@ -359,6 +359,87 @@ Global batch size = 1 × 4 × 6 = 24.
 
 **Notable**: Most stable forward times of all anchors=512 tests (305-448ms range vs 204-837ms for others). Less FlexAttention recompilation jitter with batch=1.
 
+### Test 512-E: 4 Inference + 4 Training GPUs
+
+```
+training.dflash_num_anchors=512 inference.inference_num_gpus=4 training.training_num_gpus_per_node=4
+```
+
+Global batch size = 1 × 4 × 4 = 16.
+
+| Metric | Value |
+|--------|-------|
+| Total time | **368s** |
+| step_time | **0.75-0.83s** |
+| forward | **230-355ms** |
+| backward | 459-517ms |
+| optimizer | ~15-16ms |
+| thru (samples/s) | 17-20 |
+| I (inference/s) | **108-120** |
+| T (train capacity) | 18-25 |
+| pool | **64-72 / 64 (overfull!)** |
+| dispatch_wait | 0.04-0.06s |
+
+**TIMING samples**:
+
+| Step | step_time | data_time | compute_time | fwd | bwd | opt | dispatch |
+|------|-----------|-----------|--------------|-----|-----|-----|----------|
+| 50 | 0.763s | 0.404s | 0.744s | 0.230s | 0.498s | 0.016s | 0.044s |
+| 100 | 0.751s | 0.403s | 0.741s | 0.258s | 0.468s | 0.016s | 0.046s |
+| 150 | 0.834s | 0.369s | 0.825s | 0.292s | 0.517s | 0.016s | 0.045s |
+| 200 | 0.781s | 0.346s | 0.767s | 0.292s | 0.459s | 0.015s | 0.061s |
+
+**COMPUTE_BREAKDOWN**:
+
+| Step | forward (ms) | backward (ms) |
+|------|-------------|---------------|
+| 100 | 247.4 | 364.7 |
+| 150 | 355.6 | 496.4 |
+| 195 | 331.8 | 496.4 |
+
+**Notable**: Fastest total time of all tests. 4 inference GPUs massively oversaturate the pool (I=108-120 samples/s, pool overflows to 72). Fewer FSDP ranks (4 vs 6-7) means less allreduce overhead, giving the lowest forward times. Trade-off: global batch size drops to 16, reducing per-step sample throughput but more than compensated by faster steps.
+
+### Test 512-F: Larger Micro-Batch + 4 Inference GPUs (4 Inference + 4 Training)
+
+```
+training.dflash_num_anchors=512 training.micro_batch_size=2 training.draft_accumulation_steps=2
+inference.inference_num_gpus=4 training.training_num_gpus_per_node=4
+```
+
+Global batch size = 2 × 2 × 4 = 16 (same as 512-E).
+
+| Metric | Value |
+|--------|-------|
+| Total time | **394s** |
+| step_time | 0.90-0.93s |
+| forward | 231-399ms |
+| backward | 360-549ms |
+| optimizer | ~16ms |
+| thru (samples/s) | 17-18 |
+| I (inference/s) | 114-128 |
+| T (train capacity) | 18-20 |
+| pool | **64 / 64 (full)** |
+| dispatch_wait | 0.03-0.04s |
+
+**TIMING samples**:
+
+| Step | step_time | data_time | compute_time | fwd | bwd | opt | dispatch |
+|------|-----------|-----------|--------------|-----|-----|-----|----------|
+| 50 | 0.895s | 0.412s | 0.743s | 0.261s | 0.466s | 0.016s | 0.034s |
+| 100 | 0.910s | 0.394s | 0.805s | 0.282s | 0.507s | 0.016s | 0.035s |
+| 150 | 0.909s | 0.393s | 0.794s | 0.298s | 0.480s | 0.016s | 0.039s |
+| 200 | 0.927s | 0.419s | 0.796s | 0.231s | 0.549s | 0.016s | 0.033s |
+
+**COMPUTE_BREAKDOWN**:
+
+| Step | forward (ms) | backward (ms) |
+|------|-------------|---------------|
+| 100 | 399.8 | 360.4 |
+| 150 | 257.7 | 414.2 |
+| 195 | 375.3 | 461.2 |
+
+**Notable**: Slower than 512-E (394s vs 368s) despite same global batch size. batch=2 packs 2 sequences per micro-batch, increasing FlexAttention overhead per forward pass (0.90-0.93s/step vs 0.75-0.83s). batch=1 with accum=4 remains superior for the 4+4 split.
+
 ---
 
 ## Comparison Summary
@@ -379,22 +460,26 @@ Global batch size = 1 × 4 × 6 = 24.
 |--------|-----------|-------|-------|---------|------------|-----------|------------|------|------------|
 | 512-A | 1+7 | 1 | 4 | 512 | 584s | 0.83-1.40s | 17-20 | starved (12-28) | data |
 | 512-B | 1+7 | 2 | 2 | 512 | 574s | 0.85-1.28s | 17-19 | starved (12-20) | data |
-| **512-C** | **2+6** | **2** | **2** | **512** | **446s** | 0.99-1.29s | **20-25** | **full** | compute |
-| **512-D** | **2+6** | **1** | **4** | **512** | **457s** | **0.93-1.09s** | **22-25** | **full** | compute |
+| 512-C | 2+6 | 2 | 2 | 512 | 446s | 0.99-1.29s | 20-25 | full | compute |
+| 512-D | 2+6 | 1 | 4 | 512 | 457s | 0.93-1.09s | 22-25 | full | compute |
+| **512-E** | **4+4** | **1** | **4** | **512** | **368s** | **0.75-0.83s** | 17-20 | **overfull (72)** | compute |
+| 512-F | 4+4 | 2 | 2 | 512 | 394s | 0.90-0.93s | 17-18 | full | compute |
 
 ### Key Findings
 
 1. **`dflash_num_anchors` is the biggest lever**: 512→256 halves Q_LEN, cuts forward time from 260-800ms to 240-434ms. Consistent with Phase C results on RunPod.
 
-2. **2 inference GPUs is essential for anchors=512**: With 1 inference GPU, every anchors=512 config suffered pool starvation (12-28/64) and dispatch waits of 1.0-1.5s. Adding a second inference GPU fully resolves this (pool=64, wait=0.05s).
+2. **2+ inference GPUs is essential for anchors=512**: With 1 inference GPU, every anchors=512 config suffered pool starvation (12-28/64) and dispatch waits of 1.0-1.5s. Adding more inference GPUs fully resolves this.
 
-3. **Adding a second inference GPU solves data starvation**: This applies to both anchors=512 (any batch size) and anchors=256 (batch=4). On 8-GPU Modal, 2 inference GPUs have enough PCIe bandwidth headroom without the Mooncake TCP contention seen on 4-GPU RunPod (Phase F).
+3. **4+4 split (512-E) is the fastest overall**: 368s total, 17% faster than 512-C (446s). Fewer FSDP ranks (4 vs 6-7) reduces allreduce overhead, giving the lowest forward times (230-355ms). Trade-off: global batch size drops to 16 vs 24, but faster steps more than compensate.
 
-4. **Anchors=512 matches anchors=256 speed when properly tuned**: 512-C (446s) and 512-D (457s) are actually faster than the best anchors=256 config (C2, 476s). The higher per-step compute from 512 anchors is offset by better pool utilization and inference overlap.
+4. **Inference is massively oversaturated at 4+4**: I=108-120 samples/s with pool overflowing to 72/64. The 4 inference GPUs produce far more data than 4 training GPUs can consume. This suggests 3+5 may be the sweet spot.
 
-5. **512-D has the most stable step times**: Forward variance 305-448ms vs 204-837ms for other configs. batch=1 with accum=4 avoids FlexAttention recompilation from varying padded batch shapes.
+5. **Anchors=512 matches anchors=256 speed when properly tuned**: All 2+ inference GPU configs (512-C/D/E) match or beat the best anchors=256 config (C2, 476s).
 
-6. **RDMA is not available on Modal**: The RDMA probe confirmed `/dev/infiniband` and `ibstat` are not present. Mooncake uses TCP only, but CPU prefetch effectively hides the latency.
+6. **512-D has the most stable step times among 2+6 configs**: Forward variance 305-448ms vs 204-837ms for other configs. batch=1 with accum=4 avoids FlexAttention recompilation from varying padded batch shapes.
+
+7. **RDMA is not available on Modal**: The RDMA probe confirmed `/dev/infiniband` and `ibstat` are not present. Mooncake uses TCP only, but CPU prefetch effectively hides the latency.
 
 ### 200K × 3 Epoch Estimates
 
@@ -404,28 +489,33 @@ Global batch size = 1 × 4 × 6 = 24.
 |--------|-----------|-----------|
 | Baseline (1+7, anchors=512) | ~18 | ~9.3 hr |
 | Test C2 (2+6, batch=4, anchors=256) | ~24 | ~6.9 hr |
-| **512-C (2+6, batch=2, anchors=512)** | **~22** | **~7.6 hr** |
-| **512-D (2+6, batch=1, anchors=512)** | **~23** | **~7.2 hr** |
+| 512-C (2+6, batch=2, anchors=512) | ~22 | ~7.6 hr |
+| 512-D (2+6, batch=1, anchors=512) | ~23 | ~7.2 hr |
+| **512-E (4+4, batch=1, anchors=512)** | **~19** | **~8.8 hr** |
+
+Note: 512-E has the fastest wall-clock for 200 steps (368s) but lower samples/s (19 vs 23) due to
+smaller global batch (16 vs 24). For full training, effective time depends on optimizer convergence —
+fewer samples per step means more optimizer steps needed, partially offsetting the faster step time.
 
 ### Recommended Config for Full Training (Quality-Optimized)
 
 Based on `specforge_dflash_training_reference.md`: z-lab achieves τ=3.95 with `dflash_num_anchors=512`,
 `max_seq_length=2048`, and 200K+ samples. Anchors=512 is recommended for best acceptance length.
 
-**512-D (most stable, quality-optimized)**:
+**512-E (fastest step time, 4+4)**:
+
+```bash
+modal run --detach --env sandbox scripts/modal_dflash_train.py \
+  --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
+  --extra-overrides "training.dflash_num_anchors=512 inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
+```
+
+**512-D (best throughput, most stable, 2+6)**:
 
 ```bash
 modal run --detach --env sandbox scripts/modal_dflash_train.py \
   --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
   --extra-overrides "training.dflash_num_anchors=512 inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
-```
-
-**512-C (fastest, quality-optimized)**:
-
-```bash
-modal run --detach --env sandbox scripts/modal_dflash_train.py \
-  --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
-  --extra-overrides "training.dflash_num_anchors=512 training.micro_batch_size=2 training.draft_accumulation_steps=2 inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
 ```
 
 **Speed-optimized (if τ quality not critical)**:

@@ -37,19 +37,19 @@ Usage:
 
 Recommended parameters (8x H100, quality-optimized with anchors=512):
     --extra-overrides "training.dflash_num_anchors=512 \
+        inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
+
+    Config 512-E: 4 inference + 4 training GPUs, batch=1, accum=4, anchors=512
+    Results: 17-20 samples/s, 368s for 200 steps (fastest wall-clock)
+    Quality: anchors=512 matches z-lab recipe for best τ (acceptance length)
+    Note: inference oversaturated (I=108-120), pool overfull (72/64)
+
+    Alternative (best throughput per step, anchors=512):
+    --extra-overrides "training.dflash_num_anchors=512 \
         inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
 
     Config 512-D: 2 inference + 6 training GPUs, batch=1, accum=4, anchors=512
     Results: 22-25 samples/s, 457s for 200 steps, most stable step times
-    Quality: anchors=512 matches z-lab recipe for best τ (acceptance length)
-
-    Alternative (fastest overall, anchors=512):
-    --extra-overrides "training.dflash_num_anchors=512 training.micro_batch_size=2 \
-        training.draft_accumulation_steps=2 inference.inference_num_gpus=2 \
-        training.training_num_gpus_per_node=6"
-
-    Config 512-C: 2 inference + 6 training GPUs, batch=2, accum=2, anchors=512
-    Results: 20-25 samples/s, 446s for 200 steps (fastest tested)
 
     Speed-only (if τ quality not critical):
     --extra-overrides "training.dflash_num_anchors=256 training.micro_batch_size=4 \
@@ -57,18 +57,18 @@ Recommended parameters (8x H100, quality-optimized with anchors=512):
         training.training_num_gpus_per_node=6"
 
     Key tuning insights (see dflash_modal_training_results.md):
-      - 2 inference GPUs is essential for anchors=512 (pool starves with 1)
-      - anchors=512 matches anchors=256 speed when using 2 inference GPUs
-      - 512-D (batch=1) has most stable fwd times (305-448ms vs 204-837ms)
-      - 512-C (batch=2) is marginally faster total time but more fwd variance
+      - 4+4 split (512-E) is fastest: 368s, fewer FSDP ranks = less allreduce
+      - 2+ inference GPUs essential for anchors=512 (pool starves with 1)
+      - anchors=512 matches anchors=256 speed with enough inference GPUs
+      - 512-D (2+6, batch=1) has most stable fwd times (305-448ms)
+      - 512-E (4+4) oversaturates inference (I=108); 3+5 may be sweet spot
       - 1 inference GPU causes pool starvation (12-28/64) for all 512 configs
-      - anchors=256 + batch=4 is fastest but may sacrifice τ quality
 
     Full training example (200K samples, 3 epochs, quality-optimized):
         modal run --detach scripts/modal_dflash_train.py \
             --max-steps 999999 --num-epochs 3 --dataset-size 200000 \
             --extra-overrides "training.dflash_num_anchors=512 \
-                inference.inference_num_gpus=2 training.training_num_gpus_per_node=6"
+                inference.inference_num_gpus=4 training.training_num_gpus_per_node=4"
 """
 
 from __future__ import annotations
@@ -209,15 +209,22 @@ class GPUConfig:
     overrides: list[str]
 
 
-def _gpu_config(gpu_count: int) -> GPUConfig:
+def _gpu_config(gpu_count: int, extra_overrides: list[str] | None = None) -> GPUConfig:
     if gpu_count >= 4:
+        infer_gpus = 1
         train_gpus = gpu_count - 1
+        if extra_overrides:
+            for ov in extra_overrides:
+                if ov.startswith("inference.inference_num_gpus="):
+                    infer_gpus = int(ov.split("=", 1)[1])
+                elif ov.startswith("training.training_num_gpus_per_node="):
+                    train_gpus = int(ov.split("=", 1)[1])
         return GPUConfig(
-            mode=f"{gpu_count}gpu (SGLang, 1 inference + {train_gpus} training FSDP)",
+            mode=f"{gpu_count}gpu (SGLang, {infer_gpus} inference + {train_gpus} training FSDP)",
             eagle3_config="configs/sglang_qwen3_8b.yaml",
             dflash_config="configs/sglang_qwen3_8b_dflash.yaml",
             overrides=[
-                f"training.training_num_gpus_per_node={train_gpus}",
+                f"training.training_num_gpus_per_node={gpu_count - 1}",
                 "inference.inference_num_gpus=1",
                 "inference.inference_num_gpus_per_engine=1",
                 f"inference.inference_num_gpus_per_node={gpu_count}",
@@ -480,14 +487,16 @@ def _train_impl(
             )
         print(f"  Dataset: {data_file}")
 
-    cfg = _gpu_config(gpu_count)
+    user_overrides = []
+    if extra_overrides:
+        user_overrides = extra_overrides.split()
+
+    cfg = _gpu_config(gpu_count, extra_overrides=user_overrides or None)
     print(f"\n  GPU mode: {cfg.mode}")
 
     dataset_overrides = [f"dataset.train_data_path={data_file}"]
 
-    user_overrides = []
-    if extra_overrides:
-        user_overrides = extra_overrides.split()
+    if user_overrides:
         print(f"  Extra overrides: {user_overrides}")
 
     if run_eagle3:
@@ -557,12 +566,19 @@ def main(
         return
 
     epochs_override = num_epochs if num_epochs > 0 else None
+    infer_gpus = 1
     train_gpus = gpu_count - 1
+    if extra_overrides:
+        for ov in extra_overrides.split():
+            if ov.startswith("inference.inference_num_gpus="):
+                infer_gpus = int(ov.split("=", 1)[1])
+            elif ov.startswith("training.training_num_gpus_per_node="):
+                train_gpus = int(ov.split("=", 1)[1])
 
     print("=" * 60)
     print("  DFlash Training on Modal")
     print("=" * 60)
-    print(f"  GPU:          {SGLANG_GPU} (1 infer + {train_gpus} train)")
+    print(f"  GPU:          {SGLANG_GPU} ({infer_gpus} infer + {train_gpus} train)")
     print(f"  Eagle3:       {'YES' if run_eagle3 else 'SKIP'}")
     print(f"  DFlash:       {'YES' if run_dflash else 'SKIP'}")
     print(f"  Max steps:    {max_steps}")
