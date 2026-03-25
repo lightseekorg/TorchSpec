@@ -656,7 +656,8 @@ The model has learned basic next-token patterns but cannot reliably predict mult
 - **Backend**: SGLang (tp=1, KV cache, CUDA graphs, paged attention)
 - **SGLang version**: Built from PR #16818 (DFlash speculative decoding support)
 - **Target model**: `Qwen/Qwen3-8B`
-- **Draft model**: `Xingh3/dflash-qwen3-8b-3epoch` (iter_11803, 3 epochs on 47K samples)
+- **Draft model**: `Xingh3/dflash-qwen3-8b-3epoch` (iter_11803, 3 epochs on 190K samples)
+- **Training config**: 190K samples (200K subsampled, filtered), 3 epochs, 23,622 optimizer steps, global_batch=24 (micro=1 x accum=4 x dp=6), 8x H100 (2 inference + 6 training)
 - **Inference config**: temperature=0.0 (greedy), max_new_tokens=2048, concurrency=1
 - **Total runtime**: ~45 minutes for all 10 datasets
 
@@ -722,14 +723,16 @@ The TorchSpec-exported DFlash model required runtime patching to work with SGLan
 
 | Factor | Ours | z-lab |
 |--------|------|-------|
-| Training samples | 47,484 | ~800,000 (16x more) |
+| Training samples | 188,977 (200K subsampled, filtered) | ~800,000 (4.2x more) |
 | Epochs | 3 | 6 |
-| Total sample passes | ~143K | ~4.8M (33x more) |
-| Training data quality | PerfectBlend 50K | Proprietary blend |
+| Total sample passes | ~567K | ~4.8M (8.5x more) |
+| Training data quality | PerfectBlend 200K (open-source blend) | Proprietary blend |
+| Optimizer steps | 23,622 | Unknown (est. ~200K+) |
+| Max seq length | 2,048 | 3,072 |
 
-The 21% τ gap is directly attributable to 33x less total training exposure. The model has learned enough to consistently accept 3+ tokens per draft cycle (a functional speculative decoder), but needs significantly more data to match z-lab's 4+ τ performance.
+The 21% τ gap is attributable to a combination of factors: 8.5x fewer total training sample passes, shorter max sequence length (2048 vs 3072), and likely higher-quality proprietary training data. With ~567K total sample passes vs z-lab's ~4.8M, the model has learned to consistently accept 3+ tokens per draft cycle (a functional speculative decoder), but needs more data diversity and longer sequences to match z-lab's 4+ τ.
 
-**Key takeaway**: Our DFlash model trained on 47K samples for 3 epochs achieves **~78% of z-lab's acceptance length** on math benchmarks, despite having **33x fewer total training sample passes**. Code tasks perform even better (τ=3.58-4.14) since code has more predictable token patterns.
+**Key takeaway**: Our DFlash model trained on 190K samples for 3 epochs achieves **~78% of z-lab's acceptance length** on math benchmarks, with **8.5x fewer total sample passes**. Code tasks perform even better (τ=3.58-4.14) since code has more predictable token patterns. Scaling to 800K samples with seq_len=3072 should close much of the remaining gap.
 
 ### Progress: τ Improvement Over Training
 
@@ -737,11 +740,13 @@ The 21% τ gap is directly attributable to 33x less total training exposure. The
 |-------|------------|----------|---|--------|-------|
 | Phase A | 200 steps | 200 steps, tiny data | 1.01 | Transformers | Pipeline validation only |
 | Phase C | iter_18001 | 18K steps, 50K data | 1.86 | Transformers | Pre-bugfix, 2 training bugs |
-| Phase D | iter_7869 (2 epoch) | 7.9K steps, 47K data | 1.85 | Transformers | Post-bugfix, saturated on 47K |
-| Phase D | iter_11803 (3 epoch) | 11.8K steps, 47K data | 1.85 | Transformers | Identical to 2-epoch |
-| **Phase G** | **iter_11803 (3 epoch)** | **11.8K steps, 47K data** | **3.06 avg** | **SGLang** | **KV cache + CUDA graphs unlock true τ** |
+| Phase D | iter_7869 (2 epoch) | 7.9K steps, 50K data | 1.85 | Transformers | Post-bugfix, saturated on 50K |
+| Phase D | iter_11803 (3 epoch) | 11.8K steps, 50K data | 1.85 | Transformers | Identical to 2-epoch |
+| **Phase G** | **iter_11803 (3 epoch)** | **23.6K steps, 190K data** | **3.06 avg** | **SGLang** | **Retrained on 200K, KV cache + CUDA graphs** |
 
-The jump from τ=1.85 (Transformers backend) to τ=3.06 (SGLang backend) on the same checkpoint demonstrates that the **inference backend matters significantly**. SGLang's KV cache, CUDA graphs, and optimized attention enable the draft model to express its full prediction quality, while the Transformers backend's naive recomputation underestimates the model's capability.
+Two factors contribute to the τ=1.85 → τ=3.06 improvement:
+1. **Dataset scale**: 50K → 190K samples (3.8x more training data)
+2. **Inference backend**: SGLang's KV cache, CUDA graphs, and optimized attention enable the draft model to express its full prediction quality, while the Transformers backend's naive recomputation underestimates the model's capability
 
 ### Commits
 
