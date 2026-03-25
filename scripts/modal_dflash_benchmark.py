@@ -1,33 +1,31 @@
 """
-DFlash inference benchmark on Modal GPU platform.
+DFlash inference benchmark on Modal GPU platform — z-lab methodology.
 
-Loads a pre-trained DFlash draft model from HuggingFace and benchmarks
-speculative decoding against a target-only baseline.
+Uses the same datasets, prompt formatting, and evaluation protocol as
+z-lab/dflash (https://github.com/z-lab/dflash):
+  GSM8K, MATH-500, AIME24, AIME25, HumanEval, MBPP, LiveCodeBench,
+  SWE-Bench, MT-Bench, Alpaca.
 
 Setup (one-time — same secrets as modal_dflash_train.py):
     modal token set --token-id <id> --token-secret <secret>
     modal secret create huggingface-secret HF_TOKEN=hf_...
 
 Usage:
-    # Default: benchmark Xingh3/dflash-qwen3-8b-1epoch (10 prompts, 128 tokens)
+    # Run all 10 z-lab benchmarks (default)
     modal run scripts/modal_dflash_benchmark.py
 
-    # Custom HF draft model
+    # Run specific datasets
+    modal run scripts/modal_dflash_benchmark.py --datasets gsm8k,math500
+
+    # Custom draft model
     modal run scripts/modal_dflash_benchmark.py \
-        --draft-repo Xingh3/dflash-qwen3-8b-1epoch
-
-    # More prompts, longer generation
-    modal run scripts/modal_dflash_benchmark.py \
-        --num-prompts 50 --max-new-tokens 256
-
-    # Skip baseline (only measure DFlash)
-    modal run scripts/modal_dflash_benchmark.py --skip-baseline
-
-    # Custom target model
-    modal run scripts/modal_dflash_benchmark.py --target-model Qwen/Qwen3-8B
+        --draft-repo Xingh3/dflash-qwen3-8b-3epoch
 
     # Custom block size and temperature
     modal run scripts/modal_dflash_benchmark.py --block-size 8 --temperature 0.6
+
+    # Skip baseline (only measure DFlash)
+    modal run scripts/modal_dflash_benchmark.py --skip-baseline
 """
 
 from __future__ import annotations
@@ -48,6 +46,19 @@ HF_CACHE_DIR = "/root/.cache/huggingface"
 
 BENCHMARK_GPU = "H100:1"
 
+ZLAB_BENCHMARKS = {
+    "gsm8k": 128,
+    "math500": 128,
+    "aime24": 30,
+    "aime25": 30,
+    "humaneval": 164,
+    "mbpp": 128,
+    "livecodebench": 128,
+    "swe-bench": 128,
+    "mt-bench": 80,
+    "alpaca": 128,
+}
+
 # =============================================================================
 # Modal app + volumes
 # =============================================================================
@@ -57,7 +68,7 @@ app = modal.App("torchspec-dflash-benchmark")
 hf_cache_vol = modal.Volume.from_name("hf-cache", create_if_missing=True)
 
 # =============================================================================
-# Container image — lightweight: just PyTorch + Transformers + TorchSpec
+# Container image
 # =============================================================================
 
 benchmark_image = (
@@ -91,21 +102,119 @@ benchmark_image = (
     )
 )
 
+
 # =============================================================================
-# Benchmark runner — executed inside Modal container
+# Dataset loading — mirrors z-lab/dflash model/utils.py exactly
+# =============================================================================
+
+def load_benchmark_dataset(data_name: str, max_samples: int | None = None):
+    """Load and format datasets using the same logic as z-lab/dflash."""
+    from datasets import load_dataset, Features, Sequence, Value
+
+    if data_name == "gsm8k":
+        dataset = load_dataset("openai/gsm8k", "main", split="test")
+        prompt_fmt = "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "math500":
+        dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+        prompt_fmt = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "aime24":
+        dataset = load_dataset("HuggingFaceH4/aime_2024", split="train")
+        prompt_fmt = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "aime25":
+        dataset = load_dataset("MathArena/aime_2025", split="train")
+        prompt_fmt = "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "alpaca":
+        dataset = load_dataset("tatsu-lab/alpaca", split="train")
+        dataset = dataset.map(lambda x: {
+            "formatted_input": (
+                f"{x['instruction']}\n\nInput:\n{x['input']}" if x["input"] else x["instruction"]
+            )
+        })
+        dataset = dataset.map(lambda x: {"turns": [x["formatted_input"]]})
+
+    elif data_name == "mt-bench":
+        dataset = load_dataset("HuggingFaceH4/mt_bench_prompts", split="train")
+        dataset = dataset.map(lambda x: {"turns": x["prompt"]})
+
+    elif data_name == "humaneval":
+        dataset = load_dataset("openai/openai_humaneval", split="test")
+        prompt_fmt = (
+            "Write a solution to the following problem and make sure that it passes the tests:\n"
+            "```python\n{prompt}\n```"
+        )
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "mbpp":
+        dataset = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+        dataset = dataset.map(lambda x: {"turns": [x["prompt"]]})
+
+    elif data_name == "swe-bench":
+        dataset = load_dataset("princeton-nlp/SWE-bench_Lite", split="test")
+        prompt_fmt = "Problem Statement:\n{problem_statement}\nPlease fix the issue described above."
+        dataset = dataset.map(lambda x: {"turns": [prompt_fmt.format(**x)]})
+
+    elif data_name == "livecodebench":
+        base = "https://huggingface.co/datasets/livecodebench/code_generation_lite/resolve/main/"
+        allowed_files = [f"test{s}.jsonl" for s in ["", "2", "3", "4", "5", "6"]]
+        urls = [base + fn for fn in allowed_files]
+        dataset = load_dataset("json", data_files={"test": urls})["test"]
+
+        def format_lcb(doc):
+            system_prompt = (
+                "You are an expert Python programmer. You will be given a question (problem specification) "
+                "and will generate a correct Python program that matches the specification and passes all tests. "
+                "You will NOT return anything except for the program"
+            )
+            question_block = f"### Question:\n{doc['question_content']}"
+            if doc.get("starter_code"):
+                format_message = "### Format: Use the following code structure:"
+                code_block = f"```python\n{doc['starter_code']}\n```"
+            else:
+                format_message = "### Format: Write your code in the following format:"
+                code_block = "```python\n# YOUR CODE HERE\n```"
+            answer_footer = "### Answer: (use the provided format with backticks)"
+            return f"{system_prompt}\n\n{question_block}\n\n{format_message}\n{code_block}\n\n{answer_footer}"
+
+        target_features = Features({"turns": Sequence(Value("large_string"))})
+        dataset = dataset.map(
+            lambda x: {"turns": [format_lcb(x)]},
+            remove_columns=dataset.column_names,
+            features=target_features,
+        )
+
+    else:
+        raise ValueError(f"Unknown dataset: {data_name}")
+
+    if max_samples is not None and len(dataset) > max_samples:
+        dataset = dataset.shuffle(seed=0).select(range(max_samples))
+
+    return dataset
+
+
+# =============================================================================
+# Benchmark runner
 # =============================================================================
 
 @app.function(
     image=benchmark_image,
     gpu=BENCHMARK_GPU,
     volumes={HF_CACHE_DIR: hf_cache_vol},
-    timeout=2 * 3600,
+    timeout=4 * 3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def run_benchmark(
     target_model: str,
     draft_repo: str,
-    num_prompts: int,
+    dataset_name: str,
+    max_samples: int,
     max_new_tokens: int,
     block_size: int,
     temperature: float,
@@ -113,10 +222,11 @@ def run_benchmark(
 ):
     import json
     import math
-    import os
+    import random
     import time
     from typing import List, Tuple
 
+    import numpy as np
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -127,6 +237,11 @@ def run_benchmark(
         DFlashDraftModel,
         build_target_layer_ids,
     )
+
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
 
     device = "cuda"
     print(f"Device: {device}")
@@ -166,7 +281,12 @@ def run_benchmark(
     print(f"Target layer IDs: {target_layer_ids}")
     print(f"Block size: {block_size}")
 
-    # ── Helpers (inlined from benchmark_dflash_inference.py) ──
+    # ── Load dataset ──
+    print(f"\nLoading dataset: {dataset_name} (max {max_samples} samples)...")
+    dataset = load_benchmark_dataset(dataset_name, max_samples)
+    print(f"Loaded {len(dataset)} samples")
+
+    # ── Helpers ──
 
     def extract_context_feature(
         hidden_states: list[torch.Tensor],
@@ -317,170 +437,179 @@ def run_benchmark(
 
         return output_ids, elapsed, acceptance_lengths
 
-    # ── Prompts ──
-    prompts = [
-        "Explain the theory of relativity in simple terms.",
-        "What is quantum entanglement?",
-        "How does nuclear fusion work and why is it hard to achieve?",
-        "Describe the Big Bang theory and the evidence supporting it.",
-        "What are gravitational waves and how were they first detected?",
-        "Write a Python function that implements binary search.",
-        "Describe how a transformer neural network works.",
-        "What is the difference between TCP and UDP?",
-        "Explain how a compiler works step by step.",
-        "What are the key principles of object-oriented programming?",
-        "How does garbage collection work in modern programming languages?",
-        "Explain the CAP theorem in distributed systems.",
-        "How do vaccines work to protect against diseases?",
-        "How does the human immune system fight infections?",
-        "Explain the process of DNA replication in cells.",
-        "What is CRISPR and how does it edit genes?",
-        "Describe the stages of mitosis and meiosis.",
-        "What is blockchain technology and how does it work?",
-        "What are the benefits and risks of artificial intelligence?",
-        "How do self-driving cars perceive their environment?",
-        "Explain how 5G networks differ from 4G.",
-        "What is edge computing and when should it be used?",
-        "Explain the Monty Hall problem and its solution.",
-        "What is Bayes' theorem and how is it applied?",
-        "Describe the P vs NP problem in computer science.",
-        "What is the traveling salesman problem?",
-        "What are the main causes of climate change?",
-        "Explain the process of making bread from scratch.",
-        "Describe the solar system and its planets.",
-        "How does a microwave oven heat food?",
-        "Why is the sky blue during the day and red at sunset?",
-        "Describe the key events of the French Revolution.",
-        "What caused the fall of the Roman Empire?",
-        "Explain the significance of the printing press.",
-        "How did the Industrial Revolution change society?",
-        "What were the main causes of World War I?",
-        "How does a jet engine produce thrust?",
-        "Explain how bridges are designed to handle stress.",
-        "What is the difference between AC and DC electricity?",
-        "How do solar panels convert sunlight to electricity?",
-        "Describe how a lithium-ion battery works.",
-        "What is the trolley problem in ethics?",
-        "Explain the concept of supply and demand in economics.",
-        "What is cognitive dissonance in psychology?",
-        "Describe the scientific method step by step.",
-        "What is game theory and how is it applied?",
-        "Write a short story about a robot learning to paint.",
-        "Explain the rules of haiku poetry with examples.",
-        "What makes a good persuasive essay?",
-        "How does the internet work from a technical perspective?",
-    ][:num_prompts]
+    # ── Format prompts using chat template (z-lab methodology) ──
+    def format_prompt(turns: list[str]) -> str:
+        """Apply chat template to (potentially multi-turn) prompts."""
+        messages = [{"role": "user", "content": turns[0]}]
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
 
-    print(f"\n{'='*60}")
-    print(f"Benchmark: {len(prompts)} prompts, max_new_tokens={max_new_tokens}")
+    print(f"\n{'='*70}")
+    print(f"Benchmark: {dataset_name} | {len(dataset)} samples | max_new_tokens={max_new_tokens}")
     print(f"Draft model: {draft_repo}")
     print(f"Target model: {target_model}")
     print(f"Temperature: {temperature}, Block size: {block_size}")
-    print(f"{'='*60}\n")
+    print(f"{'='*70}\n")
 
-    # ── Baseline: target-only ──
-    baseline_times = []
-    baseline_tokens = []
-    if not skip_baseline:
-        print("Running BASELINE (target-only autoregressive)...")
-        warmup_ids = tokenizer("Hello", return_tensors="pt")["input_ids"].to(device)
-        generate_baseline(warmup_ids, 16)
-        torch.cuda.synchronize()
-
-        for i, prompt in enumerate(prompts):
-            input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
-            torch.cuda.synchronize()
-            output, elapsed = generate_baseline(input_ids, max_new_tokens)
-            torch.cuda.synchronize()
-            num_new = output.shape[1] - input_ids.shape[1]
-            baseline_times.append(elapsed)
-            baseline_tokens.append(num_new)
-            if (i + 1) % 5 == 0:
-                print(f"  [{i+1}/{len(prompts)}] {num_new} tokens in {elapsed:.2f}s "
-                      f"({num_new/elapsed:.1f} tok/s)")
-
-        avg_baseline_time = sum(baseline_times) / len(baseline_times)
-        avg_baseline_tokens = sum(baseline_tokens) / len(baseline_tokens)
-        avg_baseline_tps = sum(
-            t / e for t, e in zip(baseline_tokens, baseline_times)
-        ) / len(prompts)
-        print(f"\n  Baseline avg: {avg_baseline_tokens:.0f} tokens, "
-              f"{avg_baseline_time:.2f}s, {avg_baseline_tps:.1f} tok/s\n")
-
-    # ── DFlash speculative decoding ──
-    print("Running DFLASH speculative decoding...")
+    # ── Warmup ──
     warmup_ids = tokenizer("Hello", return_tensors="pt")["input_ids"].to(device)
     generate_dflash_spec(warmup_ids, 16)
+    if not skip_baseline:
+        generate_baseline(warmup_ids, 16)
     torch.cuda.synchronize()
 
+    # ── Multi-turn handling for MT-Bench ──
+    is_multiturn = dataset_name == "mt-bench"
+
+    # ── Run benchmark ──
+    baseline_times = []
+    baseline_tokens = []
     dflash_times = []
     dflash_tokens = []
     all_acc_lens = []
 
-    for i, prompt in enumerate(prompts):
-        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
-        torch.cuda.synchronize()
-        output, elapsed, acc_lens = generate_dflash_spec(input_ids, max_new_tokens)
-        torch.cuda.synchronize()
-        num_new = output.shape[1] - input_ids.shape[1]
-        dflash_times.append(elapsed)
-        dflash_tokens.append(num_new)
-        all_acc_lens.extend(acc_lens)
-        avg_tau = sum(acc_lens) / max(len(acc_lens), 1)
-        if (i + 1) % 5 == 0:
-            print(f"  [{i+1}/{len(prompts)}] {num_new} tokens in {elapsed:.2f}s "
-                  f"({num_new/elapsed:.1f} tok/s, τ={avg_tau:.2f})")
+    for idx in range(len(dataset)):
+        instance = dataset[idx]
+        turns = instance["turns"]
 
-    avg_dflash_time = sum(dflash_times) / len(dflash_times)
-    avg_dflash_tokens = sum(dflash_tokens) / len(dflash_tokens)
-    avg_dflash_tps = sum(
-        t / e for t, e in zip(dflash_tokens, dflash_times)
-    ) / len(prompts)
+        messages = []
+        for turn_index, user_content in enumerate(turns):
+            messages.append({"role": "user", "content": user_content})
+            input_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
+
+            # Only benchmark on the last turn for multi-turn (collect metrics)
+            # For single-turn datasets this is always the only turn
+            is_last_turn = (turn_index == len(turns) - 1)
+
+            # Baseline
+            if not skip_baseline and is_last_turn:
+                torch.cuda.synchronize()
+                output, elapsed = generate_baseline(input_ids, max_new_tokens)
+                torch.cuda.synchronize()
+                num_new = output.shape[1] - input_ids.shape[1]
+                baseline_times.append(elapsed)
+                baseline_tokens.append(num_new)
+
+            # DFlash
+            torch.cuda.synchronize()
+            output, elapsed, acc_lens = generate_dflash_spec(input_ids, max_new_tokens)
+            torch.cuda.synchronize()
+            num_new = output.shape[1] - input_ids.shape[1]
+
+            if is_last_turn:
+                dflash_times.append(elapsed)
+                dflash_tokens.append(num_new)
+                all_acc_lens.extend(acc_lens)
+
+            # Decode response and add to conversation for multi-turn
+            if is_multiturn and not is_last_turn:
+                generated_ids = output[0, input_ids.shape[1]:]
+                output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                messages.append({"role": "assistant", "content": output_text})
+
+        if (idx + 1) % max(1, len(dataset) // 10) == 0 or idx == len(dataset) - 1:
+            avg_tau_so_far = sum(all_acc_lens) / max(len(all_acc_lens), 1)
+            print(f"  [{idx+1}/{len(dataset)}] τ={avg_tau_so_far:.2f}")
+
+    # ── Compute metrics ──
     avg_tau = sum(all_acc_lens) / max(len(all_acc_lens), 1)
 
-    print(f"\n  DFlash avg: {avg_dflash_tokens:.0f} tokens, "
-          f"{avg_dflash_time:.2f}s, {avg_dflash_tps:.1f} tok/s, τ={avg_tau:.2f}\n")
-
-    # ── Per-prompt breakdown ──
-    print(f"\n{'='*60}")
-    print("PER-PROMPT BREAKDOWN")
-    print(f"{'='*60}")
-    for i, prompt in enumerate(prompts):
-        tok_s = dflash_tokens[i] / dflash_times[i] if dflash_times[i] > 0 else 0
-        print(f"  [{i+1:2d}] {dflash_tokens[i]:3d} tok, {dflash_times[i]:.2f}s, "
-              f"{tok_s:.1f} tok/s  | {prompt[:60]}")
+    avg_dflash_time = sum(dflash_times) / len(dflash_times) if dflash_times else 0
+    avg_dflash_tokens = sum(dflash_tokens) / len(dflash_tokens) if dflash_tokens else 0
+    avg_dflash_tps = (
+        sum(t / e for t, e in zip(dflash_tokens, dflash_times) if e > 0) / len(dflash_times)
+        if dflash_times else 0
+    )
 
     # ── τ distribution ──
-    print(f"\n{'='*60}")
-    print("τ DISTRIBUTION (per draft cycle)")
-    print(f"{'='*60}")
+    print(f"\n{'='*70}")
+    print(f"τ DISTRIBUTION ({dataset_name})")
+    print(f"{'='*70}")
     if all_acc_lens:
         tau_counts = {}
         for a in all_acc_lens:
             tau_counts[a] = tau_counts.get(a, 0) + 1
         for k in sorted(tau_counts.keys()):
             bar = "█" * int(tau_counts[k] / max(tau_counts.values()) * 40)
-            print(f"  τ={k:2d}: {tau_counts[k]:4d} ({tau_counts[k]/len(all_acc_lens)*100:5.1f}%) {bar}")
-        print(f"  Total cycles: {len(all_acc_lens)}, mean τ={avg_tau:.2f}, "
-              f"median τ={sorted(all_acc_lens)[len(all_acc_lens)//2]}")
+            pct = tau_counts[k] / len(all_acc_lens) * 100
+            print(f"  τ={k:2d}: {tau_counts[k]:4d} ({pct:5.1f}%) {bar}")
+        median_tau = sorted(all_acc_lens)[len(all_acc_lens) // 2]
+        print(f"  Total cycles: {len(all_acc_lens)}, mean τ={avg_tau:.2f}, median τ={median_tau}")
 
     # ── Summary ──
-    print(f"\n{'='*60}")
-    print("RESULTS SUMMARY")
-    print(f"{'='*60}")
-    print(f"  Draft model:  {draft_repo}")
-    print(f"  Target model: {target_model}")
-    print(f"  GPU:          {torch.cuda.get_device_name(0)}")
-    print(f"  Prompts:      {len(prompts)}")
-    print(f"  Max tokens:   {max_new_tokens}")
-    if not skip_baseline:
-        speedup = avg_baseline_time / avg_dflash_time if avg_dflash_time > 0 else 0
-        print(f"  Baseline:     {avg_baseline_tps:.1f} tok/s")
-        print(f"  DFlash:       {avg_dflash_tps:.1f} tok/s (τ={avg_tau:.2f})")
-        print(f"  Speedup:      {speedup:.2f}x")
-    else:
-        print(f"  DFlash:       {avg_dflash_tps:.1f} tok/s (τ={avg_tau:.2f})")
-    print(f"{'='*60}")
+    result = {
+        "dataset": dataset_name,
+        "num_samples": len(dataset),
+        "draft_model": draft_repo,
+        "target_model": target_model,
+        "gpu": torch.cuda.get_device_name(0),
+        "max_new_tokens": max_new_tokens,
+        "block_size": block_size,
+        "temperature": temperature,
+        "avg_acceptance_length": round(avg_tau, 2),
+        "avg_dflash_tps": round(avg_dflash_tps, 1),
+    }
+
+    print(f"\n{'='*70}")
+    print(f"RESULTS: {dataset_name}")
+    print(f"{'='*70}")
+    print(f"  Draft model:           {draft_repo}")
+    print(f"  Target model:          {target_model}")
+    print(f"  GPU:                   {torch.cuda.get_device_name(0)}")
+    print(f"  Samples:               {len(dataset)}")
+    print(f"  Max new tokens:        {max_new_tokens}")
+    print(f"  Block size:            {block_size}")
+    print(f"  Temperature:           {temperature}")
+    print(f"  Acceptance length (τ): {avg_tau:.2f}")
+    print(f"  DFlash throughput:     {avg_dflash_tps:.1f} tok/s")
+
+    if not skip_baseline and baseline_times:
+        avg_baseline_tps = (
+            sum(t / e for t, e in zip(baseline_tokens, baseline_times) if e > 0)
+            / len(baseline_times)
+        )
+        speedup = avg_baseline_tps / avg_dflash_tps if avg_dflash_tps > 0 else 0
+
+        # z-lab method: compute speedup from time-per-token ratio
+        t1_per_tok = np.mean([e / t for e, t in zip(baseline_times, baseline_tokens) if t > 0])
+        tb_per_tok = np.mean([e / t for e, t in zip(dflash_times, dflash_tokens) if t > 0])
+        zlab_speedup = t1_per_tok / tb_per_tok if tb_per_tok > 0 else 0
+
+        print(f"  Baseline throughput:   {avg_baseline_tps:.1f} tok/s")
+        print(f"  Decoding speedup:      {zlab_speedup:.2f}x")
+        result["avg_baseline_tps"] = round(avg_baseline_tps, 1)
+        result["decoding_speedup"] = round(zlab_speedup, 2)
+
+    print(f"{'='*70}")
+
+    # ── z-lab reference comparison ──
+    zlab_tau_ref = {
+        "gsm8k": 3.38, "math500": 4.61, "aime24": 4.12, "aime25": 4.07,
+    }
+    zlab_speedup_ref = {
+        "gsm8k": 5.20, "math500": 6.17, "aime24": 5.91, "aime25": 5.85,
+        "humaneval": 5.20, "mbpp": 4.75, "livecodebench": 5.43,
+        "swe-bench": 2.92, "mt-bench": 2.79, "alpaca": 2.27,
+    }
+    if dataset_name in zlab_tau_ref:
+        ref_tau = zlab_tau_ref[dataset_name]
+        print(f"\n  z-lab reference τ:     {ref_tau:.2f} (ours: {avg_tau:.2f}, "
+              f"gap: {ref_tau - avg_tau:+.2f})")
+    if dataset_name in zlab_speedup_ref:
+        ref_spd = zlab_speedup_ref[dataset_name]
+        print(f"  z-lab reference speed: {ref_spd:.2f}x")
+
+    return result
 
 
 # =============================================================================
@@ -490,32 +619,78 @@ def run_benchmark(
 @app.local_entrypoint()
 def main(
     target_model: str = "Qwen/Qwen3-8B",
-    draft_repo: str = "Xingh3/dflash-qwen3-8b-1epoch",
-    num_prompts: int = 10,
-    max_new_tokens: int = 128,
+    draft_repo: str = "Xingh3/dflash-qwen3-8b-3epoch",
+    datasets: str = "gsm8k,math500",
+    max_new_tokens: int = 2048,
     block_size: int = 16,
     temperature: float = 0.0,
     skip_baseline: bool = False,
+    all_datasets: bool = False,
 ):
-    print("=" * 60)
-    print("  DFlash Inference Benchmark on Modal")
-    print("=" * 60)
-    print(f"  Target model:  {target_model}")
-    print(f"  Draft model:   {draft_repo}")
-    print(f"  GPU:           {BENCHMARK_GPU}")
-    print(f"  Num prompts:   {num_prompts}")
-    print(f"  Max new tokens:{max_new_tokens}")
-    print(f"  Block size:    {block_size}")
-    print(f"  Temperature:   {temperature}")
-    print(f"  Skip baseline: {skip_baseline}")
-    print("=" * 60)
+    import numpy as np
 
-    run_benchmark.remote(
-        target_model=target_model,
-        draft_repo=draft_repo,
-        num_prompts=num_prompts,
-        max_new_tokens=max_new_tokens,
-        block_size=block_size,
-        temperature=temperature,
-        skip_baseline=skip_baseline,
-    )
+    if all_datasets:
+        ds_list = list(ZLAB_BENCHMARKS.keys())
+    else:
+        ds_list = [d.strip() for d in datasets.split(",")]
+
+    print("=" * 70)
+    print("  DFlash Inference Benchmark on Modal (z-lab methodology)")
+    print("=" * 70)
+    print(f"  Target model:   {target_model}")
+    print(f"  Draft model:    {draft_repo}")
+    print(f"  GPU:            {BENCHMARK_GPU}")
+    print(f"  Datasets:       {', '.join(ds_list)}")
+    print(f"  Max new tokens: {max_new_tokens}")
+    print(f"  Block size:     {block_size}")
+    print(f"  Temperature:    {temperature}")
+    print(f"  Skip baseline:  {skip_baseline}")
+    print("=" * 70)
+
+    all_results = []
+
+    for ds_name in ds_list:
+        max_samples = ZLAB_BENCHMARKS.get(ds_name, 128)
+        print(f"\n>>> Running: {ds_name} ({max_samples} samples) <<<\n")
+
+        result = run_benchmark.remote(
+            target_model=target_model,
+            draft_repo=draft_repo,
+            dataset_name=ds_name,
+            max_samples=max_samples,
+            max_new_tokens=max_new_tokens,
+            block_size=block_size,
+            temperature=temperature,
+            skip_baseline=skip_baseline,
+        )
+        all_results.append(result)
+
+    # ── Cross-dataset summary ──
+    print(f"\n\n{'='*70}")
+    print("CROSS-DATASET SUMMARY")
+    print(f"{'='*70}")
+    print(f"{'Dataset':<15} {'τ':>6} {'tok/s':>8} {'Speedup':>8} {'z-lab τ':>8} {'z-lab Spd':>10}")
+    print("-" * 70)
+
+    zlab_tau_ref = {
+        "gsm8k": 3.38, "math500": 4.61, "aime24": 4.12, "aime25": 4.07,
+    }
+    zlab_speedup_ref = {
+        "gsm8k": 5.20, "math500": 6.17, "aime24": 5.91, "aime25": 5.85,
+        "humaneval": 5.20, "mbpp": 4.75, "livecodebench": 5.43,
+        "swe-bench": 2.92, "mt-bench": 2.79, "alpaca": 2.27,
+    }
+
+    for r in all_results:
+        ds = r["dataset"]
+        tau = r.get("avg_acceptance_length", 0)
+        tps = r.get("avg_dflash_tps", 0)
+        spd = r.get("decoding_speedup", 0)
+        ref_tau = zlab_tau_ref.get(ds, "-")
+        ref_spd = zlab_speedup_ref.get(ds, "-")
+        ref_tau_str = f"{ref_tau:.2f}" if isinstance(ref_tau, float) else ref_tau
+        ref_spd_str = f"{ref_spd:.2f}x" if isinstance(ref_spd, float) else ref_spd
+        spd_str = f"{spd:.2f}x" if spd else "-"
+        print(f"{ds:<15} {tau:>6.2f} {tps:>8.1f} {spd_str:>8} {ref_tau_str:>8} {ref_spd_str:>10}")
+
+    print(f"{'='*70}")
