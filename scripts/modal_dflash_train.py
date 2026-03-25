@@ -25,7 +25,7 @@ Setup (one-time):
     modal profile activate doordash
     modal secret create huggingface-secret HF_TOKEN=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
     modal secret create xingh3-hf-write HF_WRITE_TOKEN=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  # personal write token for HF uploads
-    modal secret create wandb-secret WANDB_API_KEY=<key>   # optional
+    modal secret create wandb-secret WANDB_API_KEY=<key>   # get key from https://wandb.ai/authorize
 
 Usage:
     modal run scripts/modal_dflash_train.py                                    # 8x H100, 200-step test
@@ -390,7 +390,7 @@ def _convert_and_upload_hf(
             from huggingface_hub import HfApi
             write_token = os.environ.get("HF_WRITE_TOKEN") or os.environ.get("HF_TOKEN")
             api = HfApi(token=write_token)
-            api.create_repo(hf_repo, exist_ok=True, private=True)
+            api.create_repo(hf_repo, exist_ok=True, private=False)
             api.upload_folder(
                 folder_path=hf_output,
                 repo_id=hf_repo,
@@ -421,6 +421,7 @@ _common_kwargs = dict(
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("xingh3-hf-write"),
+        modal.Secret.from_name("wandb-secret"),
     ],
 )
 
@@ -649,6 +650,7 @@ def _train_impl(
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("xingh3-hf-write"),
+        modal.Secret.from_name("wandb-secret"),
     ],
 )
 def convert_checkpoint(
@@ -703,7 +705,7 @@ def convert_checkpoint(
     from huggingface_hub import HfApi
     write_token = os.environ.get("HF_WRITE_TOKEN") or os.environ.get("HF_TOKEN")
     api = HfApi(token=write_token)
-    api.create_repo(hf_repo, exist_ok=True, private=True)
+    api.create_repo(hf_repo, exist_ok=True, private=False)
     api.upload_folder(
         folder_path=hf_output,
         repo_id=hf_repo,
