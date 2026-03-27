@@ -23,9 +23,7 @@ For 1-2 GPU HF mode, use modal_dflash_train_hf.py instead.
 Setup (one-time):
     modal token set --token-id ak-l6eYjquYvG1smlyMfH0EKl --token-secret as-eJoVAHKgk0J9iRxNgMNPRJ --profile=doordash
     modal profile activate doordash
-    modal secret create huggingface-secret HF_TOKEN=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
-    modal secret create xingh3-hf-write HF_WRITE_TOKEN=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  # personal write token for HF uploads
-    modal secret create wandb-secret WANDB_API_KEY=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  # get key from https://wandb.ai/authorize
+    bash scripts/setup_modal_secrets.sh --env sandbox   # creates xingh3-hf-write + wandb-secret
 
 Usage:
     modal run scripts/modal_dflash_train.py                                    # 8x H100, 200-step test
@@ -89,6 +87,7 @@ import modal
 
 TORCHSPEC_REPO = "https://github.com/zhubohao911/TorchSpec.git"
 TORCHSPEC_BRANCH = "feature/dflash-training"
+TORCHSPEC_PIN_COMMIT = "96f0f5b"  # bump to bust Modal image cache
 SGLANG_COMMIT = "0f2df9370a1de1b4fb11b071d39ab3ce2287a350"
 SGLANG_PATCH_VERSION = "v0.5.8.post1"
 
@@ -132,7 +131,7 @@ base_image = (
     )
     .run_commands(
         f"git clone {TORCHSPEC_REPO} {REPO_DIR}",
-        f"cd {REPO_DIR} && git checkout {TORCHSPEC_BRANCH}",
+        f"cd {REPO_DIR} && git checkout {TORCHSPEC_BRANCH} && git reset --hard {TORCHSPEC_PIN_COMMIT}",
     )
     .pip_install(
         "huggingface_hub[hf_transfer]",
@@ -271,7 +270,8 @@ def _run_training(
     num_epochs: Optional[int],
     gpu_overrides: list[str],
     wandb_project: Optional[str],
-    extra_args: list[str],
+    wandb_team: Optional[str] = None,
+    extra_args: list[str] = [],
 ):
     import os
     import time
@@ -286,6 +286,8 @@ def _run_training(
             f"logging.wandb_project={wandb_project or 'dflash-vs-eagle3'}",
             f"logging.wandb_run_id={run_id}",
         ]
+        if wandb_team:
+            wandb_args.append(f"logging.wandb_team={wandb_team}")
 
     epoch_args = []
     if num_epochs is not None:
@@ -421,7 +423,6 @@ _common_kwargs = dict(
     timeout=24 * 3600,
     retries=modal.Retries(initial_delay=0.0, max_retries=3),
     secrets=[
-        modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("xingh3-hf-write"),
         modal.Secret.from_name("wandb-secret"),
     ],
@@ -436,15 +437,16 @@ def train_sglang(
     run_eagle3: bool,
     run_dflash: bool,
     wandb_project: Optional[str],
-    dataset_path: Optional[str],
-    dataset_size: int,
+    wandb_team: Optional[str] = None,
+    dataset_path: Optional[str] = None,
+    dataset_size: int = 50000,
     extra_overrides: Optional[str] = None,
     hf_repo: Optional[str] = None,
 ):
     """Training entry point for 4+ GPU configs (SGLang inference backend)."""
     _train_impl(
         gpu_count, max_steps, num_epochs, run_eagle3, run_dflash,
-        wandb_project, dataset_path, dataset_size, extra_overrides, hf_repo,
+        wandb_project, wandb_team, dataset_path, dataset_size, extra_overrides, hf_repo,
     )
 
 
@@ -517,6 +519,7 @@ def _train_impl(
     run_eagle3: bool,
     run_dflash: bool,
     wandb_project: Optional[str],
+    wandb_team: Optional[str],
     dataset_path: Optional[str],
     dataset_size: int,
     extra_overrides: Optional[str] = None,
@@ -538,6 +541,25 @@ def _train_impl(
     _probe_rdma()
 
     os.environ["HF_HOME"] = HF_CACHE_DIR
+    hf_token = os.environ.get("HF_WRITE_TOKEN")
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+        os.makedirs(HF_CACHE_DIR, exist_ok=True)
+        for token_file in [
+            os.path.join(HF_CACHE_DIR, "token"),
+            os.path.expanduser("~/.huggingface/token"),
+        ]:
+            os.makedirs(os.path.dirname(token_file), exist_ok=True)
+            with open(token_file, "w") as f:
+                f.write(hf_token)
+        stored_dir = os.path.join(HF_CACHE_DIR, "stored_tokens")
+        if os.path.isdir(stored_dir):
+            shutil.rmtree(stored_dir)
+            print("  Cleared stale stored_tokens dir")
+        print(f"  HF token set (HF_WRITE_TOKEN -> env + {HF_CACHE_DIR}/token)")
+    else:
+        print("  WARNING: HF_WRITE_TOKEN not set — HF downloads may fail")
     os.environ.setdefault(
         "CUDA_VISIBLE_DEVICES", ",".join(str(i) for i in range(detected))
     )
@@ -588,6 +610,7 @@ def _train_impl(
             num_epochs=num_epochs,
             gpu_overrides=cfg.overrides,
             wandb_project=wandb_project,
+            wandb_team=wandb_team,
             extra_args=dataset_overrides + user_overrides,
         )
 
@@ -600,6 +623,7 @@ def _train_impl(
             num_epochs=num_epochs,
             gpu_overrides=cfg.overrides,
             wandb_project=wandb_project,
+            wandb_team=wandb_team,
             extra_args=dataset_overrides + user_overrides,
         )
 
@@ -650,7 +674,6 @@ def _train_impl(
     volumes={HF_CACHE_DIR: hf_cache_vol, OUTPUTS_DIR: outputs_vol},
     timeout=3600,
     secrets=[
-        modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("xingh3-hf-write"),
         modal.Secret.from_name("wandb-secret"),
     ],
@@ -730,6 +753,7 @@ def main(
     run_eagle3: bool = False,
     run_dflash: bool = True,
     wandb_project: Optional[str] = None,
+    wandb_team: Optional[str] = None,
     dataset_path: Optional[str] = None,
     dataset_size: int = 50000,
     extra_overrides: str = "",
@@ -799,6 +823,7 @@ def main(
         run_eagle3=run_eagle3,
         run_dflash=run_dflash,
         wandb_project=wandb_project,
+        wandb_team=wandb_team,
         dataset_path=dataset_path,
         dataset_size=dataset_size,
         extra_overrides=extra_overrides or None,

@@ -30,7 +30,7 @@ Usage:
     # Skip baseline (only DFlash, fastest)
     modal run --env sandbox scripts/modal_dflash_benchmark_sglang.py --skip-baseline
 
-    # Custom draft model
+    # Custom draft model (HuggingFace repo or Modal volume path)
     modal run --env sandbox scripts/modal_dflash_benchmark_sglang.py \
         --draft-repo Xingh3/dflash-qwen3-8b-1epoch
 """
@@ -84,6 +84,9 @@ ZLAB_BENCHMARKS_QUICK = {
 app = modal.App("torchspec-dflash-benchmark-sglang")
 
 hf_cache_vol = modal.Volume.from_name("hf-cache", create_if_missing=True)
+outputs_vol = modal.Volume.from_name("torchspec-outputs", create_if_missing=False)
+
+OUTPUTS_DIR = "/workspace/outputs"
 
 # =============================================================================
 # Container image — same SGLang image as training script
@@ -265,7 +268,7 @@ def load_benchmark_dataset(data_name: str, max_samples: int | None = None):
 @app.function(
     image=sglang_image,
     gpu=BENCHMARK_GPU,
-    volumes={HF_CACHE_DIR: hf_cache_vol},
+    volumes={HF_CACHE_DIR: hf_cache_vol, OUTPUTS_DIR: outputs_vol},
     timeout=8 * 3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -306,32 +309,40 @@ def run_benchmark(
         SGLang's DFlash support (PR #16818) expects model_type="qwen3" with
         a nested dflash_config. Our TorchSpec conversion produces model_type="dflash".
         Also copies z-lab's custom modeling files (dflash.py, utils.py) needed by auto_map.
+        Accepts a local path (e.g. /workspace/outputs/...) or a HuggingFace repo id.
         Returns local path to the patched model.
         """
         import shutil
         from huggingface_hub import snapshot_download, hf_hub_download
-        
+
+        is_local = repo_id.startswith("/") and os.path.isdir(repo_id)
         local_dir = f"/tmp/dflash_model_{repo_id.replace('/', '_')}"
-        
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                print(f"Downloading draft model {repo_id} (attempt {attempt + 1}/{max_retries})...")
-                cached_dir = snapshot_download(repo_id=repo_id)
-                if os.path.exists(local_dir):
-                    shutil.rmtree(local_dir)
-                shutil.copytree(cached_dir, local_dir, symlinks=False)
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt * 5
-                    print(f"  Download failed: {e.__class__.__name__}: {e}")
-                    print(f"  Retrying in {wait}s...")
-                    time.sleep(wait)
-                else:
-                    raise RuntimeError(
-                        f"Failed to download {repo_id} after {max_retries} attempts: {e}"
-                    ) from e
+
+        if is_local:
+            print(f"Copying draft model from volume: {repo_id}")
+            if os.path.exists(local_dir):
+                shutil.rmtree(local_dir)
+            shutil.copytree(repo_id, local_dir, symlinks=False)
+        else:
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    print(f"Downloading draft model {repo_id} (attempt {attempt + 1}/{max_retries})...")
+                    cached_dir = snapshot_download(repo_id=repo_id)
+                    if os.path.exists(local_dir):
+                        shutil.rmtree(local_dir)
+                    shutil.copytree(cached_dir, local_dir, symlinks=False)
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt * 5
+                        print(f"  Download failed: {e.__class__.__name__}: {e}")
+                        print(f"  Retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        raise RuntimeError(
+                            f"Failed to download {repo_id} after {max_retries} attempts: {e}"
+                        ) from e
         
         config_path = os.path.join(local_dir, "config.json")
         with open(config_path) as f:
@@ -789,7 +800,7 @@ def run_benchmark(
 @app.local_entrypoint()
 def main(
     target_model: str = "Qwen/Qwen3-8B",
-    draft_repo: str = "Xingh3/dflash-qwen3-8b-3epoch",
+    draft_repo: str = "/workspace/outputs/dflash-qwen3-8b/hf_model",
     datasets: str = "gsm8k,math500",
     max_new_tokens: int = 2048,
     temperature: float = 0.0,
