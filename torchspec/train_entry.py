@@ -42,7 +42,7 @@ from torchspec.controller import (
     run_training_loop,
     setup_async_training_with_engines,
 )
-from torchspec.inference import prepare_inference_engines
+from torchspec.inference.factory import prepare_inference_engines
 from torchspec.ray.placement_group import (
     allocate_train_group,
     create_placement_groups,
