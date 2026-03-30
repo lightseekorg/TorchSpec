@@ -75,7 +75,9 @@ class VllmConfig:
     Any additional vLLM engine kwargs can be supplied via ``extra_args``
     and will be forwarded as-is.
 
-    Uses vLLM's extract_hidden_states speculative config for hidden states retrieval.
+    Uses vLLM's ``extract_hidden_states`` speculative method with a
+    ``MooncakeHiddenStatesConnector`` KV Connector for hidden states
+    retrieval (requires vLLM >= 0.18.0).
     """
 
     # Parallelism
@@ -97,13 +99,6 @@ class VllmConfig:
     dist_timeout: int = 60
     init_timeout: int = 300
 
-    # Hidden states extraction
-    num_speculative_tokens: int = 1
-
-    # Use worker extension for hidden states capture (new implementation)
-    # If False, falls back to LLM class with speculative_config
-    use_worker_extension: bool = True
-
     # Passthrough: forwarded as-is to vLLM LLM.
     # Use this for any vLLM kwarg that TorchSpec doesn't need to
     # inspect (e.g. quantization, max_model_len, trust_remote_code, ...).
@@ -120,9 +115,20 @@ class InferenceConfig:
     inference_num_gpus: Optional[int] = None
     inference_num_gpus_per_engine: int = 1
     inference_num_gpus_per_node: int = 8
+    last_hidden_states_prenorm: Optional[bool] = None
     max_sample_pool_size: int = 0
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     vllm: VllmConfig = field(default_factory=VllmConfig)
+
+    def resolve_last_hidden_states_prenorm(self) -> bool:
+        """Whether last_hidden_states from the engine are pre-norm.
+
+        vLLM's extract_hidden_states connector can only capture raw layer
+        outputs (pre-norm), while sglang and hf provide post-norm outputs.
+        """
+        if self.last_hidden_states_prenorm is not None:
+            return self.last_hidden_states_prenorm
+        return self.inference_engine_type == "vllm"
 
 
 @dataclass

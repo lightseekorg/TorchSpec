@@ -75,7 +75,9 @@ def _is_save_interval_step(step: int, interval: int) -> bool:
     return interval > 0 and step % interval == 0
 
 
-def _safe_training_cleanup(args, inference_manager, inference_future) -> None:
+def _safe_training_cleanup(
+    args, inference_manager, inference_future, inference_engines=None
+) -> None:
     """Best-effort teardown for inference manager and mooncake master actor."""
     if inference_manager is not None:
         try:
@@ -89,6 +91,20 @@ def _safe_training_cleanup(args, inference_manager, inference_future) -> None:
                 logger.warning(
                     f"Inference manager run loop exited with error during cleanup: {exc}"
                 )
+
+    if inference_engines:
+        logger.info(f"Shutting down {len(inference_engines)} inference engine(s)...")
+        shutdown_refs = []
+        for engine in inference_engines:
+            try:
+                shutdown_refs.append(engine.shutdown.remote())
+            except Exception as exc:
+                logger.warning(f"Failed to initiate engine shutdown: {exc}")
+        for ref in shutdown_refs:
+            try:
+                ray.get(ref, timeout=30)
+            except Exception as exc:
+                logger.warning(f"Engine shutdown timed out or failed: {exc}")
 
     mooncake_master_actor = getattr(args, "_mooncake_master_actor", None)
     if mooncake_master_actor is not None:
@@ -401,4 +417,5 @@ def run_training_loop(
             args=args,
             inference_manager=inference_manager,
             inference_future=inference_future,
+            inference_engines=inference_engines,
         )

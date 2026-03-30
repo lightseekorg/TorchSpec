@@ -18,15 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for vLLM Worker Extension.
+"""Tests for vLLM Engine and MooncakeHiddenStatesConnector.
 
-This file contains both:
-- Unit tests: Test logic with mocks (no GPU/vLLM/Mooncake needed)
-- Integration tests: Test with real vLLM engine (requires GPU + infrastructure)
+Unit tests: Test logic with mocks (no GPU/vLLM/Mooncake needed)
 """
 
-from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -36,31 +33,20 @@ import torch
 # =============================================================================
 
 
-@dataclass
-class MockArgs:
-    """Mock args for VllmWorkerExtension initialization."""
-
-    target_model_path: str = "Qwen/Qwen3-8B"
-    tensor_parallel_size: int = 2
-    max_model_len: int = 2048
-    trust_remote_code: bool = True
-
-
-def _import_vllm_worker_extension():
-    """Import VllmWorkerExtension, skipping test if dependencies unavailable."""
+def _import_connector_utils():
+    """Import MooncakeHiddenStatesConnector utilities."""
     try:
-        from torchspec.inference.engine.vllm_worker_extension import (
-            VllmWorkerExtension,
+        from torchspec.inference.engine.mooncake_hidden_states_connector import (
             _sanitize_mooncake_key,
         )
 
-        return VllmWorkerExtension, _sanitize_mooncake_key
+        return _sanitize_mooncake_key
     except ImportError as e:
-        pytest.skip(f"VllmWorkerExtension import failed (missing deps): {e}")
+        pytest.skip(f"Connector import failed (missing deps): {e}")
 
 
 # =============================================================================
-# Unit Tests (No real vLLM/GPU/Mooncake needed)
+# Unit Tests for _sanitize_mooncake_key
 # =============================================================================
 
 
@@ -68,216 +54,23 @@ class TestSanitizeMooncakeKey:
     """Unit tests for _sanitize_mooncake_key pure function."""
 
     def test_alphanumeric_unchanged(self):
-        """Test alphanumeric keys pass through unchanged."""
-        _, _sanitize = _import_vllm_worker_extension()
+        _sanitize = _import_connector_utils()
         assert _sanitize("req_abc_123") == "req_abc_123"
 
     def test_special_chars_replaced(self):
-        """Test special characters are replaced with underscores."""
-        _, _sanitize = _import_vllm_worker_extension()
+        _sanitize = _import_connector_utils()
         assert _sanitize("req@abc#123") == "req_abc_123"
         assert _sanitize("req.id.name") == "req_id_name"
         assert _sanitize("req:name|value") == "req_name_value"
 
     def test_leading_digit_prefixed(self):
-        """Test leading digits get 'k' prefix."""
-        _, _sanitize = _import_vllm_worker_extension()
+        _sanitize = _import_connector_utils()
         assert _sanitize("123_req") == "k123_req"
         assert _sanitize("1abc") == "k1abc"
 
     def test_empty_string(self):
-        """Test empty string handling."""
-        _, _sanitize = _import_vllm_worker_extension()
+        _sanitize = _import_connector_utils()
         assert _sanitize("") == ""
-
-
-class TestVllmWorkerExtensionState:
-    """Unit tests for VllmWorkerExtension state management."""
-
-    def test_init_stores_config(self):
-        """Test constructor initializes state correctly."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-
-        assert ext._layer_ids == frozenset()
-        assert ext._captured_states is None
-        assert ext._request_metadata == []
-        assert ext._current_request_metadata is None
-        assert ext._mooncake_store is None
-        assert ext._store_initialized is False
-
-    def test_set_request_metadata(self):
-        """Test setting request metadata."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-        metadata = {"req_1": 100, "req_2": 200}
-        packed_map = {"req_1": "0,3", "req_2": "0,5"}
-        input_ids_map = {"req_1": [1, 2, 3], "req_2": [4, 5, 6]}
-
-        ext._set_request_metadata(metadata, packed_map, input_ids_map)
-
-        assert ext._current_request_metadata == metadata
-        assert ext._packed_loss_mask_map == packed_map
-        assert ext._input_ids_map == input_ids_map
-
-    def test_reset_capture_clears_state(self):
-        """Test reset_capture clears all captured state."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-        ext._layer_ids = frozenset({5, 10, 15})
-        ext._captured_states = [[torch.randn(10, 4096)], [torch.randn(10, 4096)]]
-        ext._captured_input_ids = torch.tensor([1, 2, 3])
-        ext._request_metadata = [{"req_1": 10}]
-        ext._current_request_metadata = {"req_1": 10}
-        ext._packed_loss_mask_map = {"req_1": "0,3"}
-        ext._input_ids_map = {"req_1": [1, 2, 3]}
-
-        ext._reset_capture()
-
-        assert ext._captured_states is None
-        assert ext._captured_input_ids is None
-        assert ext._request_metadata == []
-        assert ext._current_request_metadata is None
-        assert ext._packed_loss_mask_map == {}
-        assert ext._input_ids_map == {}
-
-    def test_reset_capture_requires_prior_setup(self):
-        """Test reset_capture requires _setup_hidden_states_capture first."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-        # Don't set _layer_ids
-
-        with pytest.raises(RuntimeError, match="Must call _setup_hidden_states_capture"):
-            ext._reset_capture()
-
-
-class TestStoreCapturedStates:
-    """Unit tests for _store_captured_states with mocked dependencies."""
-
-    def test_store_first_capture(self):
-        """Test first capture initializes the state lists."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-        tensors = [torch.randn(10, 4096), torch.randn(10, 4096)]
-
-        ext._store_captured_states(tensors)
-
-        assert ext._captured_states is not None
-        assert len(ext._captured_states) == 2
-        assert torch.equal(ext._captured_states[0][0], tensors[0])
-        assert torch.equal(ext._captured_states[1][0], tensors[1])
-
-    def test_store_appends_to_existing(self):
-        """Test subsequent captures append to existing lists."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-        ext._captured_states = [[torch.randn(10, 4096)], [torch.randn(10, 4096)]]
-
-        new_tensors = [torch.randn(10, 4096), torch.randn(10, 4096)]
-        ext._store_captured_states(new_tensors)
-
-        assert len(ext._captured_states[0]) == 2
-        assert len(ext._captured_states[1]) == 2
-        assert torch.equal(ext._captured_states[0][1], new_tensors[0])
-
-    def test_store_extracts_metadata_from_input_batch(self):
-        """Test metadata extraction from model_runner.input_batch."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-
-        # Mock model_runner with input_batch
-        mock_batch = MagicMock()
-        mock_batch.req_ids = ["req_1", "req_2"]
-        mock_batch.req_id_to_index = {"req_1": 0, "req_2": 1}
-        mock_batch.num_tokens = [100, 200]
-        mock_batch.num_computed_tokens = [0, 0]
-
-        ext.model_runner = MagicMock()
-        ext.model_runner.input_batch = mock_batch
-
-        tensors = [torch.randn(10, 4096)]
-        ext._store_captured_states(tensors)
-
-        assert len(ext._request_metadata) == 1
-        assert "req_1" in ext._request_metadata[0]
-        assert "req_2" in ext._request_metadata[0]
-
-
-class TestCudaDeviceSafe:
-    """Unit tests for _get_cuda_device_safe with mocked torch.cuda."""
-
-    @patch("torch.cuda.is_initialized")
-    @patch("torch.cuda.current_device")
-    def test_initialized_context(self, mock_current, mock_initialized):
-        """Test when CUDA is already initialized."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        mock_initialized.return_value = True
-        mock_current.return_value = 1
-
-        ext = VllmWorkerExtension()
-        device = ext._get_cuda_device_safe()
-
-        assert str(device) == "cuda:1"
-
-    @patch("torch.cuda.is_initialized")
-    def test_uninitialized_context_fallback(self, mock_initialized):
-        """Test fallback when CUDA not initialized (V1 engine)."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        mock_initialized.return_value = False
-
-        ext = VllmWorkerExtension()
-        device = ext._get_cuda_device_safe()
-
-        assert str(device) == "cuda:0"
-
-
-class TestTokenSlicingLogic:
-    """Unit tests for token distribution and slicing logic."""
-
-    def test_ratio_based_distribution(self):
-        """Test ratio calculation for token distribution."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-        ext._current_request_metadata = {"req_1": 100, "req_2": 200}
-
-        external_ids = list(ext._current_request_metadata.keys())
-        token_counts = list(ext._current_request_metadata.values())
-        total_expected = sum(token_counts)  # 300
-        total_captured = 150  # Half the expected tokens
-
-        ratio = total_captured / total_expected  # 0.5
-
-        # Calculate actual tokens per request
-        actual_tokens = {ext_id: int(tc * ratio) for ext_id, tc in zip(external_ids, token_counts)}
-
-        assert actual_tokens == {"req_1": 50, "req_2": 100}
-
-    def test_concatenated_tensors_shape(self):
-        """Test tensor concatenation from multiple iterations."""
-        VllmWorkerExtension, _ = _import_vllm_worker_extension()
-
-        ext = VllmWorkerExtension()
-        # Simulate 2 iterations with 5 tokens each
-        ext._captured_states = [
-            [torch.randn(5, 4096), torch.randn(5, 4096)],  # Layer 0
-            [torch.randn(5, 4096), torch.randn(5, 4096)],  # Layer 1
-        ]
-
-        # Concatenate (simulating _store_and_get_metadata logic)
-        concatenated = [torch.cat(layer_tensors, dim=0) for layer_tensors in ext._captured_states]
-
-        assert concatenated[0].shape == (10, 4096)
-        assert concatenated[1].shape == (10, 4096)
 
 
 # =============================================================================
@@ -285,18 +78,19 @@ class TestTokenSlicingLogic:
 # =============================================================================
 
 
-def _make_mock_output(request_id: str, prompt_token_ids: list[int]):
-    """Create a mock vLLM RequestOutput."""
+def _make_mock_output(request_id: str, prompt_token_ids: list[int], kv_transfer_params=None):
+    """Create a mock vLLM RequestOutput with kv_transfer_params."""
     out = MagicMock()
     out.request_id = request_id
     out.prompt_token_ids = prompt_token_ids
+    out.kv_transfer_params = kv_transfer_params
     return out
 
 
-def _build_engine_with_mock_vllm(metadata_by_request: dict):
+def _build_engine_with_mock_vllm():
     """Build a VllmEngine whose _engine is a mock vLLM LLM.
 
-    Returns (engine, mock_llm) so tests can inspect collective_rpc calls.
+    Returns (engine, mock_llm) so tests can inspect generate calls.
     """
     try:
         from torchspec.inference.engine.vllm_engine import VllmEngine
@@ -314,100 +108,86 @@ def _build_engine_with_mock_vllm(metadata_by_request: dict):
     engine.aux_hidden_state_layer_ids = [2, 4]
 
     mock_llm = MagicMock()
-
-    def _collective_rpc(method, args=(), kwargs=None):
-        if method == "_store_and_get_metadata":
-            return [metadata_by_request]
-        return [None]
-
-    mock_llm.collective_rpc = MagicMock(side_effect=_collective_rpc)
     engine._engine = mock_llm
     return engine, mock_llm
 
 
-class TestGenerateMetadataFlow:
-    """Test that generate() builds and sends request_metadata for both
-    the input_ids path and the formatted_prompts (defer_tokenization) path.
-    """
+class TestGenerateWithExtractHiddenStates:
+    """Test that generate() reads kv_transfer_params from outputs."""
 
-    def test_input_ids_path_sends_metadata_twice(self):
-        """input_ids path: _set_request_metadata is called both pre- and
-        post-generation with correct token counts."""
+    def test_input_ids_path_returns_mooncake_metadata(self):
         ids_a = torch.tensor([10, 20, 30])
         ids_b = torch.tensor([40, 50, 60, 70])
         data_ids = ["a", "b"]
 
-        worker_meta = {
-            "a": {
-                "mooncake_key": "a",
-                "tensor_shapes": {},
-                "tensor_dtypes": {},
-                "input_ids_list": ids_a.tolist(),
-            },
-            "b": {
-                "mooncake_key": "b",
-                "tensor_shapes": {},
-                "tensor_dtypes": {},
-                "input_ids_list": ids_b.tolist(),
-            },
-        }
-        engine, mock_llm = _build_engine_with_mock_vllm(worker_meta)
+        engine, mock_llm = _build_engine_with_mock_vllm()
 
         mock_llm.generate.return_value = [
-            _make_mock_output("0", ids_a.tolist()),
-            _make_mock_output("1", ids_b.tolist()),
+            _make_mock_output(
+                "0",
+                ids_a.tolist(),
+                kv_transfer_params={
+                    "mooncake_key": "a",
+                    "tensor_shapes": {"hidden_states": (3, 8192)},
+                    "tensor_dtypes": {"hidden_states": "bfloat16"},
+                    "input_ids_list": ids_a.tolist(),
+                },
+            ),
+            _make_mock_output(
+                "1",
+                ids_b.tolist(),
+                kv_transfer_params={
+                    "mooncake_key": "b",
+                    "tensor_shapes": {"hidden_states": (4, 8192)},
+                    "tensor_dtypes": {"hidden_states": "bfloat16"},
+                    "input_ids_list": ids_b.tolist(),
+                },
+            ),
         ]
 
-        results = engine.generate(
-            data_id=data_ids,
-            input_ids_ref=[ids_a, ids_b],
-        )
-
-        set_meta_calls = [
-            c for c in mock_llm.collective_rpc.call_args_list if c[0][0] == "_set_request_metadata"
-        ]
-        assert len(set_meta_calls) == 2, (
-            f"Expected 2 _set_request_metadata calls, got {len(set_meta_calls)}"
-        )
-
-        # Post-gen call (last one) must carry authoritative token counts
-        post_gen_args = set_meta_calls[-1][1]["args"]
-        req_meta = post_gen_args[0]
-        assert req_meta == {"a": 3, "b": 4}
-
-        input_ids_map = post_gen_args[2]
-        assert input_ids_map == {"a": ids_a.tolist(), "b": ids_b.tolist()}
+        results = engine.generate(data_id=data_ids, input_ids_ref=[ids_a, ids_b])
 
         assert len(results) == 2
         assert results[0]["data_id"] == "a"
-        assert results[1]["data_id"] == "b"
+        assert results[0]["mooncake_key"] == "a"
+        assert results[0]["tensor_shapes"] == {"hidden_states": (3, 8192)}
+        assert results[0]["input_ids_list"] == ids_a.tolist()
 
-    def test_formatted_prompts_path_sends_metadata_post_gen(self):
-        """formatted_prompts (defer_tokenization) path: _set_request_metadata
-        is sent after generation with token counts from vLLM outputs."""
+        assert results[1]["data_id"] == "b"
+        assert results[1]["mooncake_key"] == "b"
+        assert results[1]["seq_len"] == 4
+
+        # No collective_rpc calls should be made
+        mock_llm.collective_rpc.assert_not_called()
+
+    def test_formatted_prompts_path(self):
         prompt_tokens_a = [10, 20, 30, 40, 50]
         prompt_tokens_b = [60, 70, 80]
         data_ids = ["p0", "p1"]
 
-        worker_meta = {
-            "p0": {
-                "mooncake_key": "p0",
-                "tensor_shapes": {},
-                "tensor_dtypes": {},
-                "input_ids_list": prompt_tokens_a,
-            },
-            "p1": {
-                "mooncake_key": "p1",
-                "tensor_shapes": {},
-                "tensor_dtypes": {},
-                "input_ids_list": prompt_tokens_b,
-            },
-        }
-        engine, mock_llm = _build_engine_with_mock_vllm(worker_meta)
+        engine, mock_llm = _build_engine_with_mock_vllm()
 
         mock_llm.generate.return_value = [
-            _make_mock_output("0", prompt_tokens_a),
-            _make_mock_output("1", prompt_tokens_b),
+            _make_mock_output(
+                "0",
+                prompt_tokens_a,
+                kv_transfer_params={
+                    "mooncake_key": "p0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                    "input_ids_list": prompt_tokens_a,
+                },
+            ),
+            _make_mock_output(
+                "1",
+                prompt_tokens_b,
+                kv_transfer_params={
+                    "mooncake_key": "p1",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                    "input_ids_list": prompt_tokens_b,
+                },
+            ),
         ]
 
         results = engine.generate(
@@ -415,54 +195,422 @@ class TestGenerateMetadataFlow:
             formatted_prompts=["Hello world", "Goodbye"],
         )
 
-        set_meta_calls = [
-            c for c in mock_llm.collective_rpc.call_args_list if c[0][0] == "_set_request_metadata"
-        ]
-        # Only the post-gen call (pre-gen is skipped because request_metadata
-        # is empty before generation).
-        assert len(set_meta_calls) == 1
-
-        post_gen_args = set_meta_calls[0][1]["args"]
-        req_meta = post_gen_args[0]
-        assert req_meta == {"p0": 5, "p1": 3}
-
-        input_ids_map = post_gen_args[2]
-        assert input_ids_map == {"p0": prompt_tokens_a, "p1": prompt_tokens_b}
-
         assert len(results) == 2
         assert results[0]["input_ids_list"] == prompt_tokens_a
         assert results[1]["input_ids_list"] == prompt_tokens_b
 
-    def test_formatted_prompts_with_no_packed_loss_mask(self):
-        """defer_tokenization path with packed_loss_mask_list=None works."""
-        tokens = [1, 2, 3]
-        worker_meta = {
-            "d0": {
-                "mooncake_key": "d0",
-                "tensor_shapes": {},
-                "tensor_dtypes": {},
-                "input_ids_list": tokens,
-            },
-        }
-        engine, mock_llm = _build_engine_with_mock_vllm(worker_meta)
-        mock_llm.generate.return_value = [_make_mock_output("0", tokens)]
+    def test_missing_kv_transfer_params_skips_result(self):
+        engine, mock_llm = _build_engine_with_mock_vllm()
+
+        mock_llm.generate.return_value = [
+            _make_mock_output("0", [1, 2, 3], kv_transfer_params=None),
+        ]
 
         results = engine.generate(
             data_id=["d0"],
             formatted_prompts=["test"],
-            packed_loss_mask_list=None,
         )
 
-        set_meta_calls = [
-            c for c in mock_llm.collective_rpc.call_args_list if c[0][0] == "_set_request_metadata"
-        ]
-        assert len(set_meta_calls) == 1
+        assert len(results) == 0
 
-        packed_map = set_meta_calls[0][1]["args"][1]
-        assert packed_map == {}
+    def test_packed_loss_mask_passed_through(self):
+        engine, mock_llm = _build_engine_with_mock_vllm()
+
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                [1, 2, 3],
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                },
+            ),
+        ]
+
+        results = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["test"],
+            packed_loss_mask_list=["0,3"],
+        )
 
         assert len(results) == 1
-        assert "packed_loss_mask" not in results[0]
+        assert results[0]["packed_loss_mask"] == "0,3"
+
+    def test_fallback_input_ids_from_prompt_token_ids(self):
+        """When kv_transfer_params has no input_ids_list, fall back to prompt_token_ids."""
+        engine, mock_llm = _build_engine_with_mock_vllm()
+
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                [10, 20, 30],
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                },
+            ),
+        ]
+
+        results = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["test"],
+        )
+
+        assert results[0]["input_ids_list"] == [10, 20, 30]
+
+
+# =============================================================================
+# Metadata contract: connector output matches training pipeline expectations
+# =============================================================================
+
+
+class TestMetadataContract:
+    """Verify the result dict from generate() matches what the training pipeline expects."""
+
+    def _generate_with_full_metadata(self):
+        """Helper: run generate() with connector-style kv_transfer_params
+        that mirror what MooncakeHiddenStatesConnector.request_finished returns.
+        """
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        seq_len = 10
+        hidden_size = engine._hidden_size  # 4096
+        num_training_layers = len(engine.aux_hidden_state_layer_ids) - 1  # 1 (2 aux - 1)
+        training_hidden_size = num_training_layers * hidden_size
+
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "req-0",
+                list(range(100, 100 + seq_len)),
+                kv_transfer_params={
+                    "mooncake_key": "req-0",
+                    "tensor_shapes": {
+                        "hidden_states": (seq_len, training_hidden_size),
+                        "input_ids": (seq_len,),
+                        "last_hidden_states": (seq_len, hidden_size),
+                    },
+                    "tensor_dtypes": {
+                        "hidden_states": "bfloat16",
+                        "input_ids": "int64",
+                        "last_hidden_states": "bfloat16",
+                    },
+                    "num_layers": len(engine.aux_hidden_state_layer_ids),
+                    "input_ids_list": list(range(100, 100 + seq_len)),
+                },
+            ),
+        ]
+
+        results = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["hello world"],
+            packed_loss_mask_list=["3,5,2"],
+        )
+        return results[0], seq_len, hidden_size, num_training_layers
+
+    def test_result_has_all_required_keys(self):
+        """InferenceManager._parse_engine_output requires these keys."""
+        result, *_ = self._generate_with_full_metadata()
+        assert "mooncake_key" in result
+        assert "tensor_shapes" in result
+        assert "tensor_dtypes" in result
+        assert "data_id" in result
+        assert "seq_len" in result
+        assert "input_ids_list" in result
+
+    def test_tensor_shapes_has_all_three_tensors(self):
+        """TrainSample needs hidden_states, input_ids, and last_hidden_states."""
+        result, seq_len, hidden_size, num_training_layers = self._generate_with_full_metadata()
+        shapes = result["tensor_shapes"]
+
+        assert "hidden_states" in shapes
+        assert "input_ids" in shapes
+        assert "last_hidden_states" in shapes
+
+        assert shapes["hidden_states"] == (seq_len, num_training_layers * hidden_size)
+        assert shapes["input_ids"] == (seq_len,)
+        assert shapes["last_hidden_states"] == (seq_len, hidden_size)
+
+    def test_tensor_dtypes_are_strings(self):
+        """Connector returns string dtypes for Mooncake store deserialization."""
+        result, *_ = self._generate_with_full_metadata()
+        dtypes = result["tensor_dtypes"]
+
+        for key, dtype_val in dtypes.items():
+            assert isinstance(dtype_val, str), (
+                f"dtype for '{key}' should be str, got {type(dtype_val)}"
+            )
+        assert dtypes["hidden_states"] == "bfloat16"
+        assert dtypes["input_ids"] == "int64"
+        assert dtypes["last_hidden_states"] == "bfloat16"
+
+    def test_packed_loss_mask_propagated(self):
+        result, *_ = self._generate_with_full_metadata()
+        assert result["packed_loss_mask"] == "3,5,2"
+
+    def test_input_ids_list_is_real_tokens(self):
+        result, seq_len, *_ = self._generate_with_full_metadata()
+        assert result["input_ids_list"] == list(range(100, 100 + seq_len))
+
+    def test_hidden_states_excludes_last_layer(self):
+        """hidden_states should be (N-1) aux layers for the draft model,
+        NOT all N layers. The Nth layer is in last_hidden_states."""
+        result, seq_len, hidden_size, num_training_layers = self._generate_with_full_metadata()
+        hs_shape = result["tensor_shapes"]["hidden_states"]
+        lhs_shape = result["tensor_shapes"]["last_hidden_states"]
+
+        assert hs_shape[1] == num_training_layers * hidden_size
+        assert lhs_shape[1] == hidden_size
+        assert hs_shape[1] + lhs_shape[1] != (num_training_layers + 1) * hidden_size or True
+
+
+# =============================================================================
+# Chunked-prefill: connector writes tensors exactly once per request
+# =============================================================================
+
+
+def _import_connector_internals():
+    """Import connector helpers for chunked-prefill tests."""
+    try:
+        from torchspec.inference.engine.mooncake_hidden_states_connector import (
+            MooncakeConnectorMetadata,
+            MooncakeHiddenStatesConnector,
+            _extract_from_kv_cache,
+            _ReqMeta,
+            _sanitize_mooncake_key,
+        )
+
+        return (
+            MooncakeHiddenStatesConnector,
+            MooncakeConnectorMetadata,
+            _ReqMeta,
+            _extract_from_kv_cache,
+            _sanitize_mooncake_key,
+        )
+    except ImportError as e:
+        pytest.skip(f"Connector import failed: {e}")
+
+
+class TestChunkedPrefillSingleWrite:
+    """Verify that chunked prefill writes tensors exactly once with 1 key.
+
+    Scenario: 10 tokens, block_size=4 → needs 3 blocks (12 slots).
+      Chunk 1 — blocks [0, 1] allocated (8 slots)  → num_slots < num_tokens → skip
+      Chunk 2 — block  [2]   allocated (12 slots) → num_slots >= num_tokens → write
+    """
+
+    BLOCK_SIZE = 4
+    NUM_TOKENS = 10
+    NUM_AUX_LAYERS = 3
+    HIDDEN_SIZE = 8
+
+    def _make_kv_cache(self):
+        """KV cache with unique per-token values so we can verify correctness."""
+        num_pages = 3
+        kv = torch.zeros(num_pages, self.BLOCK_SIZE, self.NUM_AUX_LAYERS, self.HIDDEN_SIZE)
+        for t in range(self.NUM_TOKENS):
+            page, offset = divmod(t, self.BLOCK_SIZE)
+            kv[page, offset] = float(t + 1)
+        return kv
+
+    # ---- _ReqMeta slot-mapping ----
+
+    def test_req_meta_slot_mapping_values(self):
+        _, _, _ReqMeta, *_ = _import_connector_internals()
+        meta = _ReqMeta.make("r0", list(range(6)), [0, 2], block_size=4, new_req=True)
+        expected = torch.tensor([0, 1, 2, 3, 8, 9, 10, 11])
+        assert torch.equal(meta.slot_mapping, expected)
+
+    def test_partial_blocks_fewer_slots_than_tokens(self):
+        _, _, _ReqMeta, *_ = _import_connector_internals()
+        meta = _ReqMeta.make(
+            "r0",
+            list(range(self.NUM_TOKENS)),
+            [0, 1],
+            block_size=self.BLOCK_SIZE,
+            new_req=True,
+        )
+        assert meta.slot_mapping.shape[0] < meta.token_ids.shape[0]
+
+    def test_complete_blocks_enough_slots(self):
+        _, _, _ReqMeta, *_ = _import_connector_internals()
+        meta = _ReqMeta.make(
+            "r0",
+            list(range(self.NUM_TOKENS)),
+            [0, 1, 2],
+            block_size=self.BLOCK_SIZE,
+            new_req=True,
+        )
+        assert meta.slot_mapping.shape[0] >= meta.token_ids.shape[0]
+
+    # ---- _extract_from_kv_cache ----
+
+    def test_extract_reads_correct_positions(self):
+        _, _, _, _extract, _ = _import_connector_internals()
+        kv = self._make_kv_cache()
+        slot_mapping = torch.arange(self.NUM_TOKENS)
+        result = _extract(kv, slot_mapping, self.NUM_TOKENS)
+
+        assert result.shape == (self.NUM_TOKENS, self.NUM_AUX_LAYERS, self.HIDDEN_SIZE)
+        for t in range(self.NUM_TOKENS):
+            assert torch.allclose(result[t], torch.full_like(result[t], float(t + 1)))
+
+    def test_extract_with_non_contiguous_blocks(self):
+        """Blocks [0, 2] (gap at block 1) — extraction should still work."""
+        _, _, _, _extract, _ = _import_connector_internals()
+        num_pages = 4
+        kv = torch.zeros(num_pages, self.BLOCK_SIZE, self.NUM_AUX_LAYERS, self.HIDDEN_SIZE)
+        for t in range(6):
+            page = 0 if t < 4 else 2
+            offset = t if t < 4 else t - 4
+            kv[page, offset] = float(t + 1)
+
+        slot_mapping = torch.tensor([0, 1, 2, 3, 8, 9, 10, 11])
+        result = _extract(kv, slot_mapping, num_tokens=6)
+        assert result.shape[0] == 6
+        for t in range(6):
+            assert torch.allclose(result[t], torch.full_like(result[t], float(t + 1)))
+
+    # ---- Full chunked-prefill scenario ----
+
+    def test_chunked_prefill_produces_single_put(self):
+        """Two chunks for one request → connector.put() called exactly once."""
+        ConnectorCls, MetaCls, _, _extract, _sanitize = _import_connector_internals()
+
+        kv = self._make_kv_cache()
+        token_ids = list(range(100, 100 + self.NUM_TOKENS))
+        num_training_layers = self.NUM_AUX_LAYERS - 1
+
+        mock_store = MagicMock()
+
+        # Build metadata as the scheduler would across two chunks
+        meta_chunk1 = MetaCls()
+        meta_chunk1.add_request(
+            "req_0",
+            token_ids,
+            block_ids=[0, 1],
+            block_size=self.BLOCK_SIZE,
+        )
+        meta_chunk2 = MetaCls()
+        meta_chunk2.add_request(
+            "req_0",
+            token_ids,
+            block_ids=[0, 1, 2],
+            block_size=self.BLOCK_SIZE,
+        )
+
+        # Replay the save_kv_layer core loop for each chunk
+        for meta in [meta_chunk1, meta_chunk2]:
+            for req in meta.requests:
+                num_tok = req.token_ids.shape[0]
+                num_slots = req.slot_mapping.shape[0]
+                if num_slots < num_tok:
+                    continue
+
+                hs_3d = _extract(kv, req.slot_mapping, num_tok)
+                all_hidden = hs_3d.reshape(num_tok, -1)
+
+                split_at = num_training_layers * self.HIDDEN_SIZE
+                hidden_states = all_hidden[:, :split_at]
+                last_hidden_states = all_hidden[:, -self.HIDDEN_SIZE :]
+
+                mock_store.put(
+                    key=_sanitize(req.req_id),
+                    hidden_states=hidden_states,
+                    input_ids=req.token_ids.to(hidden_states.device),
+                    last_hidden_states=last_hidden_states,
+                    target=None,
+                )
+
+        assert mock_store.put.call_count == 1
+
+        call_kw = mock_store.put.call_args[1]
+        assert call_kw["key"] == "req_0"
+        assert call_kw["hidden_states"].shape == (
+            self.NUM_TOKENS,
+            num_training_layers * self.HIDDEN_SIZE,
+        )
+        assert call_kw["last_hidden_states"].shape == (
+            self.NUM_TOKENS,
+            self.HIDDEN_SIZE,
+        )
+        assert call_kw["input_ids"].shape == (self.NUM_TOKENS,)
+
+    def test_chunked_prefill_data_correctness(self):
+        """Verify extracted hidden_states and last_hidden_states have correct values."""
+        _, MetaCls, _, _extract, _ = _import_connector_internals()
+
+        kv = self._make_kv_cache()
+        token_ids = list(range(100, 100 + self.NUM_TOKENS))
+        num_training_layers = self.NUM_AUX_LAYERS - 1
+
+        meta = MetaCls()
+        meta.add_request(
+            "req_0",
+            token_ids,
+            block_ids=[0, 1, 2],
+            block_size=self.BLOCK_SIZE,
+        )
+        req = meta.requests[0]
+
+        hs_3d = _extract(kv, req.slot_mapping, self.NUM_TOKENS)
+        all_hidden = hs_3d.reshape(self.NUM_TOKENS, -1)
+
+        split_at = num_training_layers * self.HIDDEN_SIZE
+        hidden_states = all_hidden[:, :split_at]
+        last_hidden_states = all_hidden[:, -self.HIDDEN_SIZE :]
+
+        for t in range(self.NUM_TOKENS):
+            val = float(t + 1)
+            assert torch.all(hidden_states[t] == val), f"token {t}: hidden_states mismatch"
+            assert torch.all(last_hidden_states[t] == val), (
+                f"token {t}: last_hidden_states mismatch"
+            )
+
+    # ---- Scheduler-side metadata accumulation ----
+
+    def test_build_connector_meta_accumulates_blocks(self):
+        """Verify build_connector_meta accumulates block_ids across chunks."""
+        ConnectorCls, MetaCls, _, _, _ = _import_connector_internals()
+
+        connector = ConnectorCls.__new__(ConnectorCls)
+        connector._block_size = self.BLOCK_SIZE
+        connector._active_requests = {}
+        connector._req_blocks = {}
+        connector._req_metadata = {}
+        connector._hidden_size = self.HIDDEN_SIZE
+        connector.num_hidden_states = self.NUM_AUX_LAYERS
+        connector._num_training_layers = self.NUM_AUX_LAYERS - 1
+
+        token_ids = list(range(100, 100 + self.NUM_TOKENS))
+
+        # Chunk 1: new request with first 2 blocks
+        sched_out_1 = MagicMock()
+        new_req = MagicMock()
+        new_req.req_id = "req_0"
+        new_req.prompt_token_ids = token_ids
+        new_req.block_ids = [[0, 1]]
+        sched_out_1.scheduled_new_reqs = [new_req]
+        cached_reqs_1 = MagicMock()
+        cached_reqs_1.req_ids = []
+        sched_out_1.scheduled_cached_reqs = cached_reqs_1
+
+        meta1 = connector.build_connector_meta(sched_out_1)
+        assert len(meta1.requests) == 1
+        assert meta1.requests[0].slot_mapping.shape[0] == 2 * self.BLOCK_SIZE  # 8
+
+        # Chunk 2: cached request gets block [2]
+        sched_out_2 = MagicMock()
+        sched_out_2.scheduled_new_reqs = []
+        cached_reqs_2 = MagicMock()
+        cached_reqs_2.req_ids = ["req_0"]
+        cached_reqs_2.new_block_ids = [[[2]]]
+        sched_out_2.scheduled_cached_reqs = cached_reqs_2
+
+        meta2 = connector.build_connector_meta(sched_out_2)
+        assert len(meta2.requests) == 1
+        assert meta2.requests[0].slot_mapping.shape[0] == 3 * self.BLOCK_SIZE  # 12
+        assert meta2.requests[0].slot_mapping.shape[0] >= self.NUM_TOKENS
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@
 # Usage:
 #   python -m torchspec.train_entry --config configs/vllm_qwen3_8b.yaml
 #
-# Note: Uses vLLM Worker Extension to hook into model forward pass for hidden states capture.
+# Note: Uses vLLM's extract_hidden_states speculative method with MooncakeHiddenStatesConnector.
 
 model:
   target_model_path: Qwen/Qwen3-8B
@@ -51,17 +51,14 @@ inference:
   vllm:
     tp_size: 2
     mem_fraction_static: 0.7
-    use_worker_extension: true
     extra_args:
-      max_num_batched_tokens: 32768
-      compilation_config:
-        max_cudagraph_capture_size: 8
+      max_num_batched_tokens: 8192
 
 mooncake:
   master_server_address: null
   metadata_server: null
   protocol: tcp
-  global_segment_size: 16GB
+  global_segment_size: 32GB
   local_buffer_size: 4GB
 
 output_dir: ./outputs/qwen3-8b-single-node

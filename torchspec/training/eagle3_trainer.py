@@ -135,6 +135,8 @@ class Eagle3Trainer(Trainer):
         checkpoint_payload = checkpoint.load(self)
         checkpoint.finalize_load(self, checkpoint_payload)
 
+        self._last_hs_prenorm = getattr(self.args, "last_hidden_states_prenorm", False)
+
         if getattr(self.args, "compute_logits_in_trainer", True):
             self._init_target_lm_head(target_model_path)
 
@@ -144,6 +146,7 @@ class Eagle3Trainer(Trainer):
                 "Set compute_logits_in_trainer=True or provide a TargetLMHead."
             )
         self.target_lm_head_weight = self.target_lm_head.lm_head.weight
+        self.verifier_norm = self.target_lm_head.norm
 
         if getattr(self.args, "attention_backend", None) == "fa_experimental":
             from torchspec.models.draft.llama3_eagle import (
@@ -185,11 +188,15 @@ class Eagle3Trainer(Trainer):
             self.target_lm_head = TargetLMHead.from_pretrained(
                 model_path=target_model_path,
                 lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+                load_norm=self._last_hs_prenorm,
                 device="cuda",
                 dtype=torch.bfloat16,
                 trust_remote_code=getattr(self.args, "trust_remote_code", True),
             )
-            logger.info(f"[Rank 0] TargetLMHead loaded from {target_model_path}")
+            logger.info(
+                f"[Rank 0] TargetLMHead loaded from {target_model_path}"
+                f"{' (with verifier norm)' if self._last_hs_prenorm else ''}"
+            )
         else:
             from transformers import AutoConfig
 
@@ -198,6 +205,8 @@ class Eagle3Trainer(Trainer):
                 trust_remote_code=getattr(self.args, "trust_remote_code", True),
             )
             self.target_lm_head = TargetLMHead(config)
+            if self._last_hs_prenorm:
+                self.target_lm_head._init_norm_structure()
             self.target_lm_head.to(device="cuda", dtype=torch.bfloat16)
             self.target_lm_head.eval()
             self.target_lm_head.requires_grad_(False)
@@ -216,6 +225,10 @@ class Eagle3Trainer(Trainer):
     def _forward(self, batch: dict) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         input_ids = padding(batch["input_ids"], left=False).cuda()
         target_hidden_states = padding(batch["last_hidden_states"], left=False).cuda()
+
+        if self.verifier_norm is not None:
+            with torch.no_grad():
+                target_hidden_states = self.verifier_norm(target_hidden_states)
 
         loss_mask = batch["loss_mask"]
         if loss_mask.dim() == 3:

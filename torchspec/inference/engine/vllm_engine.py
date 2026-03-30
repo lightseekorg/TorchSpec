@@ -21,11 +21,18 @@
 """
 VLLM Ray actor engine for distributed deployment.
 
-Uses Worker Extension mode with MultiprocExecutor for reliable hidden states
-extraction via model.forward patching in worker processes.
+Uses vLLM's ``extract_hidden_states`` speculative decoding method with a
+custom ``MooncakeHiddenStatesConnector`` KV Connector to capture intermediate
+hidden states and store them directly to Mooncake via RDMA.
+
+This replaces the previous worker-extension approach that monkey-patched
+``model.forward``.  The new approach uses only public vLLM APIs
+(``speculative_config`` + ``kv_transfer_config``) and is compatible with
+MRV2, CUDA graphs, and ``torch.compile``.
 """
 
 import socket
+from typing import Any
 
 import ray
 import torch
@@ -45,6 +52,8 @@ _PROTECTION_ENGINE_KEYS = frozenset(
         "nnodes",
         "node_rank",
         "distributed_backend",
+        "speculative_config",
+        "kv_transfer_config",
     }
 )
 
@@ -52,8 +61,9 @@ _PROTECTION_ENGINE_KEYS = frozenset(
 class VllmEngine(InferenceEngine, RayActor):
     """Ray actor wrapper for vLLM LLM engine with distributed deployment support.
 
-    Uses Worker Extension mode with MultiprocExecutor and VllmWorkerExtension
-    for reliable hidden states extraction by patching model.forward in worker processes.
+    Uses vLLM's ``extract_hidden_states`` speculative method with a
+    ``MooncakeHiddenStatesConnector`` to capture hidden states from selected
+    model layers and write them directly to Mooncake.
     """
 
     def __init__(
@@ -101,6 +111,8 @@ class VllmEngine(InferenceEngine, RayActor):
                 )
 
             mooncake_config.local_hostname = local_ip
+            # Export env vars so worker processes (and the connector) can
+            # initialize their own Mooncake stores via MooncakeConfig.from_env().
             mooncake_config.export_env()
 
             from torchspec.transfer.mooncake.utils import (
@@ -116,7 +128,7 @@ class VllmEngine(InferenceEngine, RayActor):
         pp_size = getattr(self.args, "vllm_pp_size", 1)
 
         if self.args.aux_hidden_states_layers is not None:
-            self.aux_hidden_state_layer_ids = self.args.aux_hidden_states_layers
+            self.aux_hidden_state_layer_ids = list(self.args.aux_hidden_states_layers)
         else:
             self.aux_hidden_state_layer_ids = get_default_eagle3_aux_layer_ids(
                 self.args.target_model_path
@@ -124,6 +136,25 @@ class VllmEngine(InferenceEngine, RayActor):
             if self.rank == 0:
                 logger.info(
                     f"Using default aux hidden state layer ids: {self.aux_hidden_state_layer_ids}"
+                )
+
+        # The connector can only access aux layer outputs from the KV cache,
+        # so we append the model's final layer to capture last_hidden_states
+        # (pre-norm) for target logit computation on the training side.
+        from transformers import AutoConfig as _AC
+
+        _cfg = _AC.from_pretrained(
+            self.args.target_model_path,
+            trust_remote_code=getattr(self.args, "trust_remote_code", True),
+        )
+        _cfg = getattr(_cfg, "text_config", _cfg)
+        final_layer_id = _cfg.num_hidden_layers - 1
+        if final_layer_id not in self.aux_hidden_state_layer_ids:
+            self.aux_hidden_state_layer_ids.append(final_layer_id)
+            if self.rank == 0:
+                logger.info(
+                    f"Appended final layer {final_layer_id} to aux layers for "
+                    f"last_hidden_states: {self.aux_hidden_state_layer_ids}"
                 )
 
         nnodes = getattr(self.args, "vllm_nnodes", 1)
@@ -156,7 +187,7 @@ class VllmEngine(InferenceEngine, RayActor):
         mem_fraction: float,
         dist_init_addr: str | None,
     ) -> None:
-        """Initialize LLM with worker extension enabled."""
+        """Initialize LLM with extract_hidden_states speculative config."""
         from vllm import LLM
 
         engine_kwargs = {
@@ -166,9 +197,22 @@ class VllmEngine(InferenceEngine, RayActor):
             "trust_remote_code": getattr(self.args, "trust_remote_code", True),
             "distributed_executor_backend": "mp",
             "disable_custom_all_reduce": True,
-            "worker_extension_cls": (
-                "torchspec.inference.engine.vllm_worker_extension.VllmWorkerExtension"
-            ),
+            "speculative_config": {
+                "method": "extract_hidden_states",
+                "num_speculative_tokens": 1,
+                "draft_model_config": {
+                    "hf_config": {
+                        "eagle_aux_hidden_state_layer_ids": list(self.aux_hidden_state_layer_ids)
+                    }
+                },
+            },
+            "kv_transfer_config": {
+                "kv_connector": "MooncakeHiddenStatesConnector",
+                "kv_connector_module_path": (
+                    "torchspec.inference.engine.mooncake_hidden_states_connector"
+                ),
+                "kv_role": "kv_producer",
+            },
         }
 
         extra_args = getattr(self.args, "vllm_extra_args", None)
@@ -197,9 +241,7 @@ class VllmEngine(InferenceEngine, RayActor):
                     f"max_cudagraph_capture_size={inference_batch_size} from inference_batch_size"
                 )
 
-        # Disable prefix caching and chunked prefill
         engine_kwargs["enable_prefix_caching"] = False
-        engine_kwargs["enable_chunked_prefill"] = False
 
         max_seq_length = getattr(self.args, "max_seq_length", None)
         if max_seq_length:
@@ -213,32 +255,10 @@ class VllmEngine(InferenceEngine, RayActor):
                 engine_kwargs["distributed_init_address"] = dist_init_addr
 
         self._engine = LLM(**engine_kwargs)
-        self._setup_rpc_hidden_states_capture()
         logger.info(
-            f"VllmEngine rank {self.rank}: initialized worker extension mode "
+            f"VllmEngine rank {self.rank}: initialized extract_hidden_states mode "
             f"with layers={self.aux_hidden_state_layer_ids}"
         )
-
-    def _setup_rpc_hidden_states_capture(self) -> None:
-        """Initialize worker-side hidden-state capture hooks."""
-        if self._engine is None:
-            raise RuntimeError("VllmEngine not initialized. Call init() first.")
-        if not hasattr(self._engine, "collective_rpc"):
-            raise RuntimeError("vLLM LLM.collective_rpc is required for worker extension mode")
-
-        if self._mooncake_config is not None:
-            self._mooncake_config.export_env()
-            logger.info(
-                f"VllmEngine rank {self.rank}: Set Mooncake env vars for workers: "
-                f"master={self._mooncake_config.master_server_address}"
-            )
-
-        layer_ids = list(self.aux_hidden_state_layer_ids)
-        results = self._engine.collective_rpc(
-            "_setup_hidden_states_capture",
-            args=(layer_ids,),
-        )
-        logger.info(f"VllmEngine rank {self.rank}: worker capture setup replies={results}")
 
     def generate(
         self,
@@ -250,7 +270,13 @@ class VllmEngine(InferenceEngine, RayActor):
         return_logits: bool = True,
         multimodal_inputs: list[dict] | None = None,
     ) -> list[dict]:
-        """Generate hidden states for training data using Worker Extension mode."""
+        """Generate hidden states for training data.
+
+        Hidden states are captured by vLLM's ``extract_hidden_states``
+        speculative method and stored to Mooncake by the
+        ``MooncakeHiddenStatesConnector``.  Metadata comes back in
+        ``output.kv_transfer_params``.
+        """
         if self._engine is None:
             raise RuntimeError("VllmEngine not initialized. Call init() first.")
 
@@ -285,122 +311,52 @@ class VllmEngine(InferenceEngine, RayActor):
         from vllm import SamplingParams
 
         sampling_params = SamplingParams(max_tokens=1, temperature=0)
-        request_metadata = {}
-        if input_ids_list is not None:
-            for i, ids in enumerate(input_ids_list):
-                request_metadata[data_ids[i]] = int(self._normalize_input_ids(ids).numel())
 
-        # Build packed_loss_mask_map for workers
-        packed_loss_mask_map = {}
+        # Build packed_loss_mask_map for result assembly
+        packed_loss_mask_map: dict[str, str | None] = {}
         if packed_loss_mask_list is not None:
-            for i, data_id in enumerate(data_ids):
+            for i, did in enumerate(data_ids):
                 if i < len(packed_loss_mask_list):
-                    packed_loss_mask_map[data_id] = packed_loss_mask_list[i]
-
-        # Build input_ids_map for workers (pass real input_ids via RPC)
-        input_ids_map = {}
-        if input_ids_list is not None:
-            for i, data_id in enumerate(data_ids):
-                if i < len(input_ids_list):
-                    ids = self._normalize_input_ids(input_ids_list[i])
-                    input_ids_map[data_id] = ids.cpu().tolist()
-
-        try:
-            self._engine.collective_rpc("_reset_capture")
-            if request_metadata:
-                self._engine.collective_rpc(
-                    "_set_request_metadata",
-                    args=(request_metadata, packed_loss_mask_map, input_ids_map),
-                )
-        except Exception as e:
-            logger.warning(f"Could not reset capture via worker extension: {e}")
+                    packed_loss_mask_map[did] = packed_loss_mask_list[i]
 
         outputs = self._engine.generate(prompts, sampling_params, use_tqdm=False)
-
-        # outputs are sorted by int(request_id), matching submission order.
-        # Build mapping from vLLM's internal worker IDs ("{request_id}-{uuid}")
-        # to our external data_ids.
-        internal_to_external = {}
-        for i, output in enumerate(outputs):
-            internal_to_external[output.request_id] = data_ids[i]
-
-        # Always build request_metadata and input_ids_map from the
-        # outputs.
-        for i, output in enumerate(outputs):
-            did = data_ids[i]
-            request_metadata[did] = len(output.prompt_token_ids)
-            input_ids_map[did] = list(output.prompt_token_ids)
-        try:
-            self._engine.collective_rpc(
-                "_set_request_metadata",
-                args=(request_metadata, packed_loss_mask_map, input_ids_map),
-            )
-        except Exception as e:
-            logger.warning(
-                f"VllmEngine rank {self.rank}: Could not set post-generation request metadata: {e}"
-            )
-
-        # Get metadata from workers (tensors are already stored in Mooncake by workers)
-        metadata_by_request: dict[str, dict] = {}
-        try:
-            metadata_list = self._engine.collective_rpc(
-                "_store_and_get_metadata", args=(internal_to_external,)
-            )
-            if isinstance(metadata_list, list):
-                for metadata in metadata_list:
-                    if isinstance(metadata, dict):
-                        metadata_by_request.update(metadata)
-            elif isinstance(metadata_list, dict):
-                metadata_by_request = metadata_list
-        except Exception as e:
-            logger.warning(f"Could not get metadata from worker extension: {e}")
-
-        if not metadata_by_request:
-            logger.error(
-                f"VllmEngine rank {self.rank}: metadata_by_request is EMPTY for "
-                f"data_ids={data_ids}. Worker returned metadata_list={metadata_list!r}. "
-                f"use_prompts={use_prompts}, request_metadata_keys={list(request_metadata.keys())}, "
-                f"internal_to_external={internal_to_external}"
-            )
 
         results = []
         for i, output in enumerate(outputs):
             seq_len = len(output.prompt_token_ids)
-            data_id = data_ids[i]
+            did = data_ids[i]
 
-            # Get metadata for this request
-            metadata = metadata_by_request.get(data_id)
-            if metadata is None:
+            kv_params = getattr(output, "kv_transfer_params", None)
+            if kv_params is None:
                 logger.error(
-                    f"VllmEngine rank {self.rank}: No metadata for data_id={data_id}. "
-                    f"metadata_by_request has keys={list(metadata_by_request.keys())}. "
-                    f"Training may be corrupted."
+                    f"VllmEngine rank {self.rank}: No kv_transfer_params for data_id={did}. "
+                    f"The MooncakeHiddenStatesConnector may not have stored this request."
                 )
                 continue
 
-            # Extract info from metadata (tensors are already in Mooncake)
-            mooncake_key = metadata.get("mooncake_key", data_id)
-            tensor_shapes = metadata.get("tensor_shapes", {})
-            tensor_dtypes = metadata.get("tensor_dtypes", {})
+            mooncake_key = kv_params.get("mooncake_key", did)
+            tensor_shapes = kv_params.get("tensor_shapes", {})
+            tensor_dtypes = kv_params.get("tensor_dtypes", {})
 
-            result = {
+            result: dict[str, Any] = {
                 "mooncake_key": mooncake_key,
                 "tensor_shapes": tensor_shapes,
                 "tensor_dtypes": tensor_dtypes,
-                "data_id": data_id,
+                "data_id": did,
                 "seq_len": seq_len,
             }
-            # Get packed_loss_mask from metadata (returned by worker)
-            packed_loss_mask = metadata.get("packed_loss_mask")
+
+            packed_loss_mask = packed_loss_mask_map.get(did)
             if packed_loss_mask is not None:
                 result["packed_loss_mask"] = packed_loss_mask
-            # Get input_ids_list from metadata (returned by worker via RPC)
-            input_ids_list = metadata.get("input_ids_list")
-            if input_ids_list is not None:
-                result["input_ids_list"] = input_ids_list
-            results.append(result)
 
-        # No need to flush here - workers already flushed after storing
+            input_ids_from_kv = kv_params.get("input_ids_list")
+            if input_ids_from_kv is not None:
+                result["input_ids_list"] = input_ids_from_kv
+            else:
+                result["input_ids_list"] = list(output.prompt_token_ids)
+
+            results.append(result)
 
         logger.debug(
             f"VllmEngine rank {self.rank}: generated {len(results)} mooncake results "
@@ -446,8 +402,17 @@ class VllmEngine(InferenceEngine, RayActor):
             self._mooncake_store = None
 
         if self._engine is not None:
-            del self._engine
-            self._engine = None
+            try:
+                if hasattr(self._engine, "close"):
+                    self._engine.close()
+                elif hasattr(self._engine, "llm_engine"):
+                    llm_engine = self._engine.llm_engine
+                    if hasattr(llm_engine, "shutdown"):
+                        llm_engine.shutdown()
+            except Exception as e:
+                logger.warning(f"VllmEngine rank {self.rank}: Error during engine shutdown: {e}")
+            finally:
+                self._engine = None
 
         logger.info(f"VllmEngine rank {self.rank}: shutdown complete")
 

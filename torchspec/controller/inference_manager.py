@@ -453,6 +453,13 @@ class AsyncInferenceManager:
                 if self._enable_perf_metrics:
                     now = time.time()
                     self._batch_times.append((len(entries), now - t0, now))
+                if len(outputs) != len(entries):
+                    logger.error(
+                        f"Engine returned {len(outputs)} results for "
+                        f"{len(entries)} entries (expected equal)"
+                    )
+                    err = ValueError(f"output count mismatch: {len(outputs)} vs {len(entries)}")
+                    return [(entry, err) for entry in entries]
                 return list(zip(entries, outputs, strict=True))
             except RayActorError as e:
                 logger.critical(f"Engine actor died, terminating inference manager: {e}")

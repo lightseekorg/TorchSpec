@@ -194,7 +194,11 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
                 f"Eval: loaded cached tensors from {eval_cache_path} ({loaded[0]} batches per rank)"
             )
         else:
-            initial_eval_submit_count = min(eval_dataset_size, eval_dispatch_bs * 2)
+            inference_batch_size = args.inference_batch_size
+            initial_eval_submit_count = min(
+                eval_dataset_size,
+                max(eval_dispatch_bs * 2, inference_batch_size),
+            )
             ray.get(controller.submit_eval_chunk.remote(0, initial_eval_submit_count))
             logger.info(
                 f"Eval: {eval_dataset_size} samples, dispatch_bs={eval_dispatch_bs}, "
