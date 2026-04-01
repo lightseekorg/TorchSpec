@@ -1,0 +1,21 @@
+{
+  "description": "Phase 2 resumed: P2-accum1 resumes from step 245K checkpoint, P2-WSD starts fresh. New WandB project to avoid collision with crashed original runs.",
+  "base": {
+    "dataset_size": 800000,
+    "num_epochs": 3,
+    "wandb_project": "dflash-phase2-v2",
+    "common_overrides": "training.dflash_num_anchors=512 inference.inference_num_gpus=2 training.training_num_gpus_per_node=6 training.fsdp_strategy=FULL_SHARD training.fsdp_reduce_dtype=bfloat16 training.prefetch_depth=8 training.max_checkpoints=2 training.save_interval=5000 dataset.eval_data_path=null"
+  },
+  "runs": [
+    {
+      "name": "P2-accum1",
+      "description": "Resume from step 245K (65% done). cosine LR, accum=1.",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=1 training.dflash_loss_decay_gamma=7.0"
+    },
+    {
+      "name": "P2-WSD",
+      "description": "Fresh start. WSD schedule with cosine decay phase.",
+      "overrides": "training.learning_rate=6e-4 training.min_lr=6e-5 training.lr_decay_style=WSD training.wsd_decay_ratio=0.2 training.wsd_decay_style=cosine training.warmup_ratio=0.04 training.weight_decay=0.01 training.draft_accumulation_steps=2 training.dflash_loss_decay_gamma=7.0"
+    }
+  ]
+}

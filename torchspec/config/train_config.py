@@ -132,6 +132,10 @@ class TrainingConfig:
     ttt_length: int = 7
     warmup_ratio: float = 0.015
 
+    # WSD LR schedule parameters (used by DFlash trainer only)
+    wsd_decay_ratio: float = 0.2
+    wsd_decay_style: Optional[str] = None
+
     # DFlash-specific parameters (ignored for Eagle3 training)
     dflash_block_size: int = 16
     dflash_loss_decay_gamma: float = 7.0

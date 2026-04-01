@@ -476,12 +476,14 @@ def train_sglang(
     extra_overrides: Optional[str] = None,
     hf_repo: Optional[str] = None,
     resume: bool = False,
+    dflash_run_id: Optional[str] = None,
 ):
     """Training entry point for 4+ GPU configs (SGLang inference backend)."""
     _train_impl(
         gpu_count, max_steps, num_epochs, run_eagle3, run_dflash,
         wandb_project, wandb_team, dataset_path, dataset_size, extra_overrides, hf_repo,
         resume=resume,
+        dflash_run_id=dflash_run_id,
     )
 
 
@@ -605,6 +607,7 @@ def _train_impl(
     extra_overrides: Optional[str] = None,
     hf_repo: Optional[str] = None,
     resume: bool = False,
+    dflash_run_id: Optional[str] = None,
 ):
     import os
     import shutil
@@ -700,11 +703,13 @@ def _train_impl(
             resume=resume,
         )
 
+    _dflash_id = dflash_run_id or "dflash-qwen3-8b"
+
     if run_dflash:
         _run_training(
             name="DFlash",
             config=cfg.dflash_config,
-            run_id="dflash-qwen3-8b",
+            run_id=_dflash_id,
             max_steps=max_steps,
             num_epochs=num_epochs,
             gpu_overrides=cfg.overrides,
@@ -718,7 +723,7 @@ def _train_impl(
 
     if run_dflash:
         _convert_and_upload_hf(
-            run_id="dflash-qwen3-8b",
+            run_id=_dflash_id,
             target_model="Qwen/Qwen3-8B",
             hf_repo=hf_repo,
         )
@@ -734,14 +739,14 @@ def _train_impl(
         print(f"  Eagle3 log:         {OUTPUTS_DIR}/eagle3-qwen3-8b.log")
         print(f"  Eagle3 checkpoints: {OUTPUTS_DIR}/eagle3-qwen3-8b/checkpoints/")
     if run_dflash:
-        print(f"  DFlash log:         {OUTPUTS_DIR}/dflash-qwen3-8b.log")
-        print(f"  DFlash checkpoints: {OUTPUTS_DIR}/dflash-qwen3-8b/checkpoints/")
-        hf_dir = f"{OUTPUTS_DIR}/dflash-qwen3-8b/hf_model"
+        print(f"  DFlash log:         {OUTPUTS_DIR}/{_dflash_id}.log")
+        print(f"  DFlash checkpoints: {OUTPUTS_DIR}/{_dflash_id}/checkpoints/")
+        hf_dir = f"{OUTPUTS_DIR}/{_dflash_id}/hf_model"
         if os.path.isdir(hf_dir):
             print(f"  DFlash HF model:    {hf_dir}")
     print()
     print(f"  All outputs saved to Modal volume 'torchspec-outputs'")
-    print(f"  Download: modal volume get torchspec-outputs /dflash-qwen3-8b/checkpoints/ ./checkpoints/")
+    print(f"  Download: modal volume get torchspec-outputs /{_dflash_id}/checkpoints/ ./checkpoints/")
     if os.environ.get("WANDB_API_KEY"):
         proj = wandb_project or "dflash-vs-eagle3"
         print(f"  WandB dashboard: https://wandb.ai/{proj}")
@@ -863,6 +868,7 @@ def _run_sweep(
     wandb_team: Optional[str] = None,
     dataset_path: Optional[str] = None,
     run_filter: Optional[str] = None,
+    resume: bool = False,
 ):
     """Launch parallel training runs from a sweep config.
 
@@ -930,7 +936,7 @@ def _run_sweep(
 
         epoch_val = num_epochs if num_epochs and num_epochs > 0 else None
 
-        print(f"  Spawning [{run_name}] ...")
+        print(f"  Spawning [{run_name}] (resume={resume}) ...")
         f = train_sglang.spawn(
             gpu_count=gpu_count,
             max_steps=max_steps if not epoch_val else 0,
@@ -943,7 +949,8 @@ def _run_sweep(
             dataset_size=dataset_size,
             extra_overrides=merged_overrides or None,
             hf_repo=None,
-            resume=False,
+            resume=resume,
+            dflash_run_id=run_name,
         )
         futures.append((run_name, f))
 
@@ -1006,6 +1013,7 @@ def main(
             wandb_team=wandb_team,
             dataset_path=dataset_path,
             run_filter=sweep_filter or None,
+            resume=resume,
         )
         return
 
