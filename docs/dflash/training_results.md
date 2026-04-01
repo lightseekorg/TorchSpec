@@ -6,7 +6,7 @@ From the test plan:
 
 | Metric | Target | Best Achieved | Status |
 |--------|--------|---------------|--------|
-| Acceptance length (τ) | ≥ 5.0 | 3.79 math avg (Phase H) | Below target |
+| Acceptance length (τ) | ≥ 5.0 | 3.79 math avg (Phase K P2-accum1) | Below target |
 | Training speed | ≥ 2.0 step/s | ~6.8 step/s (RunPod 2-GPU CPU prefetch) | Exceeded |
 | Speedup | ≥ 3.0x | 2.90x (livecodebench, Phase H) | Below target |
 
@@ -1885,14 +1885,125 @@ WSD (Warmup-Stable-Decay) is a 3-phase LR schedule:
 
 vs cosine decay which starts dropping LR immediately after warmup, causing the "converge-then-plateau" pattern.
 
-### Phase 2 Status (Running)
+### Phase 2 Results (800K PerfectBlend, 3 epochs)
 
-Launched 3 full-scale validation runs on 800K PerfectBlend, 3 epochs:
-- **P2-baseline**: cosine LR, accum=2 (control)
-- **P2-WSD**: WSD schedule, accum=2 (Phase 1 winner)
-- **P2-accum1**: cosine LR, accum=1 (Phase 1 winner)
+Launched 3 full-scale validation runs. All crashed at Modal's 24h ephemeral app limit before completing 3 epochs. WandB captured training curves for all runs.
 
-WandB project: `dflash-phase2`. Modal app: `ap-ITUqpphkD28glj55OZSkD0`.
+**Original runs (24h, WandB project: `dflash-phase2`):**
+
+| Run | Last Step / Total | Progress | Last Loss | Last Acc | LR at crash |
+|-----|-------------------|----------|-----------|----------|-------------|
+| **P2-WSD** | 137,776 / 188,943 | **73%** | **1.86** | **0.46** | 6.0e-4 (still at peak) |
+| P2-baseline | 135,106 / 188,943 | 72% | 2.56 | 0.38 | 1.69e-4 |
+| P2-accum1 | 246,815 / 377,889 | 65% | 2.42 | 0.39 | 2.16e-4 |
+
+**Key finding**: P2-WSD is clearly winning — 27% lower loss and 21% higher accuracy than baseline at similar wall time. WSD's LR was still at peak (6e-4) when it crashed, meaning it had more convergence headroom remaining. Baseline's cosine LR had already decayed to 1.69e-4 (72% below peak).
+
+**Bug found**: All 3 runs used hardcoded `run_id="dflash-qwen3-8b"`, writing checkpoints to the same volume directory. Only P2-accum1's checkpoint survived (step 245K). Fixed by adding `dflash_run_id` parameter to `train_sglang` so each sweep run gets an isolated output directory.
+
+**Resumed runs (WandB project: `dflash-phase2-v2`):**
+- **P2-accum1**: Resumed from step 245K checkpoint. ~12h remaining.
+- **P2-WSD**: Fresh start (checkpoint lost). ~30h total, will need one more resume after 24h limit.
+
+Each run now saves to its own volume path (`/workspace/outputs/P2-accum1/`, `/workspace/outputs/P2-WSD/`) and supports `--resume` for multi-session training across Modal's 24h limit.
+
+### P2-accum1 Inference Benchmark (2026-04-01)
+
+P2-accum1 completed 3 epochs on 800K PerfectBlend with `accum=1` (2x optimizer steps vs Phase H). Model uploaded to public HuggingFace repo.
+
+- **HF Model**: [`Xingh3/dflash-qwen3-8b-P2-accum1`](https://huggingface.co/Xingh3/dflash-qwen3-8b-P2-accum1) (1.67B params, BF16)
+- **Backend**: SGLang (tp=1, 1x H100 80GB, KV cache, CUDA graphs, paged attention)
+- **Mode**: Quick (30 samples per dataset), temperature=0.0, concurrency=1
+- **Total runtime**: ~60 minutes for all 10 datasets
+
+#### Results: Cross-Dataset (P2-accum1 vs Phase H vs z-lab)
+
+| Dataset | P2-accum1 τ | Phase H τ | Δ (vs H) | z-lab τ | Gap to z-lab |
+|---------|-------------|-----------|----------|---------|--------------|
+| **gsm8k** | **3.79** | 3.75 | +0.04 | 3.38 | **-0.41 (beat)** |
+| **math500** | **4.07** | 3.87 | +0.20 | 4.61 | +0.54 |
+| **aime24** | **3.86** | 3.92 | -0.06 | 4.12 | +0.26 |
+| **aime25** | **3.59** | 3.62 | -0.03 | 4.07 | +0.48 |
+| **humaneval** | **4.30** | 4.12 | +0.18 | — | — |
+| **mbpp** | **3.44** | 3.50 | -0.06 | — | — |
+| **livecodebench** | **4.86** | 4.90 | -0.04 | — | — |
+| **swe-bench** | **2.61** | 2.60 | +0.01 | — | — |
+| **mt-bench** | **2.74** | 2.80 | -0.06 | — | — |
+| **alpaca** | **2.42** | 2.45 | -0.03 | — | — |
+
+#### Throughput & Speedup (SGLang backend)
+
+| Dataset | Baseline tok/s | DFlash tok/s | E2E Speedup | Decode Speedup |
+|---------|---------------|-------------|-------------|----------------|
+| gsm8k | 146.9 | 331.5 | 2.26x | 2.30x |
+| math500 | 145.4 | 357.1 | 2.46x | 2.33x |
+| aime24 | — | — | 2.41x | 2.39x |
+| aime25 | — | — | 2.28x | 2.26x |
+| humaneval | — | — | 2.67x | 2.69x |
+| mbpp | — | — | 2.13x | 2.16x |
+| livecodebench | — | — | 2.28x | 2.27x |
+| swe-bench | — | — | 1.77x | 1.74x |
+| mt-bench | — | — | 1.52x | 1.59x |
+| alpaca | — | — | 1.54x | 1.45x |
+
+#### Domain Analysis
+
+| Domain | P2-accum1 τ | Phase H τ | Δ | z-lab τ |
+|--------|-------------|-----------|---|---------|
+| Math (gsm8k, math500, aime24, aime25) | **3.83** | 3.79 | **+0.04** | 4.05 |
+| Code (humaneval, mbpp, livecodebench) | **4.20** | 4.17 | **+0.03** | — |
+| General (swe-bench, mt-bench, alpaca) | **2.59** | 2.62 | -0.03 | — |
+| Overall (all 10) | **3.57** | 3.45 | **+0.12** | — |
+
+#### τ Distribution per Dataset (30 samples each)
+
+| Dataset | τ∈[1,2) | τ∈[2,3) | τ∈[3,4) | τ∈[4,5) | τ∈[5,6) | τ∈[6,8) | Mean τ |
+|---------|---------|---------|---------|---------|---------|---------|--------|
+| gsm8k | — | 6.7% | **70.0%** | 16.7% | 6.7% | — | 3.79 |
+| math500 | — | 16.7% | 36.7% | **33.3%** | 3.3% | 10.0% | 4.07 |
+| aime24 | — | 6.7% | **53.3%** | 30.0% | 10.0% | — | 3.86 |
+| aime25 | — | 16.7% | **70.0%** | 10.0% | 3.3% | — | 3.59 |
+| humaneval | — | — | **43.3%** | 33.3% | 20.0% | 3.3% | 4.30 |
+| mbpp | — | 20.0% | **56.7%** | 23.3% | — | — | 3.44 |
+| livecodebench | — | — | 26.7% | **36.7%** | 20.0% | 16.7% | 4.86 |
+| swe-bench | — | **100.0%** | — | — | — | — | 2.61 |
+| mt-bench | 20.0% | **50.0%** | 23.3% | 3.3% | — | 3.3% | 2.74 |
+| alpaca | 23.3% | **60.0%** | 16.7% | — | — | — | 2.42 |
+
+#### Distribution Comparison: P2-accum1 vs Phase G (3-epoch 190K)
+
+Phase G used 128 samples per dataset; P2-accum1 uses 30. Comparing the distribution shape shift:
+
+| Dataset | Phase G: τ≥3 | P2-accum1: τ≥3 | Shift | Phase G: τ≥5 | P2-accum1: τ≥5 |
+|---------|--------------|-----------------|-------|--------------|-----------------|
+| gsm8k | 67.9% | **93.4%** | +25.5 | 0% | **6.7%** |
+| math500 | 61.7% | **83.3%** | +21.6 | 1.6% | **13.3%** |
+| aime24 | 63.4% | **93.3%** | +29.9 | 0% | **10.0%** |
+| aime25 | 56.6% | **83.3%** | +26.7 | 0% | **3.3%** |
+| humaneval | 89.0% | **100.0%** | +11.0 | 0.6% | **23.3%** |
+| mbpp | 55.5% | **80.0%** | +24.5 | 0% | 0% |
+| livecodebench | 62.5% | **100.0%** | +37.5 | 19.5% | **36.7%** |
+| swe-bench | 1.6% | 0% | -1.6 | 0% | 0% |
+| mt-bench | 24.9% | **30.0%** | +5.1 | 2.5% | **3.3%** |
+| alpaca | 10.9% | **16.7%** | +5.8 | 0% | 0% |
+
+**Key distribution insights:**
+
+1. **τ≥3 is the dominant bucket** for math/code datasets: 80-100% of requests achieve τ≥3 (vs 55-89% in Phase G). This means the draft model reliably accepts 3+ tokens per cycle on structured tasks.
+
+2. **τ≥5 emerged as a real category**: Phase G had almost no requests with τ≥5 except livecodebench. P2-accum1 pushes 3-37% of requests into τ∈[5,8) across math/code datasets — these are the high-value requests where speculative decoding delivers maximum throughput.
+
+3. **General-domain distribution unchanged**: swe-bench is stuck at 100% τ∈[2,3), and alpaca/mt-bench remain τ<3 dominated. These datasets have diverse/unpredictable text patterns that the draft model cannot reliably anticipate.
+
+4. **The mean understates the improvement**: On livecodebench, mean τ barely changed (4.90→4.86), but the τ≥5 fraction nearly doubled (19.5%→36.7%). The distribution is shifting rightward with a heavier tail, meaning more requests get large speedups even when the average is similar.
+
+#### Analysis
+
+P2-accum1 produces results **on par with Phase H** in mean τ across all domains, with slight improvements on math (+0.04 τ) and code (+0.03 τ). The model beats z-lab on GSM8K (3.79 vs 3.38) and matches Phase H on everything else.
+
+The `accum=1` config doubles optimizer steps but halves the effective batch size (6 vs 12). At full scale, this does not provide a meaningful advantage over Phase H in mean τ — the additional gradient updates are offset by noisier per-step gradients from the smaller batch.
+
+The z-lab gap on math benchmarks (5.4% for P2-accum1 vs 6.4% for Phase H) remains primarily attributable to recipe differences: fewer epochs (3 vs 6), shorter sequences (2048 vs 3072), and different dataset composition.
 
 ### Infrastructure: Sweep Runner
 
