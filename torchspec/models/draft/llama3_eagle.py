@@ -1071,6 +1071,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
                     original_max_position_embeddings=rope_get("original_max_position_embeddings"),
                     scaling_factor=scaling_factor,
                     beta_fast=rope_get("beta_fast"),

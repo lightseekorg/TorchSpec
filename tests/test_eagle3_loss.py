@@ -294,6 +294,42 @@ class TestLazyVsPrecomputedTarget(unittest.TestCase):
             )
 
 
+class TestRotaryConfigWiring(unittest.TestCase):
+    """Model config should fully wire RoPE settings into rotary embeddings."""
+
+    def test_yarn_uses_rope_theta_as_base(self):
+        config = LlamaConfig(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            intermediate_size=512,
+            max_position_embeddings=262144,
+            vocab_size=256,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            rope_theta=50000.0,
+            rope_scaling={
+                "type": "yarn",
+                "factor": 64.0,
+                "original_max_position_embeddings": 4096,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+            },
+            pretraining_tp=1,
+            pad_token_id=0,
+        )
+        config.draft_vocab_size = 256
+
+        model = LlamaForCausalLMEagle3(config, attention_backend="sdpa")
+        rotary = model.midlayer.self_attn.rotary_emb
+
+        self.assertEqual(rotary.base, 50000.0)
+        self.assertEqual(rotary.original_max_position_embeddings, 4096)
+        self.assertEqual(rotary.scaling_factor, 64.0)
+
+
 def _make_mask_patterns(BT):
     """Return (name, valid_idx) pairs covering diverse masking patterns."""
     patterns = []

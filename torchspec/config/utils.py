@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import copy
 import json
 import logging
 import warnings
@@ -26,6 +27,35 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _copy_config_value(value):
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return copy.deepcopy(value)
+
+
+def _normalize_rope_scaling(rope_scaling):
+    if rope_scaling is None:
+        return None
+
+    normalized = _copy_config_value(rope_scaling)
+    if not isinstance(normalized, dict):
+        return normalized
+
+    scaling_type = normalized.get("rope_type", normalized.get("type"))
+    if scaling_type == "yarn":
+        yarn_defaults = {
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 0.0,
+        }
+        for key, default in yarn_defaults.items():
+            if normalized.get(key) is None:
+                normalized[key] = default
+
+    return normalized
 
 
 def generate_draft_model_config(
@@ -85,6 +115,8 @@ def generate_draft_model_config(
         "num_key_value_heads": "num_key_value_heads",
         "intermediate_size": "intermediate_size",
         "max_position_embeddings": "max_position_embeddings",
+        "rope_theta": "rope_theta",
+        "rope_scaling": "rope_scaling",
         "rms_norm_eps": "rms_norm_eps",
         "hidden_act": "hidden_act",
         "bos_token_id": "bos_token_id",
@@ -101,6 +133,10 @@ def generate_draft_model_config(
             continue
         if target_param == "torch_dtype" and isinstance(value, torch.dtype):
             value = str(value).replace("torch.", "")
+        else:
+            value = _copy_config_value(value)
+            if target_param == "rope_scaling":
+                value = _normalize_rope_scaling(value)
         draft_config[draft_param] = value
 
     draft_config["num_hidden_layers"] = 1
