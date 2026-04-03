@@ -74,6 +74,7 @@ class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
         "DeepSeekForCausalLMEagle3": DeepseekV3Config,
+        "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
     }
 
     @classmethod

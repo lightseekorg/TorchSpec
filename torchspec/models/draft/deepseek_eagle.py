@@ -103,7 +103,9 @@ class DeepSeekMLAAttention(nn.Module):
             self.q_proj = nn.Linear(input_dim, self.num_heads * self.qk_head_dim, bias=False)
 
         # KV path
-        self.kv_a_proj = nn.Linear(input_dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
+        self.kv_a_proj_with_mqa = nn.Linear(
+            input_dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
+        )
         self.kv_a_layernorm = LlamaRMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
@@ -215,7 +217,7 @@ class DeepSeekMLAAttention(nn.Module):
         q = q.view(bsz, q_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
 
         # KV down projection + split
-        kv_combined = self.kv_a_proj(hidden_states)
+        kv_combined = self.kv_a_proj_with_mqa(hidden_states)
         kv_compressed, k_rope_raw = torch.split(
             kv_combined, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )

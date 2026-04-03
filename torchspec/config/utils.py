@@ -135,8 +135,8 @@ def generate_draft_model_config(
             value = str(value).replace("torch.", "")
         else:
             value = _copy_config_value(value)
-            if target_param == "rope_scaling":
-                value = _normalize_rope_scaling(value)
+        if target_param == "rope_scaling":
+            value = _normalize_rope_scaling(value)
         draft_config[draft_param] = value
 
     draft_config["num_hidden_layers"] = 1
