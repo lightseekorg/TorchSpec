@@ -47,7 +47,6 @@ from torchspec.models.draft.llama3_eagle import (
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
     LlamaYarnRotaryEmbedding,
-    apply_rotary_pos_emb,
     yarn_get_mscale,
 )
 from torchspec.models.ops.flex_attention import (
@@ -63,6 +62,40 @@ def _rope_config_get(rope_scaling, key, default=None):
     if isinstance(rope_scaling, dict):
         return rope_scaling.get(key, default)
     return getattr(rope_scaling, key, default)
+
+
+# ── Interleaved RoPE (DeepSeek convention) ────────────────────────────────
+#
+# DeepSeek MLA uses interleaved-pair rotation where consecutive dimension
+# pairs (0,1), (2,3), ... are rotated together.  This differs from the
+# neox-style rotation used in Llama/HF-transformers (first-half vs second-half).
+#
+# We reuse the existing LlamaRotaryEmbedding classes (which produce neox-layout
+# cos/sin caches) and convert neox→interleaved on the fly in the apply function.
+# Conversion: neox [θ0,..,θ31, θ0,..,θ31] → interleaved [θ0,θ0, θ1,θ1, ..]
+# is just cos[..., :half].repeat_interleave(2, dim=-1).
+
+
+def _rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """Interleaved-pair rotation: pairs dims (0,1), (2,3), ..."""
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+@torch.compile(dynamic=True)
+def _apply_rotary_pos_emb_interleaved(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    """Apply RoPE with interleaved rotation, accepting neox-layout cos/sin."""
+    cos = cos.squeeze(1).squeeze(0)
+    sin = sin.squeeze(1).squeeze(0)
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    half = cos.shape[-1] // 2
+    cos = cos[..., :half].repeat_interleave(2, dim=-1)
+    sin = sin[..., :half].repeat_interleave(2, dim=-1)
+    q_embed = (q * cos) + (_rotate_half_interleaved(q) * sin)
+    k_embed = (k * cos) + (_rotate_half_interleaved(k) * sin)
+    return q_embed, k_embed
 
 
 class DeepSeekMLAAttention(nn.Module):
@@ -140,8 +173,6 @@ class DeepSeekMLAAttention(nn.Module):
             scaling_factor = rget("factor")
 
             if scaling_type in (None, "default"):
-                # DeepseekV3Config may set rope_scaling={"rope_type": "default"}
-                # when no explicit scaling is provided. Treat as standard RoPE.
                 self.rotary_emb = LlamaRotaryEmbedding(
                     rope_dim,
                     max_position_embeddings=self.max_position_embeddings,
@@ -257,7 +288,9 @@ class DeepSeekMLAAttention(nn.Module):
 
         cos, sin = self.rotary_emb(q_rope, seq_len=q_len + lck)
         cos, sin = cos.to(q_rope.device), sin.to(q_rope.device)
-        q_rope, k_rope = apply_rotary_pos_emb(q_rope, k_rope_raw, cos, sin, position_ids + lck)
+        q_rope, k_rope = _apply_rotary_pos_emb_interleaved(
+            q_rope, k_rope_raw, cos, sin, position_ids + lck
+        )
 
         # Expand k_rope from [B, 1, S, rope_dim] to [B, H, S, rope_dim]
         k_rope = k_rope.expand(-1, self.num_heads, -1, -1)
