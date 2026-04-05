@@ -288,7 +288,6 @@ class VllmEngine(InferenceEngine, RayActor):
 
         if use_prompts:
             batch_size = len(formatted_prompts)
-            prompts = formatted_prompts
         else:
             if isinstance(input_ids_ref, ray.ObjectRef):
                 input_ids_list = ray.get(input_ids_ref)
@@ -297,7 +296,13 @@ class VllmEngine(InferenceEngine, RayActor):
             if input_ids_list is None:
                 raise ValueError("input_ids_ref resolved to None")
             batch_size = len(input_ids_list)
-            prompts = self._format_input_ids_for_vllm(input_ids_list)
+
+        prompts = self._build_prompts(
+            formatted_prompts=formatted_prompts if use_prompts else None,
+            input_ids_list=input_ids_list,
+            multimodal_inputs=multimodal_inputs,
+            batch_size=batch_size,
+        )
 
         if isinstance(data_id, str):
             data_ids = [f"{data_id}_{i}" for i in range(batch_size)]
@@ -382,12 +387,82 @@ class VllmEngine(InferenceEngine, RayActor):
             return input_ids
         raise ValueError(f"Unexpected input_ids shape: {input_ids.shape}")
 
-    def _format_input_ids_for_vllm(
-        self, input_ids_list: list[torch.Tensor]
-    ) -> list[dict[str, list[int]]]:
-        prompts = []
-        for ids in input_ids_list:
-            prompts.append({"prompt_token_ids": self._normalize_input_ids(ids).tolist()})
+    @staticmethod
+    def _resolve_media(items: list, fetch_fn) -> list:
+        """Resolve URL strings to loaded objects via *fetch_fn*, drop None entries."""
+        resolved = []
+        for item in items:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                resolved.append(fetch_fn(item))
+            else:
+                resolved.append(item)
+        return resolved
+
+    @staticmethod
+    def _to_vllm_multi_modal_data(mm_input: dict | None) -> dict | None:
+        """Convert TorchSpec multimodal payload to vLLM ``multi_modal_data``.
+
+        TorchSpec shape:  ``{"images": [...], "videos": [...]}``
+        vLLM shape:       ``{"image": <PIL.Image|list>, "video": ...}``
+
+        URL strings are resolved to PIL Images / video objects via
+        ``vllm.multimodal.utils.fetch_image`` / ``fetch_video`` so that
+        ``LLM.generate()`` receives the data types it expects.
+        None entries (from incomplete media blocks) are filtered out.
+        """
+        if not mm_input:
+            return None
+        mm_data: dict = {}
+        images = mm_input.get("images")
+        if images:
+            from vllm.multimodal.utils import fetch_image
+
+            loaded = VllmEngine._resolve_media(images, fetch_image)
+            if loaded:
+                mm_data["image"] = loaded[0] if len(loaded) == 1 else loaded
+        videos = mm_input.get("videos")
+        if videos:
+            try:
+                from vllm.multimodal.utils import fetch_video
+
+                loaded = VllmEngine._resolve_media(videos, fetch_video)
+            except ImportError:
+                loaded = [v for v in videos if v is not None]
+            if loaded:
+                mm_data["video"] = loaded[0] if len(loaded) == 1 else loaded
+        return mm_data or None
+
+    def _build_prompts(
+        self,
+        formatted_prompts: list[str] | None,
+        input_ids_list: list[torch.Tensor] | None,
+        multimodal_inputs: list[dict | None] | None,
+        batch_size: int,
+    ) -> list:
+        """Assemble per-request vLLM prompt dicts, attaching multimodal data when present."""
+        if multimodal_inputs is not None and len(multimodal_inputs) != batch_size:
+            raise ValueError(
+                f"multimodal_inputs length {len(multimodal_inputs)} "
+                f"does not match batch size {batch_size}"
+            )
+
+        prompts: list = []
+        for i in range(batch_size):
+            if formatted_prompts is not None:
+                prompt_dict: dict = {"prompt": formatted_prompts[i]}
+            else:
+                prompt_dict = {
+                    "prompt_token_ids": self._normalize_input_ids(input_ids_list[i]).tolist()
+                }
+
+            if multimodal_inputs is not None:
+                mm_data = self._to_vllm_multi_modal_data(multimodal_inputs[i])
+                if mm_data is not None:
+                    prompt_dict["multi_modal_data"] = mm_data
+
+            prompts.append(prompt_dict)
         return prompts
 
     def health_check(self, timeout: float = 5.0) -> bool:

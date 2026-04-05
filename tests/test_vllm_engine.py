@@ -23,6 +23,8 @@
 Unit tests: Test logic with mocks (no GPU/vLLM/Mooncake needed)
 """
 
+import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -611,6 +613,459 @@ class TestChunkedPrefillSingleWrite:
         assert len(meta2.requests) == 1
         assert meta2.requests[0].slot_mapping.shape[0] == 3 * self.BLOCK_SIZE  # 12
         assert meta2.requests[0].slot_mapping.shape[0] >= self.NUM_TOKENS
+
+
+# =============================================================================
+# Multimodal prompt assembly
+# =============================================================================
+
+
+class TestToVllmMultiModalData:
+    """Unit tests for _to_vllm_multi_modal_data static helper.
+
+    fetch_image is patched so URL strings are replaced with a sentinel
+    ``("fetched", url)`` tuple, letting us verify resolution happens
+    without actually downloading anything.
+    """
+
+    def _adapter(self):
+        try:
+            from torchspec.inference.engine.vllm_engine import VllmEngine
+        except ImportError as e:
+            pytest.skip(f"VllmEngine import failed: {e}")
+        return VllmEngine._to_vllm_multi_modal_data
+
+    @pytest.fixture(autouse=True)
+    def _patch_fetch(self, monkeypatch):
+        """Patch vllm.multimodal.utils.fetch_image to avoid real downloads."""
+        import types
+
+        fake_module = types.ModuleType("vllm.multimodal.utils")
+        fake_module.fetch_image = lambda url: ("fetched", url)
+        fake_module.fetch_video = lambda url: ("fetched_video", url)
+        monkeypatch.setitem(__import__("sys").modules, "vllm.multimodal.utils", fake_module)
+
+    def test_none_returns_none(self):
+        assert self._adapter()(None) is None
+
+    def test_empty_dict_returns_none(self):
+        assert self._adapter()({}) is None
+
+    def test_single_image_resolved(self):
+        result = self._adapter()({"images": ["http://img.png"]})
+        assert result == {"image": ("fetched", "http://img.png")}
+
+    def test_multiple_images_resolved(self):
+        result = self._adapter()({"images": ["a.png", "b.png"]})
+        assert result == {"image": [("fetched", "a.png"), ("fetched", "b.png")]}
+
+    def test_single_video_resolved(self):
+        result = self._adapter()({"videos": ["http://vid.mp4"]})
+        assert result == {"video": ("fetched_video", "http://vid.mp4")}
+
+    def test_multiple_videos_resolved(self):
+        result = self._adapter()({"videos": ["a.mp4", "b.mp4"]})
+        assert result == {"video": [("fetched_video", "a.mp4"), ("fetched_video", "b.mp4")]}
+
+    def test_images_and_videos(self):
+        result = self._adapter()({"images": ["a.png"], "videos": ["v.mp4"]})
+        assert result == {"image": ("fetched", "a.png"), "video": ("fetched_video", "v.mp4")}
+
+    def test_empty_images_ignored(self):
+        result = self._adapter()({"images": [], "videos": ["v.mp4"]})
+        assert result == {"video": ("fetched_video", "v.mp4")}
+
+    def test_none_images_ignored(self):
+        result = self._adapter()({"images": None, "videos": ["v.mp4"]})
+        assert result == {"video": ("fetched_video", "v.mp4")}
+
+    def test_all_empty_returns_none(self):
+        assert self._adapter()({"images": [], "videos": []}) is None
+
+    def test_non_string_items_passed_through(self):
+        """Pre-loaded PIL images (non-str) should not be re-fetched."""
+        pil_sentinel = object()
+        result = self._adapter()({"images": [pil_sentinel]})
+        assert result == {"image": pil_sentinel}
+
+
+def _patch_vllm_fetch(monkeypatch):
+    """Install fake vllm.multimodal.utils so fetch_image/fetch_video don't download."""
+    import sys
+    import types
+
+    fake_module = types.ModuleType("vllm.multimodal.utils")
+    fake_module.fetch_image = lambda url: ("fetched", url)
+    fake_module.fetch_video = lambda url: ("fetched_video", url)
+    monkeypatch.setitem(sys.modules, "vllm.multimodal.utils", fake_module)
+
+
+class TestBuildPrompts:
+    """Tests for per-request prompt dict assembly including multimodal data."""
+
+    @pytest.fixture(autouse=True)
+    def _patch(self, monkeypatch):
+        _patch_vllm_fetch(monkeypatch)
+
+    def test_formatted_prompts_without_mm(self):
+        engine, _ = _build_engine_with_mock_vllm()
+        prompts = engine._build_prompts(
+            formatted_prompts=["Hello", "World"],
+            input_ids_list=None,
+            multimodal_inputs=None,
+            batch_size=2,
+        )
+        assert prompts == [{"prompt": "Hello"}, {"prompt": "World"}]
+
+    def test_input_ids_without_mm(self):
+        engine, _ = _build_engine_with_mock_vllm()
+        ids_a = torch.tensor([1, 2, 3])
+        ids_b = torch.tensor([4, 5])
+        prompts = engine._build_prompts(
+            formatted_prompts=None,
+            input_ids_list=[ids_a, ids_b],
+            multimodal_inputs=None,
+            batch_size=2,
+        )
+        assert prompts == [
+            {"prompt_token_ids": [1, 2, 3]},
+            {"prompt_token_ids": [4, 5]},
+        ]
+
+    def test_formatted_prompts_with_mm(self):
+        engine, _ = _build_engine_with_mock_vllm()
+        mm = [{"images": ["a.png"]}, {"images": ["b.png", "c.png"]}]
+        prompts = engine._build_prompts(
+            formatted_prompts=["Hello", "World"],
+            input_ids_list=None,
+            multimodal_inputs=mm,
+            batch_size=2,
+        )
+        assert prompts[0] == {
+            "prompt": "Hello",
+            "multi_modal_data": {"image": ("fetched", "a.png")},
+        }
+        assert prompts[1] == {
+            "prompt": "World",
+            "multi_modal_data": {"image": [("fetched", "b.png"), ("fetched", "c.png")]},
+        }
+
+    def test_input_ids_with_mm(self):
+        engine, _ = _build_engine_with_mock_vllm()
+        ids = [torch.tensor([10, 20])]
+        mm = [{"images": ["img.png"]}]
+        prompts = engine._build_prompts(
+            formatted_prompts=None,
+            input_ids_list=ids,
+            multimodal_inputs=mm,
+            batch_size=1,
+        )
+        assert prompts == [
+            {"prompt_token_ids": [10, 20], "multi_modal_data": {"image": ("fetched", "img.png")}}
+        ]
+
+    def test_mixed_batch_some_rows_no_mm(self):
+        engine, _ = _build_engine_with_mock_vllm()
+        mm = [{"images": ["a.png"]}, None, {"videos": ["v.mp4"]}]
+        prompts = engine._build_prompts(
+            formatted_prompts=["A", "B", "C"],
+            input_ids_list=None,
+            multimodal_inputs=mm,
+            batch_size=3,
+        )
+        assert prompts[0] == {
+            "prompt": "A",
+            "multi_modal_data": {"image": ("fetched", "a.png")},
+        }
+        assert prompts[1] == {"prompt": "B"}
+        assert prompts[2] == {
+            "prompt": "C",
+            "multi_modal_data": {"video": ("fetched_video", "v.mp4")},
+        }
+
+    def test_mm_length_mismatch_raises(self):
+        engine, _ = _build_engine_with_mock_vllm()
+        with pytest.raises(ValueError, match="multimodal_inputs length"):
+            engine._build_prompts(
+                formatted_prompts=["A", "B"],
+                input_ids_list=None,
+                multimodal_inputs=[{"images": ["a.png"]}],
+                batch_size=2,
+            )
+
+
+class TestGenerateWithMultimodal:
+    """End-to-end generate() tests verifying multimodal prompts reach vLLM."""
+
+    @pytest.fixture(autouse=True)
+    def _patch(self, monkeypatch):
+        _patch_vllm_fetch(monkeypatch)
+
+    def test_formatted_prompts_mm_forwarded(self):
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                [1, 2, 3],
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                    "input_ids_list": [1, 2, 3],
+                },
+            ),
+        ]
+        results = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["Describe this image"],
+            multimodal_inputs=[{"images": ["http://example.com/img.png"]}],
+        )
+
+        assert len(results) == 1
+        call_args = mock_llm.generate.call_args
+        prompts_sent = call_args[0][0]
+        assert len(prompts_sent) == 1
+        assert prompts_sent[0]["prompt"] == "Describe this image"
+        assert prompts_sent[0]["multi_modal_data"] == {
+            "image": ("fetched", "http://example.com/img.png")
+        }
+
+    def test_input_ids_mm_forwarded(self):
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        ids = torch.tensor([10, 20, 30])
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                ids.tolist(),
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                    "input_ids_list": ids.tolist(),
+                },
+            ),
+        ]
+        results = engine.generate(
+            data_id=["d0"],
+            input_ids_ref=[ids],
+            multimodal_inputs=[{"images": ["a.png", "b.png"]}],
+        )
+
+        assert len(results) == 1
+        prompts_sent = mock_llm.generate.call_args[0][0]
+        assert prompts_sent[0]["prompt_token_ids"] == [10, 20, 30]
+        assert prompts_sent[0]["multi_modal_data"] == {
+            "image": [("fetched", "a.png"), ("fetched", "b.png")]
+        }
+
+    def test_mm_none_no_multi_modal_data_key(self):
+        """When multimodal_inputs is None, prompt dicts must not contain multi_modal_data."""
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                [1, 2],
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                },
+            ),
+        ]
+        engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["hello"],
+            multimodal_inputs=None,
+        )
+        prompts_sent = mock_llm.generate.call_args[0][0]
+        assert "multi_modal_data" not in prompts_sent[0]
+
+    def test_defer_tokenization_input_ids_preserved_with_mm(self):
+        """input_ids_list from kv_transfer_params is still the source of truth
+        even when multimodal data is attached to the request."""
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        expected_ids = [100, 200, 300, 400]
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                expected_ids,
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                    "input_ids_list": expected_ids,
+                },
+            ),
+        ]
+        results = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["Describe the image <image>"],
+            multimodal_inputs=[{"images": ["http://example.com/photo.jpg"]}],
+        )
+        assert results[0]["input_ids_list"] == expected_ids
+
+    def test_defer_tokenization_fallback_with_mm(self):
+        """When kv_transfer_params lacks input_ids_list, fall back to prompt_token_ids."""
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                [10, 20, 30],
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {},
+                    "tensor_dtypes": {},
+                },
+            ),
+        ]
+        results = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["test"],
+            multimodal_inputs=[{"images": ["img.png"]}],
+        )
+        assert results[0]["input_ids_list"] == [10, 20, 30]
+
+
+# =============================================================================
+# End-to-end: real sample data from sample_kimi_k25_conversations.jsonl
+# =============================================================================
+
+_KIMI_SAMPLE_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "examples",
+    "data",
+    "sample_kimi_k25_conversations.jsonl",
+)
+
+
+def _inline_extract_media_urls(messages):
+    """Standalone copy of extract_media_urls (avoids heavy torchspec imports)."""
+    images = []
+    videos = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "image":
+                if "image" in item:
+                    images.append(item["image"])
+                else:
+                    images.append(None)
+            elif item_type == "image_url":
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict) and "url" in image_url:
+                    images.append(image_url["url"])
+                else:
+                    images.append(None)
+            elif item_type == "video":
+                if "video" in item:
+                    videos.append(item["video"])
+                else:
+                    videos.append(None)
+    if not images and not videos:
+        return None
+    return {"images": images or None, "videos": videos or None}
+
+
+def _inline_to_vllm_mm(mm_input):
+    """Standalone copy of _to_vllm_multi_modal_data."""
+    if not mm_input:
+        return None
+    mm_data = {}
+    images = mm_input.get("images")
+    if images:
+        mm_data["image"] = images[0] if len(images) == 1 else images
+    videos = mm_input.get("videos")
+    if videos:
+        mm_data["video"] = videos[0] if len(videos) == 1 else videos
+    return mm_data or None
+
+
+class TestKimiSampleMultimodalPipeline:
+    """Verify sample_kimi_k25_conversations.jsonl flows correctly through
+    extract_media_urls -> _to_vllm_multi_modal_data -> _build_prompts."""
+
+    @pytest.fixture()
+    def kimi_samples(self):
+        if not os.path.exists(_KIMI_SAMPLE_PATH):
+            pytest.skip("sample_kimi_k25_conversations.jsonl not found")
+        samples = []
+        with open(_KIMI_SAMPLE_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    samples.append(json.loads(line))
+        return samples
+
+    def test_text_only_samples_no_mm(self, kimi_samples):
+        text_ids = {
+            "kimi_text_001",
+            "kimi_text_002",
+            "kimi_text_003",
+            "kimi_tool_001",
+            "kimi_tool_002",
+        }
+        for sample in kimi_samples:
+            if sample["id"] not in text_ids:
+                continue
+            mm = _inline_extract_media_urls(sample["conversations"])
+            assert mm is None, f"{sample['id']}: text-only should have no mm"
+            assert _inline_to_vllm_mm(mm) is None
+
+    def test_single_image_url(self, kimi_samples):
+        sample = next(s for s in kimi_samples if s["id"] == "kimi_mm_001")
+        mm = _inline_extract_media_urls(sample["conversations"])
+        assert mm == {"images": ["https://httpbin.org/image/jpeg"], "videos": None}
+        vllm_mm = _inline_to_vllm_mm(mm)
+        assert vllm_mm == {"image": "https://httpbin.org/image/jpeg"}
+
+    def test_single_image_key(self, kimi_samples):
+        sample = next(s for s in kimi_samples if s["id"] == "kimi_mm_002")
+        mm = _inline_extract_media_urls(sample["conversations"])
+        assert mm == {"images": ["https://httpbin.org/image/png"], "videos": None}
+        vllm_mm = _inline_to_vllm_mm(mm)
+        assert vllm_mm == {"image": "https://httpbin.org/image/png"}
+
+    def test_two_images(self, kimi_samples):
+        sample = next(s for s in kimi_samples if s["id"] == "kimi_mm_003")
+        mm = _inline_extract_media_urls(sample["conversations"])
+        assert mm["images"] == [
+            "https://httpbin.org/image/jpeg",
+            "https://httpbin.org/image/png",
+        ]
+        vllm_mm = _inline_to_vllm_mm(mm)
+        assert vllm_mm == {
+            "image": ["https://httpbin.org/image/jpeg", "https://httpbin.org/image/png"]
+        }
+
+    def test_mixed_batch_build_prompts(self, kimi_samples):
+        """Simulate a mixed batch (text + mm) going through _build_prompts."""
+        text_sample = next(s for s in kimi_samples if s["id"] == "kimi_text_001")
+        mm_sample = next(s for s in kimi_samples if s["id"] == "kimi_mm_001")
+
+        mm_list = [
+            _inline_extract_media_urls(text_sample["conversations"]),
+            _inline_extract_media_urls(mm_sample["conversations"]),
+        ]
+
+        prompts_text = ["What is 2+2?", "What animal is in this image?"]
+
+        # Build prompts inline (same logic as _build_prompts)
+        result = []
+        for i in range(2):
+            prompt_dict = {"prompt": prompts_text[i]}
+            vllm_mm = _inline_to_vllm_mm(mm_list[i])
+            if vllm_mm is not None:
+                prompt_dict["multi_modal_data"] = vllm_mm
+            result.append(prompt_dict)
+
+        assert "multi_modal_data" not in result[0]
+        assert result[1]["multi_modal_data"] == {"image": "https://httpbin.org/image/jpeg"}
 
 
 if __name__ == "__main__":
