@@ -133,11 +133,11 @@ def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tens
     return remapped
 
 
-def _fixup_export_config(raw_config: dict) -> dict:
+def _fixup_export_config(raw_config: dict, export_for_vllm: bool = False) -> dict:
     """Apply model-type-specific fixups to the exported config."""
     config = json.loads(json.dumps(raw_config))
 
-    if config.get("model_type") == "kimi_k2":
+    if export_for_vllm and config.get("model_type") == "kimi_k2":
         # vLLM uses 1-indexed layer IDs for kimi_k2
         key = "eagle_aux_hidden_state_layer_ids"
         if key in config:
@@ -252,7 +252,7 @@ def _save_without_vocab_pruning(
     tensors = _prepare_export_tensors(hf_model, export_for_vllm)
     save_file(tensors, os.path.join(output_dir, "model.safetensors"))
 
-    export_config = _fixup_export_config(raw_config)
+    export_config = _fixup_export_config(raw_config, export_for_vllm=export_for_vllm)
     export_config["draft_vocab_size"] = vocab_size
     actual_dtype = next(iter(tensors.values())).dtype
     export_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
@@ -309,7 +309,7 @@ def _save_with_vocab_pruning(
 
     save_file(tensors, os.path.join(output_dir, "model.safetensors"))
 
-    export_config = _fixup_export_config(raw_config)
+    export_config = _fixup_export_config(raw_config, export_for_vllm=export_for_vllm)
     export_config["draft_vocab_size"] = draft_vocab_size
     actual_dtype = next(iter(tensors.values())).dtype
     export_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
