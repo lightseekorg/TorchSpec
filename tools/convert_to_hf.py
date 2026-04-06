@@ -114,6 +114,41 @@ class _EmptyStateDictLoadPlanner(dist_cp.default_planner.DefaultLoadPlanner):
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
+# ── Export fixups ────────────────────────────────────────────────────────────
+
+# vLLM checkpoints use `layers.0.xxx` for the single decoder layer,
+# while our training code uses `midlayer.xxx`.
+_WEIGHT_KEY_REMAP = [("midlayer.", "layers.0.")]
+
+
+def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    remapped = {}
+    for k, v in tensors.items():
+        new_key = k
+        for old_prefix, new_prefix in _WEIGHT_KEY_REMAP:
+            if k.startswith(old_prefix):
+                new_key = new_prefix + k[len(old_prefix) :]
+                break
+        remapped[new_key] = v
+    return remapped
+
+
+def _fixup_export_config(raw_config: dict) -> dict:
+    """Apply model-type-specific fixups to the exported config."""
+    config = json.loads(json.dumps(raw_config))
+
+    if config.get("model_type") == "kimi_k2":
+        # vLLM uses 1-indexed layer IDs for kimi_k2
+        key = "eagle_aux_hidden_state_layer_ids"
+        if key in config:
+            config[key] = [x + 1 for x in config[key]]
+        eagle_cfg = config.get("eagle_config")
+        if eagle_cfg and key in eagle_cfg:
+            eagle_cfg[key] = [x + 1 for x in eagle_cfg[key]]
+
+    return config
+
+
 # ── Core conversion ─────────────────────────────────────────────────────────
 
 
@@ -203,16 +238,18 @@ def _extract_model_weights(
 
 
 def _save_without_vocab_pruning(
-    hf_model, output_dir: str, config_path: str, vocab_size: int
+    hf_model, output_dir: str, raw_config: dict, vocab_size: int
 ) -> None:
-    hf_model.save_pretrained(output_dir, safe_serialization=True)
-    config_json_path = os.path.join(output_dir, "config.json")
-    if os.path.isfile(config_json_path):
-        with open(config_json_path) as f:
-            saved_config = json.load(f)
-        saved_config["draft_vocab_size"] = vocab_size
-        with open(config_json_path, "w") as f:
-            json.dump(saved_config, f, indent=2)
+    tensors = _remap_weight_keys(hf_model.state_dict())
+    save_file(tensors, os.path.join(output_dir, "model.safetensors"))
+
+    export_config = _fixup_export_config(raw_config)
+    export_config["draft_vocab_size"] = vocab_size
+    actual_dtype = next(iter(tensors.values())).dtype
+    export_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
+    with open(os.path.join(output_dir, "config.json"), "w") as f:
+        json.dump(export_config, f, indent=2)
+
     logger.info(
         "Model saved to %s (no vocab pruning, draft_vocab_size=%d)",
         output_dir,
@@ -229,7 +266,7 @@ def _save_with_vocab_pruning(
     d2t: torch.Tensor,
     t2d: torch.Tensor,
 ) -> None:
-    tensors = hf_model.state_dict()
+    tensors = _remap_weight_keys(hf_model.state_dict())
     tensors["t2d"] = t2d
     tensors["d2t"] = d2t
 
@@ -262,11 +299,12 @@ def _save_with_vocab_pruning(
 
     save_file(tensors, os.path.join(output_dir, "model.safetensors"))
 
-    raw_config["draft_vocab_size"] = draft_vocab_size
+    export_config = _fixup_export_config(raw_config)
+    export_config["draft_vocab_size"] = draft_vocab_size
     actual_dtype = next(iter(tensors.values())).dtype
-    raw_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
+    export_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
     with open(os.path.join(output_dir, "config.json"), "w") as f:
-        json.dump(raw_config, f, indent=2)
+        json.dump(export_config, f, indent=2)
 
     logger.info(
         "Model saved to %s  (draft_vocab_size=%d, vocab_size=%d, d2t=%s, t2d=%s)",
@@ -460,7 +498,7 @@ def _convert_fsdp_to_hf(
                 f"in {config_path}. This model was trained with vocabulary pruning. "
                 f"Use --prune-vocab to generate t2d/d2t token mappings during conversion."
             )
-        _save_without_vocab_pruning(hf_model, output_dir, config_path, vocab_size)
+        _save_without_vocab_pruning(hf_model, output_dir, raw_config, vocab_size)
         return
 
     # ── Vocab pruning ────────────────────────────────────────────────────
