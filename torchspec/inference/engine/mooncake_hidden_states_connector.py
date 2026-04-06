@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -125,7 +126,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.requests.append(_ReqMeta.make(req_id, token_ids, block_ids, block_size, new_req))
 
 
-class MooncakeHiddenStatesConnector(KVConnectorBase_V1):
+class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     """KV Connector that stores extracted hidden states directly to Mooncake.
 
     Must be used with vLLM's ``extract_hidden_states`` speculative method.
@@ -381,6 +382,14 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1):
 
         mooncake_meta = self._req_metadata.pop(req_id, None)
         return False, mooncake_meta
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        group0_ids = block_ids[0] if block_ids else []
+        return self.request_finished(request, group0_ids)
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:

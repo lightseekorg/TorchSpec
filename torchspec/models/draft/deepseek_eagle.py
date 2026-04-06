@@ -519,7 +519,7 @@ class DeepSeekDecoderLayer(nn.Module):
         return hidden_states, cache_keys, cache_values
 
 
-class DeepSeekForCausalLMEagle3(Eagle3DraftModel):
+class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
     """Eagle3 draft model using DeepSeek MLA attention."""
 
     config_class = DeepseekV3Config
@@ -543,7 +543,7 @@ class DeepSeekForCausalLMEagle3(Eagle3DraftModel):
             self.register_buffer("d2t", torch.zeros(self.vocab_size, dtype=torch.int64))
 
         logger.info(
-            f"DeepSeekForCausalLMEagle3: hidden_size={config.hidden_size}, "
+            f"Eagle3DeepseekV2ForCausalLM: hidden_size={config.hidden_size}, "
             f"num_heads={config.num_attention_heads}, "
             f"kv_lora_rank={config.kv_lora_rank}, "
             f"q_lora_rank={config.q_lora_rank}, "

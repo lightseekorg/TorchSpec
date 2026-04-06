@@ -185,7 +185,10 @@ def call_sglang(args, server_address: str, data: Dict[str, Any], max_tokens=None
             total_output_tokens += resp.usage.completion_tokens
             resp_msg = {"role": "assistant", "content": resp.choices[0].message.content}
             if args.is_reasoning_model:
-                resp_msg["thinking"] = resp.choices[0].message.reasoning_content
+                reasoning = getattr(resp.choices[0].message, "reasoning_content", None) or (
+                    resp.choices[0].message.model_extra or {}
+                ).get("reasoning")
+                resp_msg["thinking"] = reasoning
             regenerated_messages.append(resp_msg)
         else:
             data["status"] = "error"
