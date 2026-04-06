@@ -4,7 +4,7 @@ Verifies that:
 1. Forward pass produces correct output shapes (with and without cache).
 2. Backward pass computes gradients for all trainable parameters.
 3. q_lora_rank=None path works correctly.
-4. Config dispatch correctly routes to DeepSeekForCausalLMEagle3.
+4. Config dispatch correctly routes to Eagle3DeepseekV2ForCausalLM.
 5. Softmax scale is computed correctly with YaRN mscale.
 6. Eagle3Model TTT loop works end-to-end with MLA draft model.
 """
@@ -18,8 +18,8 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 
 from torchspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.deepseek_eagle import (
-    DeepSeekForCausalLMEagle3,
     DeepSeekMLAAttention,
+    Eagle3DeepseekV2ForCausalLM,
 )
 from torchspec.models.draft.llama3_eagle import yarn_get_mscale
 from torchspec.models.eagle3 import (
@@ -71,7 +71,7 @@ def _make_config(
 
 
 def _make_model(config, length=3, device="cpu", attention_backend="sdpa"):
-    draft_model = DeepSeekForCausalLMEagle3(config, attention_backend=attention_backend)
+    draft_model = Eagle3DeepseekV2ForCausalLM(config, attention_backend=attention_backend)
     draft_model = draft_model.to(device=device, dtype=torch.bfloat16)
     model = Eagle3Model(
         draft_model,
@@ -105,7 +105,7 @@ class TestForwardShapeNoCache(unittest.TestCase):
         torch.manual_seed(42)
         H, V, B, T = 64, 256, 2, 16
         config = _make_config(H=H, V=V)
-        draft = DeepSeekForCausalLMEagle3(config).to(torch.bfloat16)
+        draft = Eagle3DeepseekV2ForCausalLM(config).to(torch.bfloat16)
 
         input_emb = torch.randn(B, T, H, dtype=torch.bfloat16)
         hidden = torch.randn(B, T, H, dtype=torch.bfloat16)
@@ -140,7 +140,7 @@ class TestForwardShapeWithCache(unittest.TestCase):
             qk_rope=qk_rope,
             v_head=v_head,
         )
-        draft = DeepSeekForCausalLMEagle3(config).to(torch.bfloat16)
+        draft = Eagle3DeepseekV2ForCausalLM(config).to(torch.bfloat16)
 
         from torchspec.models.draft.base import prepare_decoder_attention_mask
 
@@ -177,7 +177,7 @@ class TestBackward(unittest.TestCase):
         torch.manual_seed(42)
         H, V, B, T = 64, 256, 2, 8
         config = _make_config(H=H, V=V)
-        draft = DeepSeekForCausalLMEagle3(config).to(torch.bfloat16)
+        draft = Eagle3DeepseekV2ForCausalLM(config).to(torch.bfloat16)
         draft.freeze_embedding()
         draft.train()
 
@@ -220,7 +220,7 @@ class TestQLoraNone(unittest.TestCase):
         torch.manual_seed(42)
         H, V, B, T = 64, 256, 2, 8
         config = _make_config(H=H, V=V, q_lora=None)
-        draft = DeepSeekForCausalLMEagle3(config).to(torch.bfloat16)
+        draft = Eagle3DeepseekV2ForCausalLM(config).to(torch.bfloat16)
 
         self.assertFalse(hasattr(draft.midlayer.self_attn, "q_a_proj"))
         self.assertTrue(hasattr(draft.midlayer.self_attn, "q_proj"))
@@ -244,7 +244,7 @@ class TestConfigDispatch(unittest.TestCase):
 
     def test_dispatch(self):
         config_dict = {
-            "architectures": ["DeepSeekForCausalLMEagle3"],
+            "architectures": ["Eagle3DeepseekV2ForCausalLM"],
             "model_type": "deepseek_v3",
             "hidden_size": 64,
             "num_attention_heads": 4,
@@ -268,7 +268,7 @@ class TestConfigDispatch(unittest.TestCase):
         self.assertIsInstance(config, DeepseekV3Config)
 
         model = AutoEagle3DraftModel.from_config(config, torch_dtype=torch.bfloat16)
-        self.assertIsInstance(model, DeepSeekForCausalLMEagle3)
+        self.assertIsInstance(model, Eagle3DeepseekV2ForCausalLM)
 
 
 class TestSoftmaxScale(unittest.TestCase):

@@ -26,7 +26,7 @@ from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import LlamaConfig, PretrainedConfig, modeling_utils
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from torchspec.models.draft.deepseek_eagle import DeepSeekForCausalLMEagle3
+from torchspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from torchspec.utils.logging import logger
 
@@ -34,7 +34,7 @@ from torchspec.utils.logging import logger
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
-        DeepseekV3Config: DeepSeekForCausalLMEagle3,
+        DeepseekV3Config: Eagle3DeepseekV2ForCausalLM,
     }
 
     @classmethod
@@ -73,7 +73,6 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
 class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
-        "DeepSeekForCausalLMEagle3": DeepseekV3Config,
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
     }
 
