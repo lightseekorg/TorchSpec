@@ -108,6 +108,8 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     load_path: Optional[str] = None
     lr_decay_style: str = "cosine"
+    lr_wsd_decay_ratio: float = 0.2
+    lr_wsd_decay_style: str = "cosine"
     lr_total_steps: Optional[int] = None
     max_concurrent_batches: int = 1
     max_grad_norm: float = 0.5

@@ -122,13 +122,22 @@ class Eagle3Trainer(Trainer):
         self.draft_model = self.eagle3.draft_model
         self.t2d = self.draft_model.t2d if self.eagle3.vocab_pruning else None
 
+        decay_style = getattr(self.args, "lr_decay_style", "cosine")
+        wsd_decay_steps = None
+        wsd_decay_style = None
+        if decay_style == "WSD":
+            wsd_ratio = getattr(self.args, "lr_wsd_decay_ratio", 0.2)
+            wsd_decay_steps = int(wsd_ratio * self.args.lr_total_steps)
+            wsd_decay_style = getattr(self.args, "lr_wsd_decay_style", "cosine")
         self.optimizer = BF16Optimizer(
             self.draft_model,
             lr=self.args.learning_rate,
             max_grad_norm=self.args.max_grad_norm,
             warmup_ratio=getattr(self.args, "warmup_ratio", 0.1),
             total_steps=self.args.lr_total_steps,
-            decay_style=getattr(self.args, "lr_decay_style", "cosine"),
+            decay_style=decay_style,
+            wsd_decay_steps=wsd_decay_steps,
+            wsd_decay_style=wsd_decay_style,
         )
         self.lr_scheduler = self.optimizer.lr_scheduler
 

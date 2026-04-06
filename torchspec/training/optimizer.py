@@ -34,6 +34,8 @@ class BF16Optimizer:
         total_steps=800_000,
         warmup_ratio=0.015,
         decay_style="cosine",
+        wsd_decay_steps=None,
+        wsd_decay_style=None,
     ):
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
@@ -48,6 +50,8 @@ class BF16Optimizer:
             total_steps=total_steps,
             warmup_steps=int(warmup_ratio * total_steps),
             decay_style=decay_style,
+            wsd_decay_steps=wsd_decay_steps,
+            wsd_decay_style=wsd_decay_style,
         )
 
     def step(self, closure=None):
