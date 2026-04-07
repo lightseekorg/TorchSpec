@@ -88,7 +88,13 @@ class DFlashTrainer(Trainer):
                 not hasattr(config, "target_num_hidden_layers")
                 or config.target_num_hidden_layers is None
             ):
-                config.target_num_hidden_layers = 36
+                from transformers import AutoConfig
+
+                target_config = AutoConfig.from_pretrained(
+                    target_model_path,
+                    trust_remote_code=getattr(self.args, "trust_remote_code", True),
+                )
+                config.target_num_hidden_layers = target_config.num_hidden_layers
 
             draft_model = DFlashDraftModel(config)
 
