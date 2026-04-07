@@ -132,10 +132,12 @@ class Eagle3Trainer(Trainer):
         self.optimizer = BF16Optimizer(
             self.draft_model,
             lr=self.args.learning_rate,
+            weight_decay=getattr(self.args, "weight_decay", 0.0),
             max_grad_norm=self.args.max_grad_norm,
             warmup_ratio=getattr(self.args, "warmup_ratio", 0.1),
             total_steps=self.args.lr_total_steps,
             decay_style=decay_style,
+            min_lr=getattr(self.args, "min_lr", 0.0),
             wsd_decay_steps=wsd_decay_steps,
             wsd_decay_style=wsd_decay_style,
         )

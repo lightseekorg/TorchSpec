@@ -25,6 +25,8 @@ Data flow:
                 iter(fetcher)          queue.get()      store.get(key)     pad & batch
 """
 
+import queue
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -64,6 +66,8 @@ class MooncakeDataset(IterableDataset):
         dynamic_loss_mask: bool = False,
         last_turn_loss_only: bool = False,
         skip_after_header: int = 0,
+        batch_size: int = 1,
+        min_loss_tokens: int = 0,
     ):
         self.ray_queue = ray_queue
         self.mooncake_store = mooncake_store
@@ -75,6 +79,8 @@ class MooncakeDataset(IterableDataset):
         self.dynamic_loss_mask = dynamic_loss_mask
         self.last_turn_loss_only = last_turn_loss_only
         self.skip_after_header = skip_after_header
+        self._batch_size = batch_size
+        self._min_loss_tokens = min_loss_tokens
 
     def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
         """Load tensors from mooncake key into device memory."""
@@ -103,9 +109,19 @@ class MooncakeDataset(IterableDataset):
             device=self.device,
         )
 
-        self._cleanup_mooncake_data(sample)
+        tensor_dict = tensors.to_tensor_dict()
+        if self._batch_size > 1:
+            # Clone to prevent use-after-free: collator holds sample N while
+            # fetching N+1, but cleanup frees the Mooncake buffer (Issue 31).
+            # Note: clone() converts pinned → unpinned, breaking non_blocking
+            # H2D transfers. Only do this when actually needed.
+            result = {k: v.clone() for k, v in tensor_dict.items()}
+        else:
+            # batch_size=1: safe to use pinned views — consumed immediately.
+            # Preserves pinned memory for async H2D via non_blocking=True.
+            result = dict(tensor_dict)
 
-        result = tensors.to_tensor_dict()
+        self._cleanup_mooncake_data(sample)
         if sample.packed_loss_mask is not None:
             result["packed_loss_mask"] = sample.packed_loss_mask
         if sample.last_turn_loss_only is not None:
@@ -157,11 +173,21 @@ class MooncakeDataset(IterableDataset):
             logger.debug(f"__iter__: got item, mooncake_key={item.mooncake_key}")
             data = self._load_from_mooncake(item)
 
-            if self._compute_loss_mask(data) is None:
+            mask = self._compute_loss_mask(data)
+            if mask is None:
                 skip_count += 1
                 logger.warning(
                     f"Skipping sample with all-zero loss mask "
                     f"(mooncake_key={item.mooncake_key}, total_skipped={skip_count})"
+                )
+                continue
+
+            if self._min_loss_tokens > 0 and isinstance(mask, torch.Tensor) and mask.sum() < self._min_loss_tokens:
+                skip_count += 1
+                logger.warning(
+                    f"Skipping sample with too few loss-masked tokens "
+                    f"({int(mask.sum())} < {self._min_loss_tokens}, "
+                    f"mooncake_key={item.mooncake_key}, total_skipped={skip_count})"
                 )
                 continue
 
@@ -206,6 +232,7 @@ def create_mooncake_dataloader(
     dynamic_loss_mask: bool = False,
     last_turn_loss_only: bool = False,
     skip_after_header: int = 0,
+    min_loss_tokens: int = 0,
 ) -> DataLoader:
     """Create a DataLoader that fetches from mooncake via queue.
 
@@ -244,6 +271,8 @@ def create_mooncake_dataloader(
         dynamic_loss_mask=dynamic_loss_mask,
         last_turn_loss_only=last_turn_loss_only,
         skip_after_header=skip_after_header,
+        batch_size=batch_size,
+        min_loss_tokens=min_loss_tokens,
     )
 
     return DataLoader(
@@ -284,6 +313,7 @@ class MooncakeDataFetcher:
         dynamic_loss_mask: bool = False,
         last_turn_loss_only: bool = False,
         skip_after_header: int = 0,
+        min_loss_tokens: int = 0,
     ):
         self.batch_size = batch_size
         self._dataloader = create_mooncake_dataloader(
@@ -299,7 +329,80 @@ class MooncakeDataFetcher:
             dynamic_loss_mask=dynamic_loss_mask,
             last_turn_loss_only=last_turn_loss_only,
             skip_after_header=skip_after_header,
+            min_loss_tokens=min_loss_tokens,
         )
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         return iter(self._dataloader)
+
+
+class PrefetchedDataFetcher:
+    """Wraps MooncakeDataFetcher with async pre-fetching.
+
+    A background thread continuously fetches batches from the underlying
+    MooncakeDataFetcher (which blocks on Mooncake TCP), staging them in a
+    thread-safe queue.  The training loop reads from this queue, overlapping
+    data transfer with GPU compute.
+
+    Without prefetch: [data] → [compute] → [data] → [compute]  (sequential)
+    With prefetch:    [compute] → [compute] → [compute]         (overlapped)
+                      [data]      [data]      [data]
+
+    The background thread starts lazily on the first ``__iter__`` call and
+    keeps running across multiple ``itertools.islice`` invocations (one per
+    training step).  The training loop simply reads from the shared queue.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(
+        self,
+        inner: MooncakeDataFetcher,
+        prefetch_depth: int = 2,
+        target_device: Optional[torch.device] = None,
+    ):
+        self.inner = inner
+        self.prefetch_depth = prefetch_depth
+        self.target_device = target_device
+        self._queue: queue.Queue = queue.Queue(maxsize=prefetch_depth)
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
+        self._error: Optional[BaseException] = None
+
+    def _prefetch_loop(self) -> None:
+        try:
+            for batch in self.inner:
+                self._queue.put(batch)
+        except Exception as e:
+            self._error = e
+        finally:
+            self._queue.put(self._SENTINEL)
+
+    def _ensure_started(self) -> None:
+        if not self._started:
+            self._started = True
+            self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+            self._thread.start()
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        self._ensure_started()
+        return self
+
+    def _to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Move a batch of tensors to the target device (GPU)."""
+        if self.target_device is None:
+            return batch
+        return {
+            k: v.to(self.target_device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+
+    def __next__(self) -> Dict[str, torch.Tensor]:
+        if self._error is not None:
+            raise self._error
+        item = self._queue.get()
+        if item is self._SENTINEL:
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+        return self._to_device(item)

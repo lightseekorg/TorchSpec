@@ -174,7 +174,8 @@ def apply_fsdp2(
     offload_policy = CPUOffloadPolicy() if cpu_offload else None
 
     param_dtype = torch.bfloat16
-    reduce_dtype = torch.float32
+    reduce_dtype_str = getattr(args, "fsdp_reduce_dtype", "float32") if args else "float32"
+    reduce_dtype = torch.bfloat16 if reduce_dtype_str == "bfloat16" else torch.float32
 
     if args is not None and getattr(args, "fp16", False):
         param_dtype = torch.float16
