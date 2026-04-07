@@ -50,7 +50,7 @@ def _create_dflash_mask_mod(
 
     Rules:
       1. Each block sees context strictly before its anchor (kv_idx < anchor_pos)
-      2. Intra-block attention is bidirectional
+      2. Intra-block attention is bidirectional (per SpecForge PR #427)
       3. Different blocks are invisible to each other
       4. Invalid blocks (block_keep_mask=False) see nothing
     """
@@ -328,6 +328,10 @@ class DFlashModel(nn.Module):
         )
         weight_mask = weight_mask * original_loss_mask_gathered
 
+        # Capture binary mask BEFORE applying decay weights. Accuracy measures
+        # "did we predict correctly?" uniformly across positions, while decay
+        # only shapes gradient contribution. SpecForge uses no decay at all;
+        # our decay weighting is an addition to the training signal, not the metric.
         binary_eval_mask = weight_mask.view(-1)
 
         # Loss decay: exp(-(k-1)/γ) so k=1 (1st prediction) gets weight 1.0

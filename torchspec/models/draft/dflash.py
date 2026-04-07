@@ -106,6 +106,7 @@ class DFlashRotaryEmbedding(nn.Module):
         self.base = base
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # +20 buffer avoids cache rebuild if sequences slightly exceed the configured limit.
         self._set_cos_sin_cache(max_position_embeddings + 20, self.inv_freq.device, torch.float32)
 
     def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
@@ -131,6 +132,8 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+# NOTE: Not called in DFlashAttention.forward() (RoPE is applied inline there),
+# but kept as a standard utility matching SpecForge's apply_rotary_pos_emb.
 def _apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
