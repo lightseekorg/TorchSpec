@@ -33,54 +33,16 @@ MRV2, CUDA graphs, and ``torch.compile``.
 
 import os
 import socket
-from typing import Any, Callable
+from typing import Any
 
 import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
-from transformers import PretrainedConfig
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
 from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
-
-
-def _make_hf_overrides_fn(
-    overrides: dict[str, Any],
-) -> Callable[[PretrainedConfig], PretrainedConfig]:
-    """Convert a dict of hf_overrides into a callable that also strips
-    ``mrope_section`` from ``text_config.rope_parameters``.
-
-    vLLM's dict-based ``hf_overrides`` merges recursively and cannot delete
-    keys.  Models like Qwen3.5 ship with ``mrope_section`` in their text
-    config (needed for the VL wrapper) but the text-only ``ForCausalLM``
-    class does not implement ``SupportsMRoPE``, so the runner crashes.
-    Using a callable lets us both apply the user overrides and strip the
-    offending key in one pass.
-    """
-
-    def _apply(config: PretrainedConfig) -> PretrainedConfig:
-        for key, value in overrides.items():
-            if isinstance(value, dict):
-                target = getattr(config, key, None)
-                if target is not None and isinstance(target, PretrainedConfig):
-                    for k, v in value.items():
-                        setattr(target, k, v)
-                else:
-                    setattr(config, key, value)
-            else:
-                setattr(config, key, value)
-
-        text_cfg = config.get_text_config()
-        rope_params = getattr(text_cfg, "rope_parameters", None)
-        if isinstance(rope_params, dict) and "mrope_section" in rope_params:
-            rope_params.pop("mrope_section", None)
-            logger.info("Stripped mrope_section from text_config.rope_parameters")
-        return config
-
-    return _apply
-
 
 _PROTECTION_ENGINE_KEYS = frozenset(
     {
@@ -293,9 +255,6 @@ class VllmEngine(InferenceEngine, RayActor):
                 )
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTION_ENGINE_KEYS}
             engine_kwargs.update(extra)
-
-        if isinstance(engine_kwargs.get("hf_overrides"), dict):
-            engine_kwargs["hf_overrides"] = _make_hf_overrides_fn(engine_kwargs["hf_overrides"])
 
         inference_batch_size = getattr(self.args, "inference_batch_size", None)
         if inference_batch_size is not None:
