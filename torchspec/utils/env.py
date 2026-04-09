@@ -19,6 +19,8 @@ _TORCHSPEC_ENV_KEYS = [
     "TORCHSPEC_LOG_DIR",
     "TORCHSPEC_LOG_LEVEL",
     "TP_SOCKET_IFNAME",
+    "CUTE_DSL_CACHE_DIR",
+    "TORCHSPEC_FLASH_ATTN_OPT_LEVEL",
 ]
 
 # Prevent Ray from overriding VISIBLE_DEVICES so actors manage GPU assignment themselves.

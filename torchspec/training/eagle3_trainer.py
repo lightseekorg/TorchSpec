@@ -157,7 +157,7 @@ class Eagle3Trainer(Trainer):
         self.target_lm_head_weight = self.target_lm_head.lm_head.weight
         self.verifier_norm = self.target_lm_head.norm
 
-        if getattr(self.args, "attention_backend", None) == "fa_experimental":
+        if getattr(self.args, "attention_backend", None) in ("fa4", "fa_experimental"):
             from torchspec.models.draft.llama3_eagle import (
                 _has_cute_dsl,
                 warmup_flash_attention_masked,

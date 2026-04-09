@@ -8,7 +8,7 @@ dynamic = ["version", "description"]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "transformers==4.57.1",
+    "transformers",
     "datasets",
     "setuptools",
     "tqdm",
@@ -27,7 +27,6 @@ dependencies = [
     "openai",
     "omegaconf",
     "ray",
-    "sglang-router",
     "numba",
 ]
 
@@ -46,9 +45,9 @@ vllm = [
 ]
 
 fa = [
-    "flash-attention-cute @ git+https://github.com/Dao-AILab/flash-attention.git@fec3a6a18460c1b40f097208d4c16fe8964a679d#subdirectory=flash_attn/cute",
-    "nvidia-cutlass-dsl==4.4.0.dev1",
-    "nvidia-cutlass-dsl-libs-base==4.4.0.dev1",
+    "flash-attn-4>=4.0.0b7",
+    "nvidia-cutlass-dsl>=4.4.2",
+    "nvidia-cutlass-dsl-libs-base>=4.4.2",
 ]
 
 
