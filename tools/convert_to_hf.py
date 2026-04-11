@@ -66,6 +66,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_VERSION_FILE = os.path.join(os.path.dirname(__file__), "..", "version.txt")
+
+
+def _get_torchspec_version() -> str:
+    try:
+        with open(_VERSION_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return "unknown"
+
 
 # ── FSDP loading helpers ─────────────────────────────────────────────────────
 
@@ -249,11 +259,17 @@ def _prepare_export_tensors(hf_model, export_for_vllm: bool) -> dict[str, torch.
 def _save_without_vocab_pruning(
     hf_model, output_dir: str, raw_config: dict, vocab_size: int, export_for_vllm: bool = False
 ) -> None:
+    version = _get_torchspec_version()
     tensors = _prepare_export_tensors(hf_model, export_for_vllm)
-    save_file(tensors, os.path.join(output_dir, "model.safetensors"))
+    save_file(
+        tensors,
+        os.path.join(output_dir, "model.safetensors"),
+        metadata={"torchspec_version": version},
+    )
 
     export_config = _fixup_export_config(raw_config, export_for_vllm=export_for_vllm)
     export_config["draft_vocab_size"] = vocab_size
+    export_config["_torchspec_version"] = version
     actual_dtype = next(iter(tensors.values())).dtype
     export_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
     with open(os.path.join(output_dir, "config.json"), "w") as f:
@@ -307,10 +323,16 @@ def _save_with_vocab_pruning(
                 draft_vocab_size,
             )
 
-    save_file(tensors, os.path.join(output_dir, "model.safetensors"))
+    version = _get_torchspec_version()
+    save_file(
+        tensors,
+        os.path.join(output_dir, "model.safetensors"),
+        metadata={"torchspec_version": version},
+    )
 
     export_config = _fixup_export_config(raw_config, export_for_vllm=export_for_vllm)
     export_config["draft_vocab_size"] = draft_vocab_size
+    export_config["_torchspec_version"] = version
     actual_dtype = next(iter(tensors.values())).dtype
     export_config["torch_dtype"] = str(actual_dtype).replace("torch.", "")
     with open(os.path.join(output_dir, "config.json"), "w") as f:

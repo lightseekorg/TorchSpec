@@ -1,0 +1,88 @@
+TorchSpec patches for vllm v0.19.0
+
+1. Fix flash_attn rotary embedding import with FA4
+   vllm/model_executor/layers/rotary_embedding/common.py
+
+2. Fix extract_hidden_states crash with quantized KV cache dtype
+   vllm/model_executor/models/extract_hidden_states.py
+
+3. Fix extract_hidden_states for VLM models (PR #38987)
+   vllm/transformers_utils/configs/extract_hidden_states.py
+   (already in vllm >= 0.19.0, included here for older versions)
+
+Apply:
+  cd $VLLM_ROOT && git apply /path/to/vllm.patch
+
+--- a/vllm/model_executor/layers/rotary_embedding/common.py
++++ b/vllm/model_executor/layers/rotary_embedding/common.py
+@@ -135,8 +135,11 @@
+ 
+         self.apply_rotary_emb_flash_attn = None
+         if find_spec("flash_attn") is not None:
+-            from flash_attn.ops.triton.rotary import apply_rotary
++            try:
++                from flash_attn.ops.triton.rotary import apply_rotary
+ 
+-            self.apply_rotary_emb_flash_attn = apply_rotary
++                self.apply_rotary_emb_flash_attn = apply_rotary
++            except (ImportError, ModuleNotFoundError):
++                pass
+ 
+     @staticmethod
+diff --git a/vllm/model_executor/models/extract_hidden_states.py b/vllm/model_executor/models/extract_hidden_states.py
+index 608e93d..c967983 100644
+--- a/vllm/model_executor/models/extract_hidden_states.py
++++ b/vllm/model_executor/models/extract_hidden_states.py
+@@ -9,6 +9,7 @@ extract_hidden_states speculative decoding method.
+ """
+ 
+ from collections.abc import Iterable
++from dataclasses import replace
+ from typing import ClassVar
+ 
+ import torch
+@@ -352,6 +353,12 @@ class ExtractHiddenStatesModel(nn.Module):
+ 
+         cache_config = vllm_config.cache_config
+ 
++        # Hidden states dtype should be independent of KV cache dtype.
++        if cache_config is not None and is_quantized_kv_cache(
++            cache_config.cache_dtype
++        ):
++            cache_config = replace(cache_config, cache_dtype="auto")
++
+         # Create a single cache-only attention layer
+         # Note: We set num_heads <- self.num_hidden_states
+         # and head_size <- hidden_size so that we can insert
+diff --git a/vllm/transformers_utils/configs/extract_hidden_states.py b/vllm/transformers_utils/configs/extract_hidden_states.py
+index 5391fbe1ad53..2beec0e3081b 100644
+--- a/vllm/transformers_utils/configs/extract_hidden_states.py
++++ b/vllm/transformers_utils/configs/extract_hidden_states.py
+@@ -23,10 +23,14 @@ def __init__(
+ 
+         if isinstance(model, dict):
+             model_dict = model
++            source_text_config = None
+         elif isinstance(model, PretrainedConfig):
+             model_dict = model.to_dict()
++            text_config = model.get_text_config()
++            source_text_config = text_config if text_config is not model else None
+         else:
+             model_dict = {}
++            source_text_config = None
+ 
+         # Combine: model_dict first, then kwargs override
+         combined = {**model_dict, **kwargs}
+@@ -35,6 +39,12 @@ def __init__(
+ 
+         combined["architectures"] = ["ExtractHiddenStatesModel"]
+ 
++        # to_dict() and kwargs both flatten text_config to a plain dict;
++        # downstream get_hf_text_config() needs it as a PretrainedConfig
++        # for attribute access. Re-insert the original object.
++        if source_text_config is not None:
++            combined["text_config"] = source_text_config
++
+         super().__init__(**combined)
+ 
+     @classmethod
