@@ -221,6 +221,31 @@ class Eagle3Trainer(Trainer):
             self.target_lm_head.eval()
             self.target_lm_head.requires_grad_(False)
 
+        # Sync norm status from rank 0 so all ranks have the same parameter count
+        # before the broadcast loop (prevents NCCL deadlock if norm loading
+        # silently failed on rank 0 but structure creation succeeded elsewhere).
+        has_norm = torch.tensor(
+            [self.target_lm_head.norm is not None], dtype=torch.int32, device="cuda"
+        )
+        dist.broadcast(has_norm, src=0)
+        if has_norm.item():
+            if self.target_lm_head.norm is None:
+                logger.warning(
+                    f"[Rank {self.dp_rank}] Rank 0 has norm but this rank does not — "
+                    "this indicates _init_norm_structure failed; attempting recovery"
+                )
+                self.target_lm_head._init_norm_structure()
+                self.target_lm_head.norm = self.target_lm_head.norm.to(
+                    device="cuda", dtype=torch.bfloat16
+                )
+        else:
+            if self.target_lm_head.norm is not None:
+                logger.warning(
+                    f"[Rank {self.dp_rank}] Rank 0 does not have norm — "
+                    "removing norm on this rank to match"
+                )
+                self.target_lm_head.norm = None
+
         dist.barrier()
 
         for param in self.target_lm_head.parameters():

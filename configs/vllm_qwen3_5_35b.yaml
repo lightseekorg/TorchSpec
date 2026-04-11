@@ -1,0 +1,79 @@
+# Configuration for train_entry.py with vLLM Engine inference (nested config format)
+#
+# GPU allocation:
+#   - 4 GPUs for inference (TP=4 for Qwen3.5-35B-A3B)
+#   - 4 GPUs for training (DP/FSDP: model sharded across 4 GPUs)
+#   - Total: 8 GPUs
+#
+# Installation:
+#   pip install -e ".[vllm]"  # Install vLLM backend
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/vllm_qwen3_35b.yaml
+#
+# Note: Uses vLLM's extract_hidden_states speculative method with MooncakeHiddenStatesConnector.
+
+model:
+  target_model_path: Qwen/Qwen3.5-35B-A3B
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ??
+  eval_data_path: ??
+  eval_interval: 1000
+  chat_template: qwen
+  prompt_key: conversations
+  defer_tokenization: true
+
+
+training:
+  attention_backend: fa4
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 2.0
+  max_seq_length: 65536
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+  ttt_length: 4
+  save_per_epoch: true
+  warmup_ratio: 0.015
+  save_interval: 5000
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 4
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 2
+  aux_hidden_states_layers: [3, 19, 35]
+  vllm:
+    tp_size: 1
+    extra_args:
+      max_num_batched_tokens: 65536
+      enable_chunked_prefill: true
+      enforce_eager: true
+
+mooncake:
+  protocol: tcp
+  global_segment_size: 128GB
+  local_buffer_size: 8GB
+  master_server_address: null
+  metadata_server: null
+
+output_dir: ./outputs/qwen3_5-35b-single-node
+cache_dir: ./cache/qwen3_5-35b-single-node
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

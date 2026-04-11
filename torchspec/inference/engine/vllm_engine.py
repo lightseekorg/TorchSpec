@@ -155,7 +155,12 @@ class VllmEngine(InferenceEngine, RayActor):
         # after layer N runs".  vllm's capture hook fires at the INPUT of each
         # listed layer (= output of the previous layer), so we shift by +1 to
         # align with sglang's convention.
-        self.aux_hidden_state_layer_ids = [lid + 1 for lid in self.aux_hidden_state_layer_ids]
+        # Skip the shift for the final layer — it would overflow to
+        # num_hidden_layers, and the append block below handles it correctly.
+        num_layers = _cfg.num_hidden_layers
+        self.aux_hidden_state_layer_ids = [
+            lid + 1 for lid in self.aux_hidden_state_layer_ids if lid + 1 < num_layers
+        ]
         if self.rank == 0:
             logger.info(
                 f"Shifted aux layer ids +1 for vllm (post-layer → pre-next-layer): "
@@ -346,7 +351,7 @@ class VllmEngine(InferenceEngine, RayActor):
         # 2x safety for PyTorch allocator fragmentation + small extras
         reserved_bytes = int(connector_bytes * 2)
 
-        total_gpu_bytes = torch.cuda.get_device_properties(0).total_memory
+        total_gpu_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
         overhead_frac = reserved_bytes / total_gpu_bytes
         adjusted = base - overhead_frac
         adjusted = max(adjusted, 0.4)

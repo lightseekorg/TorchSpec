@@ -1,5 +1,72 @@
---- a/vllm/v1/core/kv_cache_utils.py	2026-04-09 08:45:04.525155907 +0000
-+++ b/vllm/v1/core/kv_cache_utils.py	2026-04-09 02:50:54.699304331 +0000
+Hybrid KV cache + SupportsHMA patches for vLLM 0.19
+
+Superseded by: https://github.com/vllm-project/vllm/pulls?q=is%3Aopen+is%3Apr+kv_offload%2BHMA
+Once the kv_offload+HMA series lands (PRs #36644, #36645, #37885, #38261,
+#38453, #39401–#39403), this patch is no longer needed.
+
+1. vllm/config/vllm.py — Check supports_hma() on connector class before
+   auto-disabling HMA when kv_transfer_config is set (backport of PR #36636).
+
+2. vllm/v1/core/kv_cache_utils.py — Handle heterogeneous page sizes
+   (e.g. FullAttention + Mamba/GDN) in KV cache allocation, grouping,
+   and memory estimation.
+
+3. vllm/v1/spec_decode/extract_hidden_states.py — Use per-layer slot_mappings
+   for CacheOnly during propose.  On hybrid models the CacheOnly layer is in
+   a separate KV group; common_attn_metadata.slot_mapping belongs to the
+   attention group and has wrong block_size / block IDs.
+
+Apply:
+  cd /usr/local/lib/python3.12/dist-packages && patch -p1 < /path/to/hybrid_kv_cache.patch
+
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1251,18 +1251,32 @@
+         if self.scheduler_config.disable_hybrid_kv_cache_manager is None:
+             # Default to disable HMA, but only if the user didn't express a preference.
+             if self.kv_transfer_config is not None:
+-                # NOTE(Kuntai): turn HMA off for connector unless specifically enabled.
+-                need_disable_hybrid_kv_cache_manager = True
+-                logger.warning(
+-                    "Turning off hybrid kv cache manager because "
+-                    "`--kv-transfer-config` is set. This will reduce the "
+-                    "performance of vLLM on LLMs with sliding window attention "
+-                    "or Mamba attention. If you are a developer of kv connector"
+-                    ", please consider supporting hybrid kv cache manager for "
+-                    "your connector by making sure your connector is a subclass"
+-                    " of `SupportsHMA` defined in kv_connector/v1/base.py and"
+-                    " use --no-disable-hybrid-kv-cache-manager to start vLLM."
++                from vllm.distributed.kv_transfer.kv_connector.v1.base import (
++                    supports_hma as _supports_hma,
+                 )
++                from vllm.distributed.kv_transfer.kv_connector.factory import (
++                    KVConnectorFactory,
++                )
++                connector_cls = KVConnectorFactory.get_connector_class(
++                    self.kv_transfer_config)
++                if _supports_hma(connector_cls):
++                    logger.info(
++                        "Connector %s supports HMA; keeping hybrid kv cache "
++                        "manager enabled.", connector_cls.__name__,
++                    )
++                else:
++                    need_disable_hybrid_kv_cache_manager = True
++                    logger.warning(
++                        "Turning off hybrid kv cache manager because "
++                        "`--kv-transfer-config` is set. This will reduce the "
++                        "performance of vLLM on LLMs with sliding window "
++                        "attention or Mamba attention. If you are a developer "
++                        "of kv connector, please consider supporting hybrid kv"
++                        " cache manager for your connector by making sure your"
++                        " connector is a subclass of `SupportsHMA` defined in "
++                        "kv_connector/v1/base.py and use "
++                        "--no-disable-hybrid-kv-cache-manager to start vLLM."
++                    )
+             self.scheduler_config.disable_hybrid_kv_cache_manager = (
+                 need_disable_hybrid_kv_cache_manager
+             )
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
 @@ -1123,32 +1123,58 @@
              for layer_name in kv_cache_groups[0].layer_names
          ]
@@ -132,3 +199,33 @@
      # General case: group_size pools, each shared by one layer per group
      # Memory = group_size * page_size * blocks_for_max_len
      group_size = max(len(group.layer_names) for group in kv_cache_groups)
+--- a/vllm/v1/spec_decode/extract_hidden_states.py
++++ b/vllm/v1/spec_decode/extract_hidden_states.py
+@@ -131,11 +131,24 @@
+         if num_tokens_across_dp is not None:
+             num_tokens_across_dp[self.dp_rank] = num_input_tokens
+ 
++        cache_only_slot_mapping = None
++        if slot_mappings is not None:
++            if isinstance(slot_mappings, dict):
++                cache_only_slot_mapping = next(
++                    (v for k, v in slot_mappings.items()
++                     if "cache_only" in k), None)
++            elif isinstance(slot_mappings, list) and slot_mappings:
++                cache_only_slot_mapping = next(
++                    (v for k, v in slot_mappings[0].items()
++                     if "cache_only" in k), None)
++        if cache_only_slot_mapping is None:
++            cache_only_slot_mapping = common_attn_metadata.slot_mapping
++
+         with set_forward_context(
+             per_layer_attn_metadata,
+             self.vllm_config,
+             num_tokens=num_input_tokens,
+             num_tokens_across_dp=num_tokens_across_dp,
+             cudagraph_runtime_mode=cudagraph_runtime_mode,
+             slot_mapping=self._get_slot_mapping(
+-                num_input_tokens, common_attn_metadata.slot_mapping
++                num_input_tokens, cache_only_slot_mapping
+             ),
+         ):
