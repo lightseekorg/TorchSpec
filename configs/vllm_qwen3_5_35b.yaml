@@ -1,9 +1,9 @@
 # Configuration for train_entry.py with vLLM Engine inference (nested config format)
 #
 # GPU allocation:
-#   - 4 GPUs for inference (TP=4 for Qwen3.5-35B-A3B)
-#   - 4 GPUs for training (DP/FSDP: model sharded across 4 GPUs)
-#   - Total: 8 GPUs
+#   - 2 GPUs for inference (2 inference GPUs total, TP=1 per engine)
+#   - 2 GPUs for training (DP/FSDP across 2 GPUs)
+#   - Total: 4 GPUs
 #
 # Installation:
 #   pip install -e ".[vllm]"  # Install vLLM backend
