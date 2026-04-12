@@ -25,8 +25,10 @@ from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import LlamaConfig, PretrainedConfig, modeling_utils
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from torchspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
+from torchspec.models.draft.dflash import DFlashDraftModel
 from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from torchspec.utils.logging import logger
 
@@ -74,6 +76,7 @@ class AutoDraftModelConfig:
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
+        "DFlashDraftModel": Qwen3Config,
     }
 
     @classmethod
@@ -107,3 +110,28 @@ class AutoDraftModelConfig:
         with open(config_path, "r") as f:
             config = json.load(f)
         return cls.from_dict(config)
+
+
+class AutoDFlashDraftModel:
+    """Auto-model factory for DFlash draft models.
+
+    Separate from AutoEagle3DraftModel — DFlash and Eagle3 are independent
+    architectures that must not share model factories.
+    """
+
+    _model_mapping = {
+        Qwen3Config: DFlashDraftModel,
+    }
+
+    @classmethod
+    def from_config(cls, config: PretrainedConfig, torch_dtype=None, **config_kwargs):
+        _model_cls = cls._model_mapping.get(type(config))
+        if _model_cls is None:
+            raise ValueError(
+                f"DFlash does not support config type {type(config).__name__}. "
+                f"Supported: {[c.__name__ for c in cls._model_mapping]}"
+            )
+        model = _model_cls(config, **config_kwargs)
+        if torch_dtype is not None:
+            model = model.to(dtype=torch_dtype)
+        return model

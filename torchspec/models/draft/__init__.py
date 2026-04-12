@@ -18,14 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from torchspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from torchspec.models.draft.auto import (
+    AutoDFlashDraftModel,
+    AutoDraftModelConfig,
+    AutoEagle3DraftModel,
+)
 from torchspec.models.draft.base import Eagle3DraftModel
 from torchspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
+from torchspec.models.draft.dflash import DFlashDraftModel
 from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 
 __all__ = [
+    "AutoDFlashDraftModel",
     "AutoDraftModelConfig",
     "AutoEagle3DraftModel",
+    "DFlashDraftModel",
     "Eagle3DeepseekV2ForCausalLM",
     "Eagle3DraftModel",
     "LlamaForCausalLMEagle3",

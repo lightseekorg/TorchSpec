@@ -166,8 +166,30 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         # Get configuration
         mem_fraction = getattr(self.args, "sglang_mem_fraction_static", 0.8)
         pp_size = getattr(self.args, "sglang_pp_size", 1)
+        self._draft_algorithm = getattr(self.args, "draft_algorithm", "eagle3")
         if self.args.aux_hidden_states_layers is not None:
             self.aux_hidden_state_layer_ids = self.args.aux_hidden_states_layers
+        elif self._draft_algorithm == "dflash":
+            # DFlash: compute layer IDs from draft config (single source of truth)
+            from torchspec.models.draft.dflash import build_target_layer_ids
+
+            draft_cfg = getattr(self.args, "draft_model_config_obj", None)
+            num_target_layers = getattr(draft_cfg, "num_target_layers", None)
+            num_draft_layers = getattr(draft_cfg, "num_hidden_layers", None)
+            if num_target_layers is None or num_draft_layers is None:
+                raise ValueError(
+                    "DFlash requires num_target_layers and num_hidden_layers in the draft config"
+                )
+            dflash_config = getattr(draft_cfg, "dflash_config", {}) or {}
+            explicit_ids = dflash_config.get("target_layer_ids", None)
+            if explicit_ids is not None:
+                self.aux_hidden_state_layer_ids = explicit_ids
+            else:
+                self.aux_hidden_state_layer_ids = build_target_layer_ids(
+                    num_target_layers, num_draft_layers
+                )
+            if self.rank == 0:
+                logger.info(f"DFlash aux hidden state layer ids: {self.aux_hidden_state_layer_ids}")
         else:
             self.aux_hidden_state_layer_ids = get_default_eagle3_aux_layer_ids(
                 self.args.target_model_path
@@ -243,6 +265,12 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                 "chunked_prefill_size": -1,
                 "allow_auto_truncate": True,
                 **({"context_length": max_seq_length} if max_seq_length else {}),
+                # DFlash: suppress last_hidden_states storage in Mooncake
+                **(
+                    {"spec_training_store_last_hidden_states": False}
+                    if self._draft_algorithm == "dflash"
+                    else {}
+                ),
             }
         )
 
@@ -532,16 +560,21 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
         # IMPORTANT: Sglang stores tensors WITHOUT batch dimension in mooncake
         # We must request the SAME shapes that sglang stored, otherwise we get size mismatch
         # The collator will add batch dimension when needed
-        return {
+        shapes = {
             "hidden_states": (seq_len, concat_hidden_size),  # 2D without batch dim
             "input_ids": (seq_len,),  # 1D without batch dim
-            "last_hidden_states": (seq_len, hidden_size),  # 2D without batch dim
         }
+        # DFlash does not use last_hidden_states
+        if self._draft_algorithm != "dflash":
+            shapes["last_hidden_states"] = (seq_len, hidden_size)  # 2D without batch dim
+        return shapes
 
     def _get_tensor_dtypes(self) -> dict:
         """Get tensor dtypes for mooncake metadata."""
-        return {
+        dtypes = {
             "hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
             "input_ids": torch.long,
-            "last_hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
         }
+        if self._draft_algorithm != "dflash":
+            dtypes["last_hidden_states"] = HIDDEN_STATES_STORAGE_DTYPE
+        return dtypes

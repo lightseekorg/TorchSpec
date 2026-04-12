@@ -102,10 +102,6 @@ class DataCollatorWithPadding:
             )
             has_target = all(item.get("target") is not None for item in features)
             has_last_hs = all(item.get("last_hidden_states") is not None for item in features)
-            if not has_target and not has_last_hs:
-                raise ValueError(
-                    "Either 'target' or 'last_hidden_states' is required when 'hidden_states' is provided"
-                )
             if has_target:
                 batch["target"] = torch.cat(
                     [self.paddingtensor(item["target"], max_length) for item in features]

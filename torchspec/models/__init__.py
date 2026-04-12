@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from torchspec.models.dflash import DFlashModel
 from torchspec.models.eagle3 import (
     Eagle3Model,
     compute_lazy_target_padded,
@@ -27,6 +28,7 @@ from torchspec.models.ops.loss import compiled_forward_kl_loss
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 __all__ = [
+    "DFlashModel",
     "Eagle3Model",
     "compute_lazy_target_padded",
     "compute_target_p_padded",

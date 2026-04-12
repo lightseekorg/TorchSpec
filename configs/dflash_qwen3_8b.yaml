@@ -1,0 +1,36 @@
+# DFlash training config for Qwen3-8B target model with SGLang backend.
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/dflash_qwen3_8b.yaml
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/draft_models/qwen3_8b_dflash.json
+  target_model_backend: sglang
+
+dataset:
+  train_data_path: ""  # Set to your dataset path
+  chat_template: qwen
+  defer_tokenization: false  # DFlash requires pre-tokenization
+
+training:
+  draft_algorithm: dflash
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 7.0
+  attention_backend: sdpa
+  micro_batch_size: 2
+  learning_rate: 6e-4
+  max_seq_length: 8192
+  max_grad_norm: 1.0
+  warmup_ratio: 0.04
+  num_epochs: 6
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+
+inference:
+  inference_engine_type: sgl
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.8
+
+output_dir: ./outputs/dflash_qwen3_8b

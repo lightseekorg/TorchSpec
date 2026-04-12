@@ -26,7 +26,6 @@ import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig
 from torchspec.ray.ray_actor import RayActor
-from torchspec.training.eagle3_trainer import Eagle3Trainer
 from torchspec.utils.distributed import init_gloo_group
 from torchspec.utils.logging import setup_file_logging
 
@@ -64,7 +63,15 @@ class TrainerActor(RayActor):
         args.rank = dist.get_rank()
         args.world_size = dist.get_world_size()
 
-        self._trainer = Eagle3Trainer(args)
+        draft_algorithm = getattr(args, "draft_algorithm", "eagle3")
+        if draft_algorithm == "dflash":
+            from torchspec.training.dflash_trainer import DFlashTrainer
+
+            self._trainer = DFlashTrainer(args)
+        else:
+            from torchspec.training.eagle3_trainer import Eagle3Trainer
+
+            self._trainer = Eagle3Trainer(args)
 
         draft_model_config = getattr(args, "draft_model_config_obj", None)
         if draft_model_config is None and getattr(args, "draft_model_config", None):
@@ -99,7 +106,10 @@ class TrainerActor(RayActor):
         self._trainer.save_draft_model_for_serving(output_dir)
 
     def set_vocab_buffers(self, d2t, t2d) -> None:
-        self._trainer.draft_model.set_vocab_buffers(d2t, t2d)
+        if hasattr(self._trainer, "draft_model") and hasattr(
+            self._trainer.draft_model, "set_vocab_buffers"
+        ):
+            self._trainer.draft_model.set_vocab_buffers(d2t, t2d)
 
     def set_eval_queue(self, queue, mooncake_config=None, per_dp_rank_batch_size: int = 1):
         return self._trainer.set_eval_queue(

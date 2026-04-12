@@ -96,6 +96,9 @@ class TrainingConfig:
     attention_backend: str = "sdpa"
     colocate: bool = False
     continual_training: bool = False
+    dflash_loss_decay_gamma: Optional[float] = None
+    dflash_num_anchors: int = 512
+    draft_algorithm: str = "eagle3"
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1

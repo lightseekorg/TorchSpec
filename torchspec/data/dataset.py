@@ -156,11 +156,14 @@ def load_conversation_dataset(args):
         file_stat = f"-{st.st_size}-{st.st_mtime}"
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
     train_with_decode = getattr(args, "train_with_decode", False)
+    dflash_min_loss_tokens = getattr(args, "dflash_min_loss_tokens", None)
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-{chat_template_name}-ltlo={last_turn_loss_only_flag}"
         f"-defer={defer_tokenization}-decode={train_with_decode}"
     )
+    if dflash_min_loss_tokens is not None:
+        cache_params += f"-dflash_min={dflash_min_loss_tokens}"
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
     cache_path = os.path.join(cache_dir, f"{cache_key}.pt")
@@ -168,6 +171,18 @@ def load_conversation_dataset(args):
     if os.path.exists(cache_path):
         logger.info(f"Loading dataset from cache: {cache_path}")
         prompts = torch.load(cache_path, weights_only=False)
+        # Defensive: re-apply DFlash min sample filter on cache hit
+        if dflash_min_loss_tokens is not None:
+            from torchspec.data.utils import unpack_loss_mask
+
+            before = len(prompts)
+            prompts = [
+                p
+                for p in prompts
+                if unpack_loss_mask(p["packed_loss_mask"]).sum() >= dflash_min_loss_tokens
+            ]
+            if len(prompts) < before:
+                logger.info(f"DFlash sample filter on cache: {before} -> {len(prompts)} samples")
         logger.info(f"Loaded {len(prompts)} cached samples")
         return prompts
 
@@ -254,6 +269,15 @@ def load_conversation_dataset(args):
                 input_ids = torch.tensor(input_ids)
             entry["input_ids"] = input_ids
             entry["packed_loss_mask"] = result["packed_loss_mask"]
+
+            # DFlash: filter samples with too few valid loss positions
+            if dflash_min_loss_tokens is not None:
+                from torchspec.data.utils import unpack_loss_mask
+
+                mask = unpack_loss_mask(result["packed_loss_mask"])
+                if mask.sum() < dflash_min_loss_tokens:
+                    skipped += 1
+                    continue
 
         prompts.append(entry)
 

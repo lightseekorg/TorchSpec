@@ -191,8 +191,9 @@ def _get_draft_model_config(args):
 
 
 def train_async_no_generation(args):
-    """Entry point for Eagle3 online training.
+    """Entry point for speculative decoding online training.
 
+    Supports Eagle3 (default) and DFlash (draft_algorithm=dflash) training.
     Supports prefill-only mode (default) and decode mode (train_with_decode=True)
     with speculative decoding. Uses distributed Ray actors with placement groups.
     Engines store tensors in mooncake and return keys to AsyncInferenceManager.
@@ -202,6 +203,16 @@ def train_async_no_generation(args):
         and getattr(args, "inference_engine_type", "sgl") != "sgl"
     ):
         raise ValueError("train_with_decode=True requires inference_engine_type=sgl")
+
+    # DFlash-specific config validation
+    draft_algorithm = getattr(args, "draft_algorithm", "eagle3")
+    if draft_algorithm == "dflash":
+        if getattr(args, "inference_engine_type", "hf") != "sgl":
+            raise NotImplementedError("DFlash currently supports only inference_engine_type='sgl'.")
+        if not getattr(args, "draft_model_config", None):
+            raise ValueError("DFlash requires an explicit model.draft_model_config.")
+        if getattr(args, "defer_tokenization", False):
+            raise NotImplementedError("DFlash does not support defer_tokenization=True.")
 
     init_tracking(args)
     timer = _InitTimer()
@@ -214,6 +225,18 @@ def train_async_no_generation(args):
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
         ).remote(args, args.dp_size)
 
+    # [1.5] Parse draft config early — DFlash sample filter needs block_size
+    # before dataset loading starts. Safe to move here: _get_draft_model_config
+    # only reads args.draft_model_config (path) and args.target_model_path,
+    # both set during parse_config(). No downstream step depends on this
+    # happening after controller creation.
+    with timer.phase("Parse draft model config"):
+        draft_model_config = _get_draft_model_config(args)
+        args.draft_model_config_obj = draft_model_config
+        if draft_algorithm == "dflash":
+            block_size = getattr(draft_model_config, "block_size", 16)
+            args.dflash_min_loss_tokens = 2 * block_size
+
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
     timer.begin_async("Dataset loading")
     dataset_size_ref = controller.load_dataset.remote(args)
@@ -221,9 +244,6 @@ def train_async_no_generation(args):
 
     # [3] Do initialization that doesn't depend on dataset in parallel
     with timer.phase("Driver-side init"):
-        draft_model_config = _get_draft_model_config(args)
-        args.draft_model_config_obj = draft_model_config
-
         pgs = create_placement_groups(args)
         launch_mooncake_master(args)
         mooncake_config = build_mooncake_config(args)
@@ -239,10 +259,15 @@ def train_async_no_generation(args):
         auto_calculate_training_steps(args, dataset_size)
 
     # [6] Generate vocab mapping on controller if vocab pruning is enabled
+    #     (DFlash does not use vocab pruning)
     vocab_mapping = None
     draft_vocab_size = getattr(draft_model_config, "draft_vocab_size", None)
     vocab_size = draft_model_config.vocab_size
-    if draft_vocab_size is not None and draft_vocab_size != vocab_size:
+    if (
+        draft_algorithm != "dflash"
+        and draft_vocab_size is not None
+        and draft_vocab_size != vocab_size
+    ):
         with timer.phase("Vocab mapping"):
             logger.info(
                 f"Computing vocab mapping on controller "
