@@ -86,3 +86,22 @@ def get_default_eagle3_aux_layer_ids(model_path: str) -> List[int]:
     config = getattr(config, "text_config", config)
     num_layers = config.num_hidden_layers
     return [1, num_layers // 2 - 1, num_layers - 4]
+
+
+def get_default_dflash_aux_layer_ids(model_path: str, num_target_layers: int = 5) -> List[int]:
+    """Get default auxiliary hidden state layer IDs for DFlash.
+
+    Uses the same uniform spacing algorithm as DFlashDraftModel.build_target_layer_ids().
+
+    Args:
+        model_path: Path to the HuggingFace model checkpoint.
+        num_target_layers: Number of target layers to capture (default: 5).
+
+    Returns:
+        List of uniformly spaced layer IDs.
+    """
+    from torchspec.models.draft.dflash import build_target_layer_ids
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = getattr(config, "text_config", config)
+    return build_target_layer_ids(num_target_layers, config.num_hidden_layers)

@@ -26,6 +26,7 @@ import logging
 import os
 import time
 from argparse import Namespace
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -39,7 +40,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.data.utils import DataCollatorWithPadding
 from torchspec.training import checkpoint
-from torchspec.training.data_fetcher import MooncakeDataFetcher
+from torchspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataFetcher
 from torchspec.training.fsdp import init_empty_weights
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
@@ -160,22 +161,43 @@ class Trainer(abc.ABC):
 
         collator = DataCollatorWithPadding()
 
-        self.data_fetcher = MooncakeDataFetcher(
+        prefetch_depth = getattr(self.args, "prefetch_depth", 0)
+        gpu_device = torch.cuda.current_device()
+
+        # When prefetching, stage data on CPU to avoid GPU contention between
+        # background Mooncake TCP transfers and forward/backward compute.
+        fetch_device = "cpu" if prefetch_depth > 0 else gpu_device
+
+        inner_fetcher = MooncakeDataFetcher(
             queue=self.train_queue,
             mooncake_store=self.mooncake_store,
             collator=collator,
-            device=torch.cuda.current_device(),
+            device=fetch_device,
             batch_size=per_dp_rank_batch_size,
             assistant_header_ids=self.assistant_header_ids,
             end_token_ids=self.end_token_ids,
             dynamic_loss_mask=self.dynamic_loss_mask,
             last_turn_loss_only=self.last_turn_loss_only,
             skip_after_header=self.skip_after_header,
+            min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
         )
 
-        logger.info(
-            f"[Rank {self.dp_rank}] Data fetcher initialized with batch_size={per_dp_rank_batch_size}"
-        )
+        if prefetch_depth > 0:
+            self.data_fetcher = PrefetchedDataFetcher(
+                inner_fetcher,
+                prefetch_depth=prefetch_depth,
+                target_device=gpu_device,
+            )
+            logger.info(
+                f"[Rank {self.dp_rank}] Prefetched data fetcher initialized "
+                f"(batch_size={per_dp_rank_batch_size}, prefetch_depth={prefetch_depth}, "
+                f"staging=CPU, target={gpu_device})"
+            )
+        else:
+            self.data_fetcher = inner_fetcher
+            logger.info(
+                f"[Rank {self.dp_rank}] Data fetcher initialized with batch_size={per_dp_rank_batch_size}"
+            )
 
     # ------------------------------------------------------------------
     # Eval queue & CPU cache
@@ -203,6 +225,7 @@ class Trainer(abc.ABC):
             dynamic_loss_mask=self.dynamic_loss_mask,
             last_turn_loss_only=self.last_turn_loss_only,
             skip_after_header=self.skip_after_header,
+            min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
         )
         self._eval_collator = collator
         self._eval_cache: list[dict] = []
@@ -295,6 +318,13 @@ class Trainer(abc.ABC):
             compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
             t_data_start = time.time()
 
+        # Gradient sync control for micro-batch accumulation.
+        # FSDP2 fully_shard: use set_requires_gradient_sync(bool)
+        # replicate (DDP): use no_sync() context manager
+        _model = getattr(self.model, "_orig_mod", self.model)
+        _set_grad_sync = getattr(_model, "set_requires_gradient_sync", None)
+        _no_sync = getattr(_model, "no_sync", None) if _set_grad_sync is None else None
+
         batches = self.prof.iterate_train_actor(self._iter_batches_from_queue(num_batches))
         for batch_idx, batch in enumerate(batches):
             is_last = batch_idx == num_batches - 1
@@ -308,17 +338,29 @@ class Trainer(abc.ABC):
             if logger.isEnabledFor(logging.DEBUG):
                 self._log_batch_debug(batch, step, batch_idx, num_batches)
 
-            step_metrics = self._train_step(
-                batch=batch,
-                accumulation_steps=accumulation_steps,
-                step=step,
-                batch_idx=batch_idx,
-                num_batches=num_batches,
-            )
+            if _set_grad_sync is not None:
+                _set_grad_sync(is_last)
+                ctx = nullcontext()
+            else:
+                ctx = _no_sync() if (_no_sync is not None and not is_last) else nullcontext()
+
+            with ctx:
+                step_metrics = self._train_step(
+                    batch=batch,
+                    accumulation_steps=accumulation_steps,
+                    step=step,
+                    batch_idx=batch_idx,
+                    num_batches=num_batches,
+                )
 
             if is_last:
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
+                _evt_opt_s = torch.cuda.Event(enable_timing=True)
+                _evt_opt_e = torch.cuda.Event(enable_timing=True)
+                _evt_opt_s.record()
                 grad_norm = self.optimizer.step()
+                _evt_opt_e.record()
+                step_metrics["_opt_events"] = (_evt_opt_s, _evt_opt_e)
 
             if perf:
                 evt_end.record()
@@ -338,6 +380,12 @@ class Trainer(abc.ABC):
             compute_time_ms = sum(s.elapsed_time(e) for s, e in compute_events)
             metrics["perf/data_time"] = data_time
             metrics["perf/compute_time"] = compute_time_ms / 1000.0
+            # Optimizer timing (only recorded in last micro-batch)
+            opt_ms = 0.0
+            for m in all_step_metrics:
+                if "_opt_events" in m:
+                    opt_ms += m["_opt_events"][0].elapsed_time(m["_opt_events"][1])
+            metrics["perf/optimizer_time"] = opt_ms / 1000.0
 
         return metrics
 

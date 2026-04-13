@@ -40,6 +40,7 @@ class DatasetConfig:
     eval_micro_batch_size: Optional[int] = None
     eval_prompt_key: Optional[str] = None
     last_turn_loss_only: Any = "auto"  # bool or "auto"
+    min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
     prompt_key: str = "conversations"
     shuffle_dataset: bool = True
     train_data_path: str = ""
@@ -99,10 +100,12 @@ class TrainingConfig:
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1
+    fsdp_reduce_dtype: str = "float32"  # "float32" or "bfloat16"
     fsdp_strategy: str = "REPLICATE"
     # Controls which workload claims head-node GPUs first under PACK strategy.
     # "training_first" (default) or "inference_first". Extensible to custom mappings later.
     placement_strategy: str = "training_first"
+    compile_model: bool = False  # torch.compile the full training model
 
     gradient_checkpointing: bool = False
     learning_rate: float = 1e-4
@@ -114,12 +117,15 @@ class TrainingConfig:
     max_concurrent_batches: int = 1
     max_grad_norm: float = 0.5
     max_seq_length: int = 8192
+    min_lr: float = 0.0
+    weight_decay: float = 0.0
     num_epochs: int = 10
     num_train_steps: Optional[int] = None
     micro_batch_size: int = 2
-    prefetch_depth: int = 4
+    prefetch_depth: int = 2  # 0 = disabled, >0 = async pre-fetch N batches ahead
     save_interval: int = 5000
     save_per_epoch: bool = False
+    max_checkpoints: int = 0  # 0 = keep all, N > 0 = rotate and keep only N most recent
     seed: int = 0
     train_backend: str = "fsdp"
     train_env_vars: str = "{}"
@@ -128,6 +134,16 @@ class TrainingConfig:
     training_num_nodes: int = 1
     ttt_length: int = 7
     warmup_ratio: float = 0.015
+
+    # WSD LR schedule parameters (used by DFlash trainer only)
+    wsd_decay_ratio: float = 0.2
+    wsd_decay_style: Optional[str] = None
+
+    # DFlash-specific parameters (ignored for Eagle3 training)
+    dflash_block_size: int = 16
+    dflash_loss_decay_gamma: float = 7.0
+    dflash_num_anchors: int = 512
+    dflash_num_target_layers: int = 5
 
 
 @dataclass

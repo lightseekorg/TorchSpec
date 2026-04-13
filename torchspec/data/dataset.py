@@ -44,7 +44,11 @@ _worker_state = {}
 
 
 def _init_tokenize_worker(
-    tokenizer_path, trust_remote_code, chat_template_name, last_turn_loss_only=False
+    tokenizer_path,
+    trust_remote_code,
+    chat_template_name,
+    last_turn_loss_only=False,
+    min_loss_tokens=0,
 ):
     """Initializer for each worker process — loads tokenizer once."""
     _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
@@ -52,6 +56,7 @@ def _init_tokenize_worker(
     _worker_state["template"] = TEMPLATE_REGISTRY.get(chat_template_name)
     _worker_state["preprocess"] = preprocess_conversations
     _worker_state["last_turn_loss_only"] = last_turn_loss_only
+    _worker_state["min_loss_tokens"] = min_loss_tokens
 
 
 def _resolve_last_turn_loss_only(messages):
@@ -75,6 +80,7 @@ def _tokenize_single(args):
         add_generation_prompt=train_with_decode,
         return_formatted_text=True,
         last_turn_loss_only=_resolve_last_turn_loss_only(messages),
+        min_loss_tokens=_worker_state.get("min_loss_tokens", 0),
     )
     if not processed["input_ids"]:
         return None
@@ -156,10 +162,12 @@ def load_conversation_dataset(args):
         file_stat = f"-{st.st_size}-{st.st_mtime}"
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
     train_with_decode = getattr(args, "train_with_decode", False)
+    min_loss_tokens_val = getattr(args, "min_loss_tokens", 0)
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-{chat_template_name}-ltlo={last_turn_loss_only_flag}"
         f"-defer={defer_tokenization}-decode={train_with_decode}"
+        f"-mlt={min_loss_tokens_val}"
     )
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
@@ -212,8 +220,15 @@ def load_conversation_dataset(args):
                 f"last_turn_loss_only={last_turn_loss_only}: "
                 "loss mask will only cover the last assistant turn"
             )
+        min_loss_tokens = getattr(args, "min_loss_tokens", 0)
         worker_init = _init_tokenize_worker
-        worker_initargs = (args.target_model_path, True, chat_template_name, last_turn_loss_only)
+        worker_initargs = (
+            args.target_model_path,
+            True,
+            chat_template_name,
+            last_turn_loss_only,
+            min_loss_tokens,
+        )
         worker_fn = _tokenize_single
         desc = "Tokenizing dataset"
 
