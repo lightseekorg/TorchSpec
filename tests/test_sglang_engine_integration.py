@@ -49,7 +49,8 @@ os.environ.setdefault("MOONCAKE_MASTER_HOST", LOCAL_IP)
 os.environ.setdefault("MOONCAKE_MASTER_PORT", "51135")
 os.environ.setdefault("MOONCAKE_METADATA_PORT", "8763")
 os.environ.setdefault("MOONCAKE_LOCAL_HOSTNAME", LOCAL_IP)
-os.environ.setdefault("MOONCAKE_MASTER_SERVER", f"{LOCAL_IP}:51135")
+_MC_PORT = os.environ["MOONCAKE_MASTER_PORT"]
+os.environ.setdefault("MOONCAKE_MASTER_SERVER", f"{LOCAL_IP}:{_MC_PORT}")
 
 
 def get_aux_layer_ids(model_path: str) -> tuple[list[int], int, int]:
