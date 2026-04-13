@@ -159,7 +159,7 @@ class Eagle3Trainer(Trainer):
         self.target_lm_head_weight = self.target_lm_head.lm_head.weight
         self.verifier_norm = self.target_lm_head.norm
 
-        if getattr(self.args, "attention_backend", None) == "fa_experimental":
+        if getattr(self.args, "attention_backend", None) == "fa4":
             from torchspec.models.draft.llama3_eagle import (
                 _has_cute_dsl,
                 warmup_flash_attention_masked,
@@ -222,6 +222,31 @@ class Eagle3Trainer(Trainer):
             self.target_lm_head.to(device="cuda", dtype=torch.bfloat16)
             self.target_lm_head.eval()
             self.target_lm_head.requires_grad_(False)
+
+        # Sync norm status from rank 0 so all ranks have the same parameter count
+        # before the broadcast loop (prevents NCCL deadlock if norm loading
+        # silently failed on rank 0 but structure creation succeeded elsewhere).
+        has_norm = torch.tensor(
+            [self.target_lm_head.norm is not None], dtype=torch.int32, device="cuda"
+        )
+        dist.broadcast(has_norm, src=0)
+        if has_norm.item():
+            if self.target_lm_head.norm is None:
+                logger.warning(
+                    f"[Rank {self.dp_rank}] Rank 0 has norm but this rank does not — "
+                    "this indicates _init_norm_structure failed; attempting recovery"
+                )
+                self.target_lm_head._init_norm_structure()
+                self.target_lm_head.norm = self.target_lm_head.norm.to(
+                    device="cuda", dtype=torch.bfloat16
+                )
+        else:
+            if self.target_lm_head.norm is not None:
+                logger.warning(
+                    f"[Rank {self.dp_rank}] Rank 0 does not have norm — "
+                    "removing norm on this rank to match"
+                )
+                self.target_lm_head.norm = None
 
         dist.barrier()
 

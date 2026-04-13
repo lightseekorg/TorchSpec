@@ -38,6 +38,28 @@ from torchspec.utils.logging import logger, print_with_rank
 
 _flash_attn_import_error: ImportError | None = None
 try:
+    # cutlass-dsl >= 4.4.2 removed cutlass.utils.ampere_helpers, but FA4
+    # still imports it for SMEM_CAPACITY. Inject a shim before any FA4 import.
+    import importlib  # noqa: E401
+    import importlib.util
+
+    if importlib.util.find_spec("cutlass.utils") and not importlib.util.find_spec(
+        "cutlass.utils.ampere_helpers"
+    ):
+        import types  # noqa: E401
+
+        import cutlass.utils
+
+        _shim = types.ModuleType("cutlass.utils.ampere_helpers")
+        _shim.SMEM_CAPACITY = {
+            "sm80": (164 - 1) * 1024,
+            "sm86": (100 - 1) * 1024,
+            "sm89": (100 - 1) * 1024,
+        }
+        import sys
+
+        sys.modules["cutlass.utils.ampere_helpers"] = _shim
+
     from flash_attn.cute import flash_attn_func as _flash_attn_func
     from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 except ImportError as _e:
@@ -844,18 +866,10 @@ def _build_eagle3_mask_pair(
     SM100+: uses the mode selected by set_eagle3_mask_mode().
     """
     mode = _effective_mask_mode()
-    mask_mod_flex = None
     aux_tensors = None
 
     if mode == "closure":
         mask_mod_cute = _make_eagle3_flash_mask_mod(q_len, q_len)
-        seq_lengths = torch.full((bsz,), q_len, dtype=torch.long, device=device)
-        mask_mod_flex = generate_eagle3_mask(
-            seq_lengths=seq_lengths,
-            Q_LEN=q_len,
-            KV_LEN=kv_len,
-            lck=lck,
-        )
     elif mode == "simple":
         mask_mod_cute = _make_eagle3_flash_mask_mod_simple(q_len)
     elif mode == "dynamic":
@@ -868,36 +882,78 @@ def _build_eagle3_mask_pair(
     else:
         raise ValueError(f"Unknown eagle3 mask mode {mode!r}")
 
+    # Always build a flex-compatible mask_mod for block-sparse iteration.
+    seq_lengths = torch.full((bsz,), q_len, dtype=torch.long, device=device)
+    mask_mod_flex = generate_eagle3_mask(
+        seq_lengths=seq_lengths,
+        Q_LEN=q_len,
+        KV_LEN=kv_len,
+        lck=lck,
+    )
+
     return mask_mod_cute, mask_mod_flex, aux_tensors
 
 
-# Two-level cache for SM90 backward block-sparse tensors.
-# Level 1 (_bwd_bm_raw_cache): B=1, H=1 raw Q-direction index tensors.
-#   Key: (q_len, kv_len, max_seq_len, device_index)
-# Level 2 (_bwd_block_sparse_cache): expanded BlockSparseTensorsTorch.
-#   Key: (q_len, kv_len, bsz, num_heads, max_seq_len, device_index)
-_bwd_bm_raw_cache: dict = {}
-_bwd_block_sparse_cache: dict = {}
+# Block-sparse tensor caches for FA4 forward and backward.
+#
+# BlockMask.as_tuple(flatten=True) layout:
+#   [0] seq_lengths_q, [1] seq_lengths_kv,
+#   [2] kv_num_blocks, [3] kv_indices, [4] full_kv_num_blocks, [5] full_kv_indices,
+#   [6] q_num_blocks,  [7] q_indices,  [8] full_q_num_blocks,  [9] full_q_indices,
+#   [10] KV_BLOCK_SIZE, [11] Q_BLOCK_SIZE, [12] mask_mod
+#
+# Forward needs KV-direction (indices 2-5): for each Q block, which KV blocks to visit.
+# Backward needs Q-direction (indices 6-9): for each KV block, which Q blocks affect it.
 
-# Indices into BlockMask.as_tuple(flatten=True) for Q-direction tensors.
+_BM_KV_NUM_BLOCKS = 2
+_BM_KV_INDICES = 3
+_BM_FULL_KV_NUM_BLOCKS = 4
+_BM_FULL_KV_INDICES = 5
 _BM_Q_NUM_BLOCKS = 6
 _BM_Q_INDICES = 7
 _BM_FULL_Q_NUM_BLOCKS = 8
 _BM_FULL_Q_INDICES = 9
 
+# Level 1: B=1, H=1 raw tensors keyed by (q_len, kv_len, block_size, device_index).
+_block_mask_raw_cache: dict = {}
+# Level 2: expanded BlockSparseTensorsTorch keyed by (q_len, kv_len, bsz, num_heads, direction, block_size, device_index).
+_block_sparse_cache: dict = {}
 
-def _get_bwd_block_sparse(mask_mod_flex, q_len, kv_len, bsz, num_heads, max_seq_len, device):
-    """Return BlockSparseTensorsTorch for SM90 backward, creating and caching as needed.
 
-    On SM90, _flash_attn_bwd with causal=False + mask_mod requires block_sparse_tensors
-    (forces m_block_size=64, dQ_swapAB=False). The EAGLE3 mask is batch/head-independent,
-    so we compute with B=1, H=1 to avoid OOM, then expand to (bsz, num_heads).
+def _fa4_block_size() -> tuple:
+    """Return (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for FA4 block-sparse iteration.
+
+    SM100+ (Blackwell) requires Q_BLOCK_SIZE=256 for both forward and backward
+    due to subtile_factor=2 (q_stage=2, two M-tiles per CTA).
+    SM90 (Hopper) uses 128 x 128.
     """
+    if _cuda_sm_major >= 10:
+        return (256, 128)
+    return (128, 128)
+
+
+def _get_block_sparse(
+    mask_mod_flex,
+    q_len,
+    kv_len,
+    bsz,
+    num_heads,
+    device,
+    direction="kv",
+):
+    """Return BlockSparseTensorsTorch for FA4 forward or backward.
+
+    direction="kv": KV-direction tensors for forward (skip empty KV blocks per Q block).
+    direction="q":  Q-direction tensors for backward (skip empty Q blocks per KV block).
+
+    The EAGLE3 mask is batch/head-independent, so we compute with B=1, H=1
+    and expand to (bsz, num_heads).
+    """
+    block_size = _fa4_block_size()
     device_idx = device.index or 0
 
-    # Level 1: compute block mask once per unique shape.
-    raw_key = (q_len, kv_len, max_seq_len, device_idx)
-    if raw_key not in _bwd_bm_raw_cache:
+    raw_key = (q_len, kv_len, block_size, device_idx)
+    if raw_key not in _block_mask_raw_cache:
         bm = create_block_mask(
             mask_mod_flex,
             B=1,
@@ -905,45 +961,70 @@ def _get_bwd_block_sparse(mask_mod_flex, q_len, kv_len, bsz, num_heads, max_seq_
             Q_LEN=q_len,
             KV_LEN=kv_len,
             device=device,
-            BLOCK_SIZE=(128, 128),
+            BLOCK_SIZE=block_size,
         )
         t = bm.as_tuple()
-        _bwd_bm_raw_cache[raw_key] = (
-            t[_BM_Q_NUM_BLOCKS],
-            t[_BM_Q_INDICES],
-            t[_BM_FULL_Q_NUM_BLOCKS],
-            t[_BM_FULL_Q_INDICES],
-        )
+        _block_mask_raw_cache[raw_key] = {
+            "kv": (
+                t[_BM_KV_NUM_BLOCKS],
+                t[_BM_KV_INDICES],
+                t[_BM_FULL_KV_NUM_BLOCKS],
+                t[_BM_FULL_KV_INDICES],
+            ),
+            "q": (
+                t[_BM_Q_NUM_BLOCKS],
+                t[_BM_Q_INDICES],
+                t[_BM_FULL_Q_NUM_BLOCKS],
+                t[_BM_FULL_Q_INDICES],
+            ),
+        }
 
-    # Level 2: expand to (bsz, num_heads).
-    cache_key = (q_len, kv_len, bsz, num_heads, max_seq_len, device_idx)
-    if cache_key not in _bwd_block_sparse_cache:
-        q_cnt, q_idx, fq_cnt, fq_idx = _bwd_bm_raw_cache[raw_key]
-        _bwd_block_sparse_cache[cache_key] = BlockSparseTensorsTorch(
-            mask_block_cnt=q_cnt.expand(bsz, num_heads, -1).contiguous(),
-            mask_block_idx=q_idx.expand(bsz, num_heads, -1, -1).contiguous(),
-            full_block_cnt=fq_cnt.expand(bsz, num_heads, -1).contiguous(),
-            full_block_idx=fq_idx.expand(bsz, num_heads, -1, -1).contiguous(),
-            block_size=(128, 128),
+    cache_key = (q_len, kv_len, bsz, num_heads, direction, block_size, device_idx)
+    if cache_key not in _block_sparse_cache:
+        cnt, idx, f_cnt, f_idx = _block_mask_raw_cache[raw_key][direction]
+        _block_sparse_cache[cache_key] = BlockSparseTensorsTorch(
+            mask_block_cnt=cnt.expand(bsz, num_heads, -1).contiguous(),
+            mask_block_idx=idx.expand(bsz, num_heads, -1, -1).contiguous(),
+            full_block_cnt=f_cnt.expand(bsz, num_heads, -1).contiguous()
+            if f_cnt is not None
+            else None,
+            full_block_idx=f_idx.expand(bsz, num_heads, -1, -1).contiguous()
+            if f_idx is not None
+            else None,
+            block_size=block_size,
         )
-    return _bwd_block_sparse_cache[cache_key]
+    return _block_sparse_cache[cache_key]
 
 
 class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
-    """Autograd wrapper for flash_attn fwd/bwd with mask_mod.
+    """Autograd wrapper for flash_attn fwd/bwd with mask_mod + block sparsity.
 
     The public flash_attn_func does not pass mask_mod to its backward, making
     gradients incorrect for non-causal custom masks. This wrapper correctly
     forwards mask_mod to both _flash_attn_fwd and _flash_attn_bwd.
 
-    On SM90, backward with causal=False + mask_mod requires block_sparse_tensors
-    (forces m_block_size=64, dQ_swapAB=False). These are computed once and cached.
+    Block-sparse iteration lets the kernel skip tiles that are entirely masked
+    out, which is critical for the EAGLE3 pattern at long sequences where the
+    mask is very sparse (causal + diagonal suffix).
     """
 
     @staticmethod
     def forward(
         ctx, q, k, v, mask_mod_cute, mask_mod_flex, softmax_scale, max_seq_len, aux_tensors=None
     ):
+        bsz, q_len, num_heads, _ = q.shape
+        kv_len = k.shape[1]
+
+        fwd_block_sparse = _get_block_sparse(
+            mask_mod_flex,
+            q_len,
+            kv_len,
+            bsz,
+            num_heads,
+            q.device,
+            direction="kv",
+        )
+
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -951,16 +1032,20 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
             softmax_scale=softmax_scale,
             causal=False,
             mask_mod=mask_mod_cute,
+            block_sparse_tensors=fwd_block_sparse,
             return_lse=True,
             aux_tensors=aux_tensors,
         )
 
-        bwd_block_sparse = None
-        if _cuda_sm_major == 9:
-            bsz, q_len, num_heads, _ = q.shape
-            bwd_block_sparse = _get_bwd_block_sparse(
-                mask_mod_flex, q_len, k.shape[1], bsz, num_heads, max_seq_len, q.device
-            )
+        bwd_block_sparse = _get_block_sparse(
+            mask_mod_flex,
+            q_len,
+            kv_len,
+            bsz,
+            num_heads,
+            q.device,
+            direction="q",
+        )
 
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1376,6 +1461,8 @@ class LlamaFlashAttention(LlamaAttention):
             softmax_scale=1.0 / math.sqrt(self.head_dim),
             causal=True,
         )
+        # Accumulate O in FP32 so the backward delta path (rowsum(dO·O)) stays accurate
+        attn_output = attn_output.float()
         lse = lse.transpose(1, 2)
 
         lck = cache_keys.shape[1]
@@ -1395,17 +1482,16 @@ class LlamaFlashAttention(LlamaAttention):
                 qi = query_states.view(q_shape_expanded)
                 vi = cache_values[:, i].unsqueeze(-2)
 
-                attn_outputs.append(vi)
-                lses.append((qi * ki).sum(-1) / math.sqrt(self.head_dim))
+                attn_outputs.append(vi.float())
+                lses.append((qi.float() * ki.float()).sum(-1) / math.sqrt(self.head_dim))
 
             lse = torch.logsumexp(torch.stack(lses, dim=-1), dim=-1)
             attn_output = sum(
                 attn_outputi * torch.exp(lsei - lse).unsqueeze(-1)
                 for attn_outputi, lsei in zip(attn_outputs, lses)
             )
-            # lse is fp32, downcast attn_output back
-            attn_output = attn_output.to(self.o_proj.weight.dtype)
 
+        attn_output = attn_output.to(self.o_proj.weight.dtype)
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
 
         attn_output = self.o_proj(attn_output)
@@ -1681,14 +1767,10 @@ class LlamaDecoderLayer(nn.Module):
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
             self.self_attn = LlamaFlexAttention(config=config)
-        elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
-        elif attention_backend == "fa_experimental":
-            print_with_rank(
-                "[EXPERIMENTAL] Using LlamaFlashAttentionMasked (flash-attention cute DSL). "
-                "Validated on SM80/SM90/SM100."
-            )
+        elif attention_backend == "fa4":
             self.self_attn = LlamaFlashAttentionMasked(config=config)
+        elif attention_backend == "fa_low_acc":
+            self.self_attn = LlamaFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 

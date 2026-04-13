@@ -79,36 +79,32 @@ def _extract_from_kv_cache(
     return padded_kv[:num_tokens]
 
 
+def _slot_mapping_from_block_ids(
+    block_ids: list[int],
+    page_size: int,
+    num_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute slot_mapping from accumulated block_ids instead of attn_metadata.
+
+    We cannot use ``attn_metadata.slot_mapping`` for two reasons:
+    1. Chunked prefill: attn_metadata only has the current chunk's slots, but
+       we need the full sequence's mapping (block_ids are accumulated across
+       chunks in ``build_connector_meta``).
+    2. HMA models: ``cache_config.block_size`` differs from the CacheOnly
+       group's actual page_size.  Reading ``page_size`` from
+       ``kv_layer.shape[1]`` handles both cases correctly.
+    """
+    block_ids_gpu = torch.tensor(block_ids, dtype=torch.int64, device=device)
+    offsets = torch.arange(page_size, dtype=torch.int64, device=device)
+    return (block_ids_gpu.unsqueeze(1) * page_size + offsets).flatten()[:num_tokens]
+
+
 @dataclass
 class _ReqMeta:
     req_id: str
     token_ids: torch.Tensor
-    slot_mapping: torch.Tensor
-    new_req: bool
-
-    @staticmethod
-    def make(
-        req_id: str,
-        token_ids: list[int],
-        block_ids: list[int],
-        block_size: int,
-        new_req: bool,
-    ) -> _ReqMeta:
-        token_ids_tensor = torch.tensor(token_ids)
-        block_ids_tensor = torch.tensor(block_ids)
-        num_blocks = block_ids_tensor.shape[0]
-        block_offsets = torch.arange(0, block_size)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids_tensor.reshape((num_blocks, 1)) * block_size
-        )
-        slot_mapping = slot_mapping.flatten()
-        return _ReqMeta(
-            req_id=req_id,
-            token_ids=token_ids_tensor,
-            slot_mapping=slot_mapping,
-            new_req=new_req,
-        )
+    block_ids: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -120,10 +116,14 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         req_id: str,
         token_ids: list[int],
         block_ids: list[int],
-        block_size: int,
-        new_req: bool = True,
     ) -> None:
-        self.requests.append(_ReqMeta.make(req_id, token_ids, block_ids, block_size, new_req))
+        self.requests.append(
+            _ReqMeta(
+                req_id=req_id,
+                token_ids=torch.tensor(token_ids),
+                block_ids=list(block_ids),
+            )
+        )
 
 
 class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
@@ -151,6 +151,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._block_size = vllm_config.cache_config.block_size
         self.cache_layers: list[str] = []
+        self._cache_layer_group_id: int = self._find_cache_layer_group_id(kv_cache_config)
 
         assert self._vllm_config.speculative_config is not None, (
             "MooncakeHiddenStatesConnector requires 'extract_hidden_states' speculative method"
@@ -170,13 +171,53 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._req_blocks: dict[str, list[int]] = {}
         self._req_metadata: dict[str, dict[str, Any]] = {}
 
-        # Worker-side state: Mooncake store (lazy init)
         self._mooncake_store = None
         self._mooncake_setup_done = False
+        self._tp_rank: int | None = None
+
+    @staticmethod
+    def _find_cache_layer_group_id(kv_cache_config) -> int:
+        """Find the KV cache group that contains the CacheOnlyAttentionLayer.
+
+        When ``kv_cache_config`` is available (worker side), we look for the
+        group whose layer name contains ``cache_only_layers``.  On the
+        scheduler side (``kv_cache_config is None``) we return ``None``
+        and resolve it lazily in ``build_connector_meta`` by picking the
+        group with ``ceil(num_tokens / block_size)`` blocks.
+        """
+        if kv_cache_config is None:
+            return None  # type: ignore[return-value]
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+            for name in group.layer_names:
+                if "cache_only_layers" in name:
+                    logger.info(
+                        f"Cache-only layer found in KV group {gid}: {name} "
+                        f"(total groups={len(kv_cache_config.kv_cache_groups)})"
+                    )
+                    return gid
+        logger.warning(
+            f"Cache-only layer NOT found in KV cache groups "
+            f"(groups={[g.layer_names for g in kv_cache_config.kv_cache_groups]})"
+        )
+        return None  # type: ignore[return-value]
+
+    def _get_tp_rank(self) -> int:
+        if self._tp_rank is None:
+            try:
+                from vllm.distributed import get_tensor_model_parallel_rank
+
+                self._tp_rank = get_tensor_model_parallel_rank()
+            except Exception:
+                self._tp_rank = 0
+        return self._tp_rank
 
     def _ensure_mooncake_store(self) -> bool:
         if self._mooncake_setup_done:
             return self._mooncake_store is not None
+
+        if self._get_tp_rank() != 0:
+            self._mooncake_setup_done = True
+            return False
 
         if not os.environ.get("MOONCAKE_MASTER_SERVER") and not os.environ.get(
             "MOONCAKE_MASTER_HOST"
@@ -256,20 +297,34 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(connector_metadata, MooncakeConnectorMetadata)
 
         if not self._ensure_mooncake_store():
-            logger.warning("save_kv_layer: Mooncake store not available, skipping")
+            if self._get_tp_rank() == 0:
+                logger.warning("save_kv_layer: Mooncake store not available, skipping")
             return
+
+        # Use tensor's actual page_size, not cache_config.block_size
+        # (they differ on HMA models).
+        page_size = kv_layer.shape[1]
 
         for request in connector_metadata.requests:
             num_tokens = request.token_ids.shape[0]
-            num_slots = request.slot_mapping.shape[0]
+            mooncake_key = _sanitize_mooncake_key(request.req_id)
+
+            # Recompute from accumulated block_ids — attn_metadata.slot_mapping
+            # only covers the current chunk, not the full sequence.
+            slot_mapping = _slot_mapping_from_block_ids(
+                request.block_ids,
+                page_size,
+                num_tokens,
+                device=kv_layer.device,
+            )
+            num_slots = slot_mapping.shape[0]
 
             # With chunked prefill, save_kv_layer is called per chunk.
-            # Mooncake keys are write-once (can't overwrite), so we skip
-            # partial chunks and only write when all blocks are allocated.
+            # Skip partial chunks — only store when all blocks are allocated.
             if num_slots < num_tokens:
                 continue
 
-            hidden_states_3d = _extract_from_kv_cache(kv_layer, request.slot_mapping, num_tokens)
+            hidden_states_3d = _extract_from_kv_cache(kv_layer, slot_mapping, num_tokens)
 
             all_hidden = hidden_states_3d.reshape(num_tokens, -1)
 
@@ -280,8 +335,6 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             last_hidden_states = all_hidden[:, -self._hidden_size :]
 
             input_ids = request.token_ids.to(hidden_states.device)
-
-            mooncake_key = _sanitize_mooncake_key(request.req_id)
 
             try:
                 self._mooncake_store.put(
@@ -316,17 +369,34 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         meta = MooncakeConnectorMetadata()
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = new_req.prompt_token_ids or []
+            group_sizes = [len(g) for g in new_req.block_ids]
+            gid = self._cache_layer_group_id
+            if gid is None:
+                # On the scheduler side kv_cache_config is unavailable, so we
+                # pick the group with the most blocks.  The CacheOnly group
+                # uses the smallest page_size and therefore always has the
+                # highest block count for a given token count.
+                gid = max(range(len(new_req.block_ids)), key=lambda i: len(new_req.block_ids[i]))
+                self._cache_layer_group_id = gid
+                logger.warning(f"Resolved cache-only KV group id={gid} (group_sizes={group_sizes})")
             meta.add_request(
                 new_req.req_id,
                 token_ids=token_ids,
-                block_ids=new_req.block_ids[0],
-                block_size=self._block_size,
+                block_ids=new_req.block_ids[gid],
+            )
+            logger.debug(
+                "build_connector_meta: req_id=%s key=%s num_tokens=%d gid=%d "
+                "group_sizes=%s chosen_blocks=%d",
+                new_req.req_id,
+                _sanitize_mooncake_key(new_req.req_id),
+                len(token_ids),
+                gid,
+                group_sizes,
+                len(new_req.block_ids[gid]),
             )
             self._active_requests[new_req.req_id] = new_req
-            self._req_blocks[new_req.req_id] = list(new_req.block_ids[0])
+            self._req_blocks[new_req.req_id] = list(new_req.block_ids[gid])
 
-            # Pre-compute metadata that request_finished will return.
-            # The mooncake key and shapes are deterministic from the request.
             seq_len = len(token_ids)
             training_hidden_size = self._num_training_layers * self._hidden_size
             mooncake_key = _sanitize_mooncake_key(new_req.req_id)
@@ -358,15 +428,13 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             cached_req = self._active_requests[req_id]
             req_block_ids = self._req_blocks[req_id]
 
-            block_ids = new_block_ids[0]
+            block_ids = new_block_ids[self._cache_layer_group_id]
             req_block_ids.extend(block_ids)
 
             meta.add_request(
                 req_id=req_id,
                 token_ids=cached_req.prompt_token_ids or [],
                 block_ids=req_block_ids,
-                block_size=self._block_size,
-                new_req=False,
             )
 
         return meta

@@ -442,9 +442,9 @@ class AsyncInferenceManager:
                     engine.generate_with_decode if self._train_with_decode else engine.generate
                 )
                 outputs = await generate_method.remote(
-                    kwargs["data_ids"],
-                    kwargs["input_ids_ref"],
-                    kwargs["packed_loss_mask_list"],
+                    data_id=kwargs["data_ids"],
+                    input_ids_ref=kwargs["input_ids_ref"],
+                    packed_loss_mask_list=kwargs["packed_loss_mask_list"],
                     formatted_prompts=kwargs["formatted_prompts"],
                     return_last_hidden_states=kwargs["return_last_hidden_states"],
                     return_logits=kwargs["return_logits"],
@@ -467,7 +467,9 @@ class AsyncInferenceManager:
                 await self.controller.set_inference_error.remote(str(e))
                 raise
             except Exception as e:
-                logger.error(f"Engine dispatch failed: {e}")
+                import traceback
+
+                logger.error(f"Engine dispatch failed: {e}\n{traceback.format_exc()}")
                 return [(entry, e) for entry in entries]
 
     # -- Result processing ---------------------------------------------------

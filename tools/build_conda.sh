@@ -57,8 +57,8 @@ if [ "$BACKEND" = "sglang" ] || [ "$BACKEND" = "both" ]; then
     echo "Installing SGLang..."
     echo "=========================================="
 
-    SGLANG_VERSION="${SGLANG_VERSION:-v0.5.8.post1}"
-    SGLANG_COMMIT=0f2df9370a1de1b4fb11b071d39ab3ce2287a350
+    SGLANG_VERSION="${SGLANG_VERSION:-v0.5.10.post1}"
+    SGLANG_COMMIT=94f03a39dbd39edfc2b118b5357bbbadaaa9ad28
     SGLANG_FOLDER_NAME="_sglang"
 
     # Install sglang inside the conda environment

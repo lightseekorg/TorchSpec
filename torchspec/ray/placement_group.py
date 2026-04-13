@@ -187,40 +187,41 @@ def create_placement_groups(args):
 
     num_training_gpus = args.training_num_nodes * args.training_num_gpus_per_node
     num_inference_gpus = args.inference_num_gpus
+    total_gpus = num_training_gpus + num_inference_gpus
 
+    # Single PG ensures deterministic node-to-role assignment across restarts,
+    # avoiding kernel/weight cache misses from random GPU shuffling.
     logger.info(
-        f"Creating placement groups: {num_inference_gpus} GPUs for inference and "
-        f"{num_training_gpus} GPUs for training..."
+        f"Creating unified placement group with {total_gpus} GPUs "
+        f"({num_training_gpus} training + {num_inference_gpus} inference)..."
+    )
+
+    pg, sorted_bundle_indices, sorted_gpu_ids = _create_placement_group(
+        total_gpus, strategy="PACK", name="unified_pg"
     )
 
     placement_strategy = getattr(args, "placement_strategy", "training_first")
 
     if placement_strategy == "training_first":
-        logger.info(
-            "Creating training placement group first (placement_strategy=training_first)..."
-        )
-        training_pg, training_bundle_indices, training_gpu_ids = _create_placement_group(
-            num_training_gpus, strategy="PACK", name="training_pg"
-        )
-        logger.info("Creating inference placement group...")
-        inference_pg, inference_bundle_indices, inference_gpu_ids = _create_placement_group(
-            num_inference_gpus, strategy="PACK", name="inference_pg"
-        )
+        training_bundle_indices = sorted_bundle_indices[:num_training_gpus]
+        training_gpu_ids = sorted_gpu_ids[:num_training_gpus]
+        inference_bundle_indices = sorted_bundle_indices[num_training_gpus:]
+        inference_gpu_ids = sorted_gpu_ids[num_training_gpus:]
     else:
-        logger.info(
-            "Creating inference placement group first (placement_strategy=inference_first)..."
-        )
-        inference_pg, inference_bundle_indices, inference_gpu_ids = _create_placement_group(
-            num_inference_gpus, strategy="PACK", name="inference_pg"
-        )
-        logger.info("Creating training placement group...")
-        training_pg, training_bundle_indices, training_gpu_ids = _create_placement_group(
-            num_training_gpus, strategy="PACK", name="training_pg"
-        )
+        inference_bundle_indices = sorted_bundle_indices[:num_inference_gpus]
+        inference_gpu_ids = sorted_gpu_ids[:num_inference_gpus]
+        training_bundle_indices = sorted_bundle_indices[num_inference_gpus:]
+        training_gpu_ids = sorted_gpu_ids[num_inference_gpus:]
+
+    logger.info(
+        f"Placement (strategy={placement_strategy}): "
+        f"training bundles={training_bundle_indices}, "
+        f"inference bundles={inference_bundle_indices}"
+    )
 
     return {
-        "training": (training_pg, training_bundle_indices, training_gpu_ids),
-        "inference": (inference_pg, inference_bundle_indices, inference_gpu_ids),
+        "training": (pg, training_bundle_indices, training_gpu_ids),
+        "inference": (pg, inference_bundle_indices, inference_gpu_ids),
     }
 
 

@@ -31,6 +31,7 @@ This replaces the previous worker-extension approach that monkey-patched
 MRV2, CUDA graphs, and ``torch.compile``.
 """
 
+import os
 import socket
 from typing import Any
 
@@ -40,7 +41,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
-from torchspec.transfer.mooncake.eagle_store import HIDDEN_STATES_STORAGE_DTYPE
 from torchspec.utils.logging import logger, setup_file_logging
 from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
 
@@ -51,7 +51,8 @@ _PROTECTION_ENGINE_KEYS = frozenset(
         "gpu_memory_utilization",
         "nnodes",
         "node_rank",
-        "distributed_backend",
+        "master_addr",
+        "master_port",
         "speculative_config",
         "kv_transfer_config",
     }
@@ -82,13 +83,17 @@ class VllmEngine(InferenceEngine, RayActor):
         self.node_rank = node_rank
         self._engine = None
         self._mooncake_config = None
-        self._mooncake_store = None
         self._hidden_size = None
         self.local_gpu_id = None
 
         setup_file_logging("inference", self.rank, group=engine_group)
 
-    def init(self, mooncake_config=None, dist_init_addr: str | None = None) -> None:
+    def init(
+        self,
+        mooncake_config=None,
+        dist_init_addr: str | None = None,
+        pre_allocated_port: int | None = None,
+    ) -> None:
         if self.base_gpu_id is not None:
             self.local_gpu_id = self.setup_gpu(self.base_gpu_id)
             logger.info(
@@ -124,7 +129,7 @@ class VllmEngine(InferenceEngine, RayActor):
                 mooncake_config.metadata_server,
             )
 
-        mem_fraction = getattr(self.args, "vllm_mem_fraction_static", 0.8)
+        mem_fraction = getattr(self.args, "vllm_mem_fraction_static", None)
         pp_size = getattr(self.args, "vllm_pp_size", 1)
 
         if self.args.aux_hidden_states_layers is not None:
@@ -138,9 +143,6 @@ class VllmEngine(InferenceEngine, RayActor):
                     f"Using default aux hidden state layer ids: {self.aux_hidden_state_layer_ids}"
                 )
 
-        # The connector can only access aux layer outputs from the KV cache,
-        # so we append the model's final layer to capture last_hidden_states
-        # (pre-norm) for target logit computation on the training side.
         from transformers import AutoConfig as _AC
 
         _cfg = _AC.from_pretrained(
@@ -148,13 +150,33 @@ class VllmEngine(InferenceEngine, RayActor):
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
         )
         _cfg = getattr(_cfg, "text_config", _cfg)
+
+        # Layer IDs use post-layer semantics: "capture the residual stream
+        # after layer N runs".  vllm's capture hook fires at the INPUT of each
+        # listed layer (= output of the previous layer), so we shift by +1 to
+        # align with sglang's convention.
+        # Skip the shift for the final layer — it would overflow to
+        # num_hidden_layers, and the append block below handles it correctly.
+        num_layers = _cfg.num_hidden_layers
+        self.aux_hidden_state_layer_ids = [
+            lid + 1 for lid in self.aux_hidden_state_layer_ids if lid + 1 < num_layers
+        ]
+        if self.rank == 0:
+            logger.info(
+                f"Shifted aux layer ids +1 for vllm (post-layer → pre-next-layer): "
+                f"{self.aux_hidden_state_layer_ids}"
+            )
+
+        # Append the model's final layer to capture last_hidden_states
+        # (pre-norm) for target logit computation.  No +1 here: training
+        # applies the model's final norm itself.
         final_layer_id = _cfg.num_hidden_layers - 1
         if final_layer_id not in self.aux_hidden_state_layer_ids:
             self.aux_hidden_state_layer_ids.append(final_layer_id)
             if self.rank == 0:
                 logger.info(
-                    f"Appended final layer {final_layer_id} to aux layers for "
-                    f"last_hidden_states: {self.aux_hidden_state_layer_ids}"
+                    f"Appended final layer {final_layer_id} for last_hidden_states: "
+                    f"{self.aux_hidden_state_layer_ids}"
                 )
 
         nnodes = getattr(self.args, "vllm_nnodes", 1)
@@ -167,12 +189,11 @@ class VllmEngine(InferenceEngine, RayActor):
             f"aux_hidden_state_layer_ids={self.aux_hidden_state_layer_ids}"
         )
 
-        self._init_engine(tp_size, pp_size, nnodes, mem_fraction, dist_init_addr)
+        self._init_engine(
+            tp_size, pp_size, nnodes, mem_fraction, dist_init_addr, pre_allocated_port
+        )
 
         self._hidden_size = self._get_hidden_size_from_engine()
-
-        if self._mooncake_config is not None:
-            self._init_mooncake_store()
 
         logger.info(
             f"VllmEngine rank {self.rank}: initialized from {self.args.target_model_path} "
@@ -184,16 +205,26 @@ class VllmEngine(InferenceEngine, RayActor):
         tp_size: int,
         pp_size: int,
         nnodes: int,
-        mem_fraction: float,
+        mem_fraction: float | None,
         dist_init_addr: str | None,
+        pre_allocated_port: int | None = None,
     ) -> None:
         """Initialize LLM with extract_hidden_states speculative config."""
+        # Pin vLLM's mp workers to the correct physical GPUs.  Without this,
+        # all engines on a node see every GPU and their workers collide on
+        # devices 0..tp_size-1.
+        if self.base_gpu_id is not None:
+            gpu_ids = [str(self.base_gpu_id + i) for i in range(self.num_gpus_per_engine)]
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+            logger.info(
+                f"VllmEngine rank {self.rank}: set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
+            )
+
         from vllm import LLM
 
         engine_kwargs = {
             "model": self.args.target_model_path,
             "tensor_parallel_size": tp_size,
-            "gpu_memory_utilization": mem_fraction,
             "trust_remote_code": getattr(self.args, "trust_remote_code", True),
             "distributed_executor_backend": "mp",
             "disable_custom_all_reduce": True,
@@ -232,33 +263,105 @@ class VllmEngine(InferenceEngine, RayActor):
 
         inference_batch_size = getattr(self.args, "inference_batch_size", None)
         if inference_batch_size is not None:
-            comp_cfg = engine_kwargs.get("compilation_config", {})
-            if isinstance(comp_cfg, dict) and "max_cudagraph_capture_size" not in comp_cfg:
-                comp_cfg["max_cudagraph_capture_size"] = inference_batch_size
-                engine_kwargs["compilation_config"] = comp_cfg
+            if "max_num_seqs" not in engine_kwargs:
+                engine_kwargs["max_num_seqs"] = inference_batch_size
                 logger.info(
                     f"VllmEngine rank {self.rank}: defaulting "
-                    f"max_cudagraph_capture_size={inference_batch_size} from inference_batch_size"
+                    f"max_num_seqs={inference_batch_size} from inference_batch_size"
                 )
 
         engine_kwargs["enable_prefix_caching"] = False
+
+        # Prefill-only: no decode graphs needed and piecewise adds launch
+        # overhead not worthwhile for variable-length prefills.
+        # Cap capture sizes when the user overrides the mode via extra_args.
+        comp_cfg = engine_kwargs.get("compilation_config", {})
+        if isinstance(comp_cfg, dict):
+            if "cudagraph_mode" not in comp_cfg:
+                comp_cfg["cudagraph_mode"] = "NONE"
+            elif inference_batch_size is not None and "cudagraph_capture_sizes" not in comp_cfg:
+                comp_cfg["cudagraph_capture_sizes"] = [
+                    2**i
+                    for i in range(inference_batch_size.bit_length())
+                    if 2**i <= inference_batch_size
+                ]
+            engine_kwargs["compilation_config"] = comp_cfg
+
+        if "distributed_timeout_seconds" not in engine_kwargs:
+            timeout_min = getattr(self.args, "distributed_timeout_minutes", 10)
+            engine_kwargs["distributed_timeout_seconds"] = timeout_min * 60
 
         max_seq_length = getattr(self.args, "max_seq_length", None)
         if max_seq_length:
             engine_kwargs["max_model_len"] = max_seq_length
 
+        if dist_init_addr:
+            host, port_str = dist_init_addr.rsplit(":", 1)
+            engine_kwargs["master_addr"] = host
+            engine_kwargs["master_port"] = int(port_str)
+        elif pre_allocated_port is not None:
+            engine_kwargs["master_port"] = pre_allocated_port
+
         if nnodes > 1:
             engine_kwargs["nnodes"] = nnodes
             engine_kwargs["node_rank"] = self.node_rank
-            if dist_init_addr:
-                engine_kwargs["distributed_backend"] = "nccl"
-                engine_kwargs["distributed_init_address"] = dist_init_addr
+
+        if mem_fraction is not None:
+            engine_kwargs["gpu_memory_utilization"] = mem_fraction
+        else:
+            # vLLM's profiler doesn't account for the connector's runtime
+            # allocations (extracting hidden states from KV cache during
+            # save_kv_layer).  Auto-compute a utilization that reserves room.
+            engine_kwargs["gpu_memory_utilization"] = self._compute_mem_fraction(engine_kwargs)
 
         self._engine = LLM(**engine_kwargs)
         logger.info(
             f"VllmEngine rank {self.rank}: initialized extract_hidden_states mode "
             f"with layers={self.aux_hidden_state_layer_ids}"
         )
+
+    _VLLM_DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
+
+    def _compute_mem_fraction(self, engine_kwargs: dict) -> float:
+        """Auto-compute gpu_memory_utilization with connector overhead reserved.
+
+        Starts from vLLM's default (0.9) and subtracts the estimated peak
+        memory of the MooncakeHiddenStatesConnector's ``save_kv_layer``,
+        which creates temporary GPU tensors that vLLM's profiler doesn't
+        account for.
+        """
+        base = self._VLLM_DEFAULT_GPU_MEMORY_UTILIZATION
+        max_len = engine_kwargs.get("max_model_len")
+        if max_len is None:
+            return base
+
+        from transformers import AutoConfig
+
+        hf_cfg = AutoConfig.from_pretrained(
+            self.args.target_model_path,
+            trust_remote_code=getattr(self.args, "trust_remote_code", True),
+        )
+        hf_cfg = getattr(hf_cfg, "text_config", hf_cfg)
+        hidden_size = hf_cfg.hidden_size
+        num_aux_layers = len(self.aux_hidden_state_layer_ids)
+
+        # Peak per-request: _extract_from_kv_cache materialises
+        # (seq_len, num_aux_layers * hidden_size) in bf16.
+        connector_bytes = max_len * num_aux_layers * hidden_size * 2
+        # 2x safety for PyTorch allocator fragmentation + small extras
+        reserved_bytes = int(connector_bytes * 2)
+
+        total_gpu_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        overhead_frac = reserved_bytes / total_gpu_bytes
+        adjusted = base - overhead_frac
+        adjusted = max(adjusted, 0.4)
+
+        logger.info(
+            f"VllmEngine rank {self.rank}: auto gpu_memory_utilization={adjusted:.3f} "
+            f"(reserving {reserved_bytes / (1 << 30):.1f} GiB for connector: "
+            f"{max_len} tokens × {num_aux_layers} layers × {hidden_size} hidden × bf16 × 2x safety)"
+        )
+        return adjusted
 
     def generate(
         self,
@@ -369,17 +472,6 @@ class VllmEngine(InferenceEngine, RayActor):
         )
         return results
 
-    def _init_mooncake_store(self) -> None:
-        if self._mooncake_store is not None or self._mooncake_config is None:
-            return
-        from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-
-        self._mooncake_store = EagleMooncakeStore(self._mooncake_config)
-        if torch.cuda.is_available():
-            self._mooncake_store.setup(device=torch.cuda.current_device())
-        else:
-            self._mooncake_store.setup()
-
     def _normalize_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.dim() == 2 and input_ids.shape[0] == 1:
             return input_ids.squeeze(0)
@@ -469,13 +561,6 @@ class VllmEngine(InferenceEngine, RayActor):
         return self._engine is not None
 
     def shutdown(self) -> None:
-        if self._mooncake_store is not None:
-            try:
-                self._mooncake_store.close()
-            except Exception as e:
-                logger.warning(f"VllmEngine rank {self.rank}: Error closing mooncake store: {e}")
-            self._mooncake_store = None
-
         if self._engine is not None:
             try:
                 if hasattr(self._engine, "close"):
@@ -516,27 +601,3 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"Could not determine hidden_size from model config: {self.args.target_model_path}"
             )
         return hidden_size
-
-    def _get_tensor_shapes(self, seq_len: int) -> dict:
-        aux_hidden_state_layer_ids = self.aux_hidden_state_layer_ids
-        num_aux_layers = len(aux_hidden_state_layer_ids)
-        if self._hidden_size is None:
-            raise ValueError(
-                f"VllmEngine rank {self.rank}: hidden_size not initialized. Call init() first."
-            )
-        hidden_size = self._hidden_size
-
-        concat_hidden_size = num_aux_layers * hidden_size
-
-        return {
-            "hidden_states": (seq_len, concat_hidden_size),
-            "input_ids": (seq_len,),
-            "last_hidden_states": (seq_len, hidden_size),
-        }
-
-    def _get_tensor_dtypes(self) -> dict:
-        return {
-            "hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
-            "input_ids": torch.long,
-            "last_hidden_states": HIDDEN_STATES_STORAGE_DTYPE,
-        }

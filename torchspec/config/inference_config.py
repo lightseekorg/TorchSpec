@@ -85,8 +85,8 @@ class VllmConfig:
     pp_size: int = 1
     nnodes: int = 1
 
-    # Memory
-    mem_fraction_static: float = 0.8
+    # Memory (None = auto-compute from connector overhead; see VllmEngine)
+    mem_fraction_static: Optional[float] = None
 
     # Observability
     enable_metrics: bool = False

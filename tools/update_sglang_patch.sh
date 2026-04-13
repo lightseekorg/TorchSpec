@@ -5,7 +5,7 @@ set -e
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
-SGLANG_VERSION="${SGLANG_VERSION:-v0.5.8.post1}"
+SGLANG_VERSION="${SGLANG_VERSION:-v0.5.10.post1}"
 SGLANG_DIR="$PROJECT_ROOT/docker/sglang/$SGLANG_VERSION"
 
 if [ ! -d "$SGLANG_DIR" ]; then

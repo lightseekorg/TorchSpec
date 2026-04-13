@@ -94,7 +94,7 @@ class Eagle3Model(nn.Module):
             zero = total * 0.0
             return zero, zero.detach()
         # Important as it prevents recompilation.
-        torch._dynamo.mark_dynamic(valid_idx, 0)
+        torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
 
         if isinstance(target, PrecomputedTarget):
