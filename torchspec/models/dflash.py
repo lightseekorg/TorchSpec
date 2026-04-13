@@ -137,16 +137,9 @@ class DFlashModel(nn.Module):
         valid = loss_mask[:, : max_anchor + 1] > 0.5
         valid_counts = valid.sum(dim=1)
 
-        if int(valid_counts.max().item()) == 0:
-            logger.warning(
-                f"No valid anchor positions in batch (max_anchor={max_anchor}, "
-                f"block_size={bs}). Returning dummy anchors with "
-                f"keep_mask=False so loss is zero. Consider setting "
-                f"dataset.min_loss_tokens >= 2*block_size."
-            )
-            anchors = torch.zeros(bsz, max_n, dtype=torch.long, device=device)
-            keep_mask = torch.zeros(bsz, max_n, dtype=torch.bool, device=device)
-            return anchors, keep_mask
+        # No .item() guard here — when valid_counts is all-zero, the normal
+        # path produces keep_mask=False everywhere, giving zero loss.
+        # Avoiding .item() prevents a torch.compile graph break.
 
         indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
         masked_indices = torch.where(valid, indices, torch.tensor(seq_len + 1, device=device))
