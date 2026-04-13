@@ -67,7 +67,7 @@ mooncake:
   protocol: rdma
   device_name: mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11
   enable_gpu_direct: false
-  kv_lease_ttl_s: 3.0
+  kv_lease_ttl_s: 3.0 # Mooncake master internal lease only; does not affect deletion timing
 
 output_dir: ./outputs/sglang_minimax_m25_5node
 cache_dir: ./cache/sglang_minimax_m25_5node

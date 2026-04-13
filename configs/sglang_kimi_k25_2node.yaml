@@ -71,7 +71,7 @@ mooncake:
   enable_gpu_direct: false
   device_name: mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11 # Please change this to correct network devices.
   # protocol: tcp # Switch to TCP if RDMA is not available.
-  # kv_lease_ttl_s: 60 # If TCP transfer is slow, increase the lease TTL. Also increase the global_segment_size accordingly.
+  # kv_lease_ttl_s: 60 # Mooncake master internal lease only; does not affect deletion timing. Increase global_segment_size for TCP.
 
 
 output_dir: ./outputs/train_kimi25_2node_h200

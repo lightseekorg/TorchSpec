@@ -57,7 +57,7 @@ class MooncakeConfig:
     gpu_buffer_size: str | int | None = None
     enable_gpu_direct: bool = False
     replica_num: int = 1
-    enable_soft_pin: bool = False
+    enable_hard_pin: bool = False
     host_buffer_size: str | int | None = None
     get_batch_size: int = 1
     max_seq_len: int = 8192
@@ -70,7 +70,7 @@ class MooncakeConfig:
     get_retry_wait_seconds: float = 0.5
     get_retry_log_interval_seconds: float = 10.0
     get_retry_max_wait_seconds: float = 60.0
-    kv_lease_ttl_s: float = 5.0
+    kv_lease_ttl_s: float = 5.0  # Mooncake master lease TTL only; not used for deletion timing
 
     def __post_init__(self):
         # Coerce size fields: accept str ("4GB") or int
@@ -146,6 +146,7 @@ class MooncakeConfig:
                 args, "mooncake_get_batch_size", getattr(args, "per_dp_rank_batch_size", 1)
             ),
             "kv_lease_ttl_s": getattr(args, "mooncake_kv_lease_ttl_s", 5.0),
+            "enable_hard_pin": getattr(args, "mooncake_enable_hard_pin", False),
             "max_seq_len": getattr(
                 args,
                 "mooncake_max_seq_len",
@@ -187,6 +188,7 @@ class MooncakeConfig:
             self.get_retry_log_interval_seconds
         )
         os.environ["MOONCAKE_GET_RETRY_MAX_WAIT_SECONDS"] = str(self.get_retry_max_wait_seconds)
+        os.environ["MOONCAKE_ENABLE_HARD_PIN"] = "1" if self.enable_hard_pin else "0"
 
     @classmethod
     def from_env(cls) -> "MooncakeConfig":
@@ -237,6 +239,7 @@ class MooncakeConfig:
             get_retry_wait_seconds=get_retry_wait_seconds,
             get_retry_log_interval_seconds=get_retry_log_interval_seconds,
             get_retry_max_wait_seconds=get_retry_max_wait_seconds,
+            enable_hard_pin=os.getenv("MOONCAKE_ENABLE_HARD_PIN", "0") == "1",
         )
 
     @classmethod

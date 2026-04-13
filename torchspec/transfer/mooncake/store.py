@@ -20,7 +20,7 @@
 
 import threading
 from abc import ABC
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 from mooncake.store import MooncakeDistributedStore
@@ -56,6 +56,7 @@ class MooncakeHiddenStateStore(ABC):
         self._gpu_send_buffer: Optional[GPUSendBuffer] = None
         self._gpu_direct_available = False
         self._copy_stream: Optional[torch.cuda.Stream] = None
+        self._replicate_config: Any = None
 
     def setup(self, device: torch.device | int | None = None) -> None:
         """Initialize the Mooncake Store client."""
@@ -94,6 +95,9 @@ class MooncakeHiddenStateStore(ABC):
                 f"and metadata server is available at {self.config.metadata_server}"
             )
 
+        self._verify_force_delete()
+        self._build_replicate_config()
+
         pool_size = self.config.async_put_pool_size
         if pool_size > 0:
             self._host_buffer_pool = HostBufferPool(
@@ -105,7 +109,9 @@ class MooncakeHiddenStateStore(ABC):
             for buf in self._host_buffer_pool._buffers:
                 self._register_buffer(buf.ptr, buf.size)
 
-            self._async_put_manager = AsyncPutManager(store=self._store, max_workers=pool_size)
+            self._async_put_manager = AsyncPutManager(
+                store=self._store, max_workers=pool_size, replicate_config=self._replicate_config
+            )
             logger.info("Async put manager created (pool_size=%d)", pool_size)
 
         if self.config.enable_gpu_direct and torch.cuda.is_available():
@@ -223,13 +229,8 @@ class MooncakeHiddenStateStore(ABC):
         buf = self._host_buffer_pool.get_buffer()
         size = 4096
         self._store.batch_put_from([key], [buf.ptr], [size])
-        self._store.remove(key)
+        self._store.batch_remove([key], force=True)
         logger.info("RDMA warmup complete")
-
-    def remove(self, key: str) -> None:
-        """Remove data from Mooncake Store."""
-        self._store.remove(key)
-        logger.debug("Removed data with key: %s", key)
 
     def exists(self, key: str) -> bool:
         """Check if a key exists in the store (metadata-only, no data download)."""
@@ -238,6 +239,57 @@ class MooncakeHiddenStateStore(ABC):
             return result == 1
         except Exception:
             return False
+
+    def _verify_force_delete(self) -> None:
+        """Fail-fast if Mooncake doesn't support batch_remove(force=True).
+
+        Requires mooncake-transfer-engine >= 0.3.10.post1.
+        Primary check uses package version metadata; falls back to docstring
+        heuristic for non-pip installs.
+        """
+        batch_remove = getattr(self._store, "batch_remove", None)
+        if batch_remove is None:
+            raise RuntimeError(
+                "Mooncake version too old: batch_remove() not found. "
+                "Requires mooncake-transfer-engine >= 0.3.10.post1."
+            )
+        try:
+            from importlib.metadata import version
+
+            from packaging.version import Version
+
+            installed = Version(version("mooncake-transfer-engine"))
+            if installed >= Version("0.3.10.post1"):
+                return
+        except Exception:
+            pass
+        doc = getattr(batch_remove, "__doc__", "") or ""
+        if "force" not in doc:
+            raise RuntimeError(
+                "Mooncake version too old: batch_remove(force=True) not supported. "
+                "Requires mooncake-transfer-engine >= 0.3.10.post1."
+            )
+
+    def _build_replicate_config(self) -> None:
+        """Build ReplicateConfig for batch_put_from if hard_pin is enabled and supported."""
+        self._replicate_config = None
+        if not self.config.enable_hard_pin:
+            return
+        try:
+            from mooncake.store import ReplicateConfig
+
+            cfg = ReplicateConfig()
+            if hasattr(cfg, "with_hard_pin"):
+                cfg.with_hard_pin = True
+                self._replicate_config = cfg
+                logger.info("Hard pin enabled for batch_put_from")
+            else:
+                logger.warning(
+                    "enable_hard_pin=True but ReplicateConfig lacks with_hard_pin attr "
+                    "(needs unreleased Mooncake)"
+                )
+        except ImportError:
+            logger.warning("enable_hard_pin=True but ReplicateConfig not importable")
 
     def close(self) -> None:
         """Close the Mooncake Store client."""
