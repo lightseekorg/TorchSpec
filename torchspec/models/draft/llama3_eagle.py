@@ -1644,33 +1644,19 @@ def _standard_flash_attn_forward(
     softmax_scale: float,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if _std_flash_attn_mod is not None and _std_flash_attn_mod.__version__ < "2.6.3":
-        out, _, _, _, _, lse, _, _ = _std_flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=(-1, -1),
-            softcap=0.0,
-            alibi_slopes=None,
-            return_softmax=False,
-        )
-    else:
-        out, lse, _, _ = _std_flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size_left=-1,
-            window_size_right=-1,
-            softcap=0.0,
-            alibi_slopes=None,
-            return_softmax=False,
-        )
+    out, lse, _, _ = _std_flash_attn_forward(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=-1,
+        window_size_right=-1,
+        softcap=0.0,
+        alibi_slopes=None,
+        return_softmax=False,
+    )
     return out, lse
 
 
@@ -1687,47 +1673,26 @@ def _standard_flash_attn_backward_call(
     softmax_scale: float,
     causal: bool,
 ) -> None:
-    if _std_flash_attn_mod is not None and _std_flash_attn_mod.__version__ < "2.6.3":
-        _std_flash_attn_backward(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            0.0,
-            softmax_scale,
-            causal,
-            (-1, -1),
-            0.0,
-            None,
-            False,
-            None,
-        )
-    else:
-        _std_flash_attn_backward(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            0.0,
-            softmax_scale,
-            causal,
-            -1,
-            -1,
-            0.0,
-            None,
-            False,
-            None,
-        )
+    _std_flash_attn_backward(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+        None,
+    )
 
 
 def _standard_flash_attn_varlen_forward(
@@ -1788,55 +1753,30 @@ def _standard_flash_attn_varlen_backward_call(
     dq_unpad = torch.empty_like(q_unpad)
     dk_unpad = torch.empty_like(k_unpad)
     dv_unpad = torch.empty_like(v_unpad)
-    if _std_flash_attn_mod is not None and _std_flash_attn_mod.__version__ < "2.6.3":
-        _std_flash_attn_varlen_backward(
-            dout_unpad,
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            out_unpad,
-            lse_unpad,
-            dq_unpad,
-            dk_unpad,
-            dv_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            0.0,
-            softmax_scale,
-            causal,
-            (-1, -1),
-            0.0,
-            None,
-            False,
-            None,
-        )
-    else:
-        _std_flash_attn_varlen_backward(
-            dout_unpad,
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            out_unpad,
-            lse_unpad,
-            dq_unpad,
-            dk_unpad,
-            dv_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            0.0,
-            softmax_scale,
-            causal,
-            -1,
-            -1,
-            0.0,
-            None,
-            False,
-            None,
-        )
+    _std_flash_attn_varlen_backward(
+        dout_unpad,
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        out_unpad,
+        lse_unpad,
+        dq_unpad,
+        dk_unpad,
+        dv_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        0.0,
+        softmax_scale,
+        causal,
+        -1,
+        -1,
+        0.0,
+        None,
+        False,
+        None,
+    )
     dq.copy_(_std_flash_pad_input(dq_unpad, indices_q, q.shape[0], q.shape[1]))
     dk.copy_(_std_flash_pad_input(dk_unpad, indices_k, k.shape[0], k.shape[1]))
     dv.copy_(_std_flash_pad_input(dv_unpad, indices_k, v.shape[0], v.shape[1]))
