@@ -27,6 +27,7 @@ import torch.distributed as dist
 from torchspec.utils import wandb as wandb_utils
 
 _LOG_FORMAT = "[%(asctime)s] %(filename)s:%(lineno)d %(levelname)s %(message)s"
+_tb_writer = None
 
 
 def _get_logger_level():
@@ -117,7 +118,29 @@ def print_on_rank0(message):
 
 
 def init_tracking(args, primary: bool = True, **kwargs):
+    global _tb_writer
     if primary:
         wandb_utils.init_wandb_primary(args, **kwargs)
+        if getattr(args, "use_tensorboard", False) and getattr(args, "output_dir", None):
+            from torch.utils.tensorboard import SummaryWriter
+
+            tb_log_dir = os.path.join(args.output_dir, "runs")
+            os.makedirs(tb_log_dir, exist_ok=True)
+            _tb_writer = SummaryWriter(log_dir=tb_log_dir)
+            logger.info(f"TensorBoard writer initialized at {tb_log_dir}")
     else:
         wandb_utils.init_wandb_secondary(args, **kwargs)
+
+
+def get_tb_writer():
+    """Return the module-level TensorBoard SummaryWriter, or None if not initialized."""
+    return _tb_writer
+
+
+def close_tb_writer():
+    """Flush and close the TensorBoard writer."""
+    global _tb_writer
+    if _tb_writer is not None:
+        _tb_writer.flush()
+        _tb_writer.close()
+        _tb_writer = None

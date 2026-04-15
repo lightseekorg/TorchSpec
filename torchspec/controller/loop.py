@@ -36,7 +36,7 @@ from torchspec.controller.eval import (
     setup_eval,
     update_checkpoint_eval_meta,
 )
-from torchspec.utils.logging import logger
+from torchspec.utils.logging import get_tb_writer, logger
 
 
 def _maybe_sync_draft_weights(args, completed_steps, train_group, inference_engines):
@@ -348,6 +348,12 @@ def training_loop(
 
                 if getattr(wandb, "run", None) is not None:
                     wandb.log(metrics)
+
+                tb_writer = get_tb_writer()
+                if tb_writer is not None:
+                    for key, value in metrics.items():
+                        if isinstance(value, (int, float)):
+                            tb_writer.add_scalar(key, value, completed_steps)
 
             # ── Eval at explicit interval (if configured) ─────────
             # Skip if a checkpoint save is about to run (it will eval anyway)
