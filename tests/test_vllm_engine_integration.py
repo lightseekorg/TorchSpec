@@ -64,6 +64,9 @@ def create_engine(
     tp_size: int,
     aux_layer_ids: list[int],
     max_num_batched_tokens: int | None = None,
+    enforce_eager: bool = False,
+    load_format: str | None = None,
+    max_model_len: int = 4096,
 ):
     from vllm import LLM
 
@@ -81,7 +84,9 @@ def create_engine(
         disable_custom_all_reduce=True,
         disable_log_stats=True,
         enable_prefix_caching=False,
-        max_model_len=4096,
+        max_model_len=max_model_len,
+        enforce_eager=enforce_eager,
+        **({"load_format": load_format} if load_format else {}),
         speculative_config={
             "method": "extract_hidden_states",
             "num_speculative_tokens": 1,
@@ -214,9 +219,13 @@ def run_test(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3-8B")
-    parser.add_argument("--tp", type=int, default=4)
+    parser.add_argument("--model", default="moonshotai/Kimi-K2.5")
+    parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--dump-dir", default="./tensor_dumps")
+    parser.add_argument("--load-format", default="fastsafetensors")
+    parser.add_argument("--enforce-eager", action="store_true", default=True)
+    parser.add_argument("--no-enforce-eager", dest="enforce_eager", action="store_false")
+    parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument(
         "--aux-layers",
         type=int,
@@ -245,6 +254,9 @@ def main():
 
     print(f"Model:           {args.model}")
     print(f"TP size:         {args.tp}")
+    print(f"Load format:     {args.load_format}")
+    print(f"Enforce eager:   {args.enforce_eager}")
+    print(f"Max model len:   {args.max_model_len}")
     print(f"Aux layer IDs:   {aux_layer_ids}")
     print(f"  training layers: {aux_layer_ids[:-1]} -> hidden_dim={hidden_dim}")
     print(f"  final layer:     {aux_layer_ids[-1]} -> last_hidden_dim={last_hidden_dim}")
@@ -263,7 +275,14 @@ def main():
     }
     torch.save(meta, dump_dir / "vllm_meta.pt")
 
-    engine = create_engine(args.model, args.tp, aux_layer_ids)
+    engine = create_engine(
+        args.model,
+        args.tp,
+        aux_layer_ids,
+        enforce_eager=args.enforce_eager,
+        load_format=args.load_format,
+        max_model_len=args.max_model_len,
+    )
 
     from torchspec.transfer.mooncake import EagleMooncakeStore, MooncakeConfig
 
@@ -349,6 +368,9 @@ def main():
         args.tp,
         aux_layer_ids,
         max_num_batched_tokens=128,
+        enforce_eager=args.enforce_eager,
+        load_format=args.load_format,
+        max_model_len=args.max_model_len,
     )
 
     # Sequences longer than 128 tokens will require multiple prefill chunks.

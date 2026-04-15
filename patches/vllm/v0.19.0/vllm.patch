@@ -10,6 +10,20 @@ TorchSpec patches for vllm v0.19.0
    vllm/transformers_utils/configs/extract_hidden_states.py
    (already in vllm >= 0.19.0, included here for older versions)
 
+4. Fix MLAAttentionSpec.merge() missing dimension validation
+   vllm/v1/kv_cache_interface.py
+   Without this, CacheOnlyAttentionLayer (used by extract_hidden_states)
+   gets incorrectly merged with MLA attention layers into a single uniform
+   KV cache group, causing the CacheOnly KV cache to be reshaped with MLA
+   dimensions (1 head, 576 dim) instead of hidden-state dimensions
+   (num_aux_layers heads, hidden_size dim).
+
+5. Register _CacheOnlyKVCacheSpec in the KV cache manager spec map
+   vllm/v1/core/single_type_kv_cache_manager.py
+   extract_hidden_states uses _CacheOnlyKVCacheSpec (a subclass of
+   AttentionSpec) which is not in vLLM's spec_manager_map, causing a
+   KeyError during engine init. Route it to FullAttentionManager.
+
 Apply:
   cd $VLLM_ROOT && git apply /path/to/vllm.patch
 
@@ -86,3 +100,62 @@ index 5391fbe1ad53..2beec0e3081b 100644
          super().__init__(**combined)
  
      @classmethod
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -208,7 +208,7 @@
+ 
+     @classmethod
+     def merge(cls, specs: list[Self]) -> Self:
+         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
+             "All attention layers in the same KV cache group must be MLAAttentionSpec."
+         )
+         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+@@ -216,7 +216,14 @@
+         assert len(cache_dtype_str_set) == 1, (
+             "All attention layers in the same KV cache group must use the same "
+             "quantization method."
+         )
+-        return cls(
++        merged = cls(
+             block_size=specs[0].block_size,
+             num_kv_heads=specs[0].num_kv_heads,
+             head_size=specs[0].head_size,
+@@ -224,3 +224,10 @@
+             dtype=specs[0].dtype,
+             page_size_padded=specs[0].page_size_padded,
+             cache_dtype_str=cache_dtype_str_set.pop(),
+-        )
++        )
++        for spec in specs:
++            for f in fields(AttentionSpec):
++                assert getattr(spec, f.name) == getattr(merged, f.name), (
++                    "All MLAAttentionSpec layers in the same KV cache group "
++                    f"must match on {f.name}: "
++                    f"{getattr(spec, f.name)} != {getattr(merged, f.name)}"
++                )
++        return merged
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1109,6 +1109,14 @@
+ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
+     FullAttentionSpec: FullAttentionManager,
+     MLAAttentionSpec: FullAttentionManager,
+     SlidingWindowSpec: SlidingWindowManager,
+     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
+     MambaSpec: MambaManager,
+     CrossAttentionSpec: CrossAttentionManager,
+     SinkFullAttentionSpec: SinkFullAttentionManager,
+ }
+ 
++try:
++    from vllm.model_executor.models.extract_hidden_states import (
++        _CacheOnlyKVCacheSpec,
++    )
++    spec_manager_map[_CacheOnlyKVCacheSpec] = FullAttentionManager
++except ImportError:
++    pass
++
+ 
+ def get_manager_for_kv_cache_spec(
