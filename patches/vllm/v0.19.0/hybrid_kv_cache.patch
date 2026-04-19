@@ -1,5 +1,12 @@
 Hybrid KV cache + SupportsHMA patches for vLLM 0.19
 
+This patch complements `patches/vllm/v0.19.0/vllm.patch` (scheme 2):
+- `vllm.patch` introduces `HiddenStatesCacheSpec` so CacheOnly uses an
+  explicit per-layer KV spec instead of relying on merge mismatch behavior.
+- This patch makes hybrid/HMA allocation and slot-mapping work when that
+  CacheOnly layer ends up in its own KV group next to FullAttention and
+  Mamba/GDN groups (for example Qwen3.5).
+
 Superseded by: https://github.com/vllm-project/vllm/pulls?q=is%3Aopen+is%3Apr+kv_offload%2BHMA
 Once the kv_offload+HMA series lands (PRs #36644, #36645, #37885, #38261,
 #38453, #39401–#39403), this patch is no longer needed.
@@ -8,16 +15,19 @@ Once the kv_offload+HMA series lands (PRs #36644, #36645, #37885, #38261,
    auto-disabling HMA when kv_transfer_config is set (backport of PR #36636).
 
 2. vllm/v1/core/kv_cache_utils.py — Handle heterogeneous page sizes
-   (e.g. FullAttention + Mamba/GDN) in KV cache allocation, grouping,
-   and memory estimation.
+   (e.g. FullAttention + Mamba/GDN + HiddenStatesCacheSpec) in KV cache
+   allocation, grouping, and memory estimation.
 
 3. vllm/v1/spec_decode/extract_hidden_states.py — Use per-layer slot_mappings
-   for CacheOnly during propose.  On hybrid models the CacheOnly layer is in
-   a separate KV group; common_attn_metadata.slot_mapping belongs to the
-   attention group and has wrong block_size / block IDs.
+   for CacheOnly during propose. On hybrid models the CacheOnly layer lives in
+   its own KV group (explicitly via HiddenStatesCacheSpec); using
+   common_attn_metadata.slot_mapping from the attention group gives wrong
+   block_size / block IDs.
 
 Apply:
-  cd /usr/local/lib/python3.12/dist-packages && patch -p1 < /path/to/hybrid_kv_cache.patch
+  # Apply vllm.patch first, then this patch.
+  cd $VLLM_ROOT && git apply /path/to/vllm.patch
+  cd $VLLM_ROOT && git apply /path/to/hybrid_kv_cache.patch
 
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
@@ -201,7 +211,7 @@ Apply:
      group_size = max(len(group.layer_names) for group in kv_cache_groups)
 --- a/vllm/v1/spec_decode/extract_hidden_states.py
 +++ b/vllm/v1/spec_decode/extract_hidden_states.py
-@@ -131,11 +131,24 @@
+@@ -129,13 +129,26 @@
          if num_tokens_across_dp is not None:
              num_tokens_across_dp[self.dp_rank] = num_input_tokens
  
