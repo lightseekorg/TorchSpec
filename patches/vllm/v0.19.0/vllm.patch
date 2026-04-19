@@ -10,19 +10,23 @@ TorchSpec patches for vllm v0.19.0
    vllm/transformers_utils/configs/extract_hidden_states.py
    (already in vllm >= 0.19.0, included here for older versions)
 
-4. Fix MLAAttentionSpec.merge() missing dimension validation
-   vllm/v1/kv_cache_interface.py
-   Without this, CacheOnlyAttentionLayer (used by extract_hidden_states)
-   gets incorrectly merged with MLA attention layers into a single uniform
-   KV cache group, causing the CacheOnly KV cache to be reshaped with MLA
-   dimensions (1 head, 576 dim) instead of hidden-state dimensions
-   (num_aux_layers heads, hidden_size dim).
+4. Use explicit HiddenStatesCacheSpec for extract_hidden_states
+   vllm/model_executor/models/extract_hidden_states.py
+   Instead of relying on MLAAttentionSpec/FullAttentionSpec merge behavior,
+   define a dedicated cache spec that always rejects merging. This guarantees
+   CacheOnlyAttentionLayer gets its own per-layer KV allocation on MLA, GQA,
+   and hybrid attention models.
 
-5. Register _CacheOnlyKVCacheSpec in the KV cache manager spec map
+5. Register HiddenStatesCacheSpec in the KV cache manager spec map
    vllm/v1/core/single_type_kv_cache_manager.py
-   extract_hidden_states uses _CacheOnlyKVCacheSpec (a subclass of
-   AttentionSpec) which is not in vLLM's spec_manager_map, causing a
-   KeyError during engine init. Route it to FullAttentionManager.
+   Without this, scheduler init raises:
+   KeyError: HiddenStatesCacheSpec
+
+6. Backport EagleModelMixin hooks to Qwen3NextModel
+   vllm/model_executor/models/qwen3_next.py
+   Qwen3.5 models use Qwen3NextModel internally. Without EagleModelMixin and
+   _maybe_add_hidden_state, extract_hidden_states fails with:
+   AssertionError: Model instance must inherit from EagleModelMixin
 
 Apply:
   cd $VLLM_ROOT && git apply /path/to/vllm.patch
@@ -44,7 +48,6 @@ Apply:
  
      @staticmethod
 diff --git a/vllm/model_executor/models/extract_hidden_states.py b/vllm/model_executor/models/extract_hidden_states.py
-index 608e93d..c967983 100644
 --- a/vllm/model_executor/models/extract_hidden_states.py
 +++ b/vllm/model_executor/models/extract_hidden_states.py
 @@ -9,6 +9,7 @@ extract_hidden_states speculative decoding method.
@@ -55,7 +58,55 @@ index 608e93d..c967983 100644
  from typing import ClassVar
  
  import torch
-@@ -352,6 +353,12 @@ class ExtractHiddenStatesModel(nn.Module):
+@@ -34,10 +35,27 @@ from vllm.v1.attention.backend import (
+ )
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
++    FullAttentionSpec,
+     KVCacheSpec,
+-    MLAAttentionSpec,
+ )
+ 
++
++class HiddenStatesCacheSpec(FullAttentionSpec):
++    """KV cache spec for hidden-states-only storage (no real K/V split).
++
++    Subclasses FullAttentionSpec so is_uniform_type() recognises it, but
++    overrides merge() to always reject grouping with other layers. This makes
++    the CacheOnly layer use per-layer KV allocation explicitly rather than
++    relying on merge mismatch side effects.
++    """
++
++    @classmethod
++    def merge(cls, specs):
++        raise AssertionError(
++            "HiddenStatesCacheSpec must not be merged with other layers"
++        )
++
++
+ ########## Custom Ops ########
+ 
+ 
+@@ -323,13 +341,13 @@ class CacheOnlyAttentionLayer(nn.Module, AttentionLayerBase):
+         return self.attn_backend
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+-        # Note: we use MLAAttentionSpec here to because it will
+-        # produce page sizes of (block_size * num_kv_heads * head_size * dtype_size)
+-        # whereas FullAttentionSpec will add an additional factor of 2
+-        return MLAAttentionSpec(
+-            block_size=self.block_size,
++        return HiddenStatesCacheSpec(
++            # Use the current cache_config block size since the backend may
++            # update it after model init (for example MLA requires block_size=32).
++            block_size=vllm_config.cache_config.block_size,
+             num_kv_heads=self.num_heads,
+             head_size=self.head_size,
++            head_size_v=0,
+             dtype=self.kv_cache_torch_dtype,
+         )
+ 
+@@ -353,6 +371,12 @@ class ExtractHiddenStatesModel(nn.Module):
  
          cache_config = vllm_config.cache_config
  
@@ -100,60 +151,73 @@ index 5391fbe1ad53..2beec0e3081b 100644
          super().__init__(**combined)
  
      @classmethod
-diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
---- a/vllm/v1/kv_cache_interface.py
-+++ b/vllm/v1/kv_cache_interface.py
-@@ -208,7 +208,7 @@
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -58,6 +58,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
  
-     @classmethod
-     def merge(cls, specs: list[Self]) -> Self:
-         assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
-             "All attention layers in the same KV cache group must be MLAAttentionSpec."
-         )
-         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
-@@ -216,7 +216,14 @@
-         assert len(cache_dtype_str_set) == 1, (
-             "All attention layers in the same KV cache group must use the same "
-             "quantization method."
-         )
--        return cls(
-+        merged = cls(
-             block_size=specs[0].block_size,
-             num_kv_heads=specs[0].num_kv_heads,
-             head_size=specs[0].head_size,
-@@ -224,3 +224,10 @@
-             dtype=specs[0].dtype,
-             page_size_padded=specs[0].page_size_padded,
-             cache_dtype_str=cache_dtype_str_set.pop(),
--        )
-+        )
-+        for spec in specs:
-+            for f in fields(AttentionSpec):
-+                assert getattr(spec, f.name) == getattr(merged, f.name), (
-+                    "All MLAAttentionSpec layers in the same KV cache group "
-+                    f"must match on {f.name}: "
-+                    f"{getattr(spec, f.name)} != {getattr(merged, f.name)}"
-+                )
-+        return merged
+ from .interfaces import (
++    EagleModelMixin,
+     HasInnerState,
+     IsHybrid,
+     MixtureOfExperts,
+@@ -454,7 +455,7 @@ class Qwen3NextDecoderLayer(nn.Module):
+ 
+ 
+ @support_torch_compile
+-class Qwen3NextModel(nn.Module):
++class Qwen3NextModel(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -492,8 +493,6 @@ class Qwen3NextModel(nn.Module):
+         else:
+             self.norm = PPMissingLayer()
+ 
+-        self.aux_hidden_state_layers: tuple[int, ...] = ()
+-
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
+@@ -514,20 +513,19 @@ class Qwen3NextModel(nn.Module):
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        aux_hidden_states = []
++        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+         for layer_idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer),
+             start=self.start_layer,
+         ):
+-            if layer_idx in self.aux_hidden_state_layers:
+-                aux_hidden_states.append(
+-                    hidden_states + residual if residual is not None else hidden_states
+-                )
+             hidden_states, residual = layer(
+                 positions=positions,
+                 hidden_states=hidden_states,
+                 residual=residual,
+             )
++            self._maybe_add_hidden_state(
++                aux_hidden_states, layer_idx + 1, hidden_states, residual
++            )
+ 
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors(
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
-@@ -1109,6 +1109,14 @@
- spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
-     FullAttentionSpec: FullAttentionManager,
-     MLAAttentionSpec: FullAttentionManager,
-     SlidingWindowSpec: SlidingWindowManager,
-     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
-     MambaSpec: MambaManager,
-     CrossAttentionSpec: CrossAttentionManager,
+@@ -1116,5 +1116,14 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
      SinkFullAttentionSpec: SinkFullAttentionManager,
  }
  
 +try:
 +    from vllm.model_executor.models.extract_hidden_states import (
-+        _CacheOnlyKVCacheSpec,
++        HiddenStatesCacheSpec,
 +    )
-+    spec_manager_map[_CacheOnlyKVCacheSpec] = FullAttentionManager
++
++    spec_manager_map[HiddenStatesCacheSpec] = FullAttentionManager
 +except ImportError:
 +    pass
 +
