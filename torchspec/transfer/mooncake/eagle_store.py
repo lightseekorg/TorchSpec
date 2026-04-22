@@ -18,14 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import atexit
 import ctypes
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
-from torchspec.transfer.mooncake.deferred_delete import DeferredDeleteManager
 from torchspec.transfer.mooncake.helpers import _format_bytes
 from torchspec.transfer.mooncake.store import MooncakeHiddenStateStore
 from torchspec.utils.logging import logger
@@ -63,56 +61,10 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     - {key}_ids: input_ids
     - {key}_lhs: last_hidden_states (if present)
 
-    Deletions are deferred to respect Mooncake's lease TTL (config.kv_lease_ttl_s).
+    Deletions use ``batch_remove(force=True)`` for immediate cleanup.
     """
 
     TENSOR_SUFFIXES = ["_hs", "_tgt", "_ids", "_lhs"]
-
-    def __init__(self, config):
-        """Initialize Eagle3 Mooncake Store with deferred deletion."""
-        super().__init__(config)
-        self._deferred_delete_manager: Optional[DeferredDeleteManager] = None
-        self._cleanup_registered = False
-
-    def setup(self, device: torch.device = None) -> None:
-        """Initialize the Mooncake Store client and deferred delete manager."""
-        super().setup(device)
-
-        if self._deferred_delete_manager is None:
-            lease_ttl_s = self.config.kv_lease_ttl_s
-            # Initialize deferred delete manager after store is ready
-            self._deferred_delete_manager = DeferredDeleteManager(
-                store=self._store,
-                ttl_buffer_seconds=0.5,  # Small buffer for safety
-                check_interval=1.0,  # Check queue every second
-                max_queue_size=10000,  # Max pending deletions
-                retry_interval=2.0,  # Retry failed deletes after 2s
-                ttl_seconds=lease_ttl_s,  # Mooncake lease TTL
-            )
-            logger.debug("Deferred delete manager initialized")
-
-            # Register cleanup on exit
-            if not self._cleanup_registered:
-                atexit.register(self._cleanup_deferred_deletes)
-                self._cleanup_registered = True
-
-    def _cleanup_deferred_deletes(self):
-        """Cleanup deferred delete manager on exit."""
-        if self._deferred_delete_manager is not None:
-            logger.info("Cleaning up deferred delete manager...")
-            stats = self._deferred_delete_manager.get_stats()
-            queue_size = self._deferred_delete_manager.get_queue_size()
-            if queue_size > 0:
-                logger.warning(
-                    " Shutting down with %d pending deletions. "
-                    "Some Mooncake objects may not be cleaned up.",
-                    queue_size,
-                )
-            self._deferred_delete_manager.stop()
-            logger.info(
-                "Deferred delete final stats: %s",
-                stats,
-            )
 
     def put(
         self,
@@ -242,17 +194,22 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     ) -> None:
         """Synchronous batch_put_from with error handling."""
         total_bytes = sum(sizes)
-        results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+        if self._replicate_config is not None:
+            results = self._store.batch_put_from(
+                keys, buffer_ptrs, sizes, config=self._replicate_config
+            )
+        else:
+            results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
         failures = [(k, r) for k, r in zip(keys, results) if r != 0]
         if failures:
-            for k in keys:
-                try:
-                    self._store.remove(k)
-                except Exception:
-                    logger.debug(
-                        "Failed to remove partial key %s after batch_put_from failure.",
-                        k,
-                    )
+            try:
+                self._store.batch_remove(keys, force=True)
+            except Exception:
+                logger.warning(
+                    "Failed to cleanup keys after batch_put_from failure: %s",
+                    keys,
+                    exc_info=True,
+                )
             failure_details = ", ".join(f"{k} (code={r})" for k, r in failures)
             config_details = (
                 f"total_bytes={_format_bytes(total_bytes)}, "
@@ -506,72 +463,51 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         has_last_hidden_states: bool = False,
         has_target: bool = False,
     ) -> None:
-        """
-        Queue deferred removal of all tensors associated with an Eagle3 output.
+        """Force-delete all tensors associated with an Eagle3 output.
 
-        Deletions are queued and executed after Mooncake's lease TTL expires.
-        This prevents deletion failures due to active leases.
+        Uses ``batch_remove(force=True)`` to bypass lease TTL and delete
+        immediately after consumption. Retries up to 3 times on failure.
+        Never raises — deletion is best-effort to avoid breaking the
+        training fetch path.
 
         Args:
             key: Base key used when storing
             has_last_hidden_states: Whether last_hidden_states was stored
             has_target: Whether target (logits) was stored
         """
-
         keys = [f"{key}_hs", f"{key}_ids"]
         if has_target:
             keys.append(f"{key}_tgt")
         if has_last_hidden_states:
             keys.append(f"{key}_lhs")
 
-        logger.debug(
-            "Queueing deferred deletion for base_key=%s, num_keys=%d",
-            key,
-            len(keys),
-        )
-
-        # Queue deletion instead of deleting immediately
-        if self._deferred_delete_manager is None:
-            logger.error(
-                "Deferred delete manager not initialized! Cannot delete %s",
-                key,
-            )
-            return
-
-        success = self._deferred_delete_manager.enqueue_delete(
-            keys=keys,
-            base_key=key,
-            max_attempts=3,
-        )
-
-        if success:
-            logger.debug(
-                "Queued deferred deletion for base_key=%s",
-                key,
-            )
-        else:
-            logger.error(
-                "Failed to queue deletion for %s (queue full)",
-                key,
-            )
-
-    def get_deferred_delete_stats(self) -> Dict[str, int]:
-        """Get statistics from the deferred delete manager.
-
-        Returns:
-            Dict with keys: enqueued, attempted, succeeded, failed, retried, abandoned, queue_size
-        """
-        if self._deferred_delete_manager is None:
-            return {
-                "enqueued": 0,
-                "attempted": 0,
-                "succeeded": 0,
-                "failed": 0,
-                "retried": 0,
-                "abandoned": 0,
-                "queue_size": 0,
-            }
-
-        stats = self._deferred_delete_manager.get_stats()
-        stats["queue_size"] = self._deferred_delete_manager.get_queue_size()
-        return stats
+        for attempt in range(1, 4):
+            try:
+                results = self._store.batch_remove(keys, force=True)
+            except Exception:
+                if attempt < 3:
+                    logger.warning(
+                        "batch_remove raised for %s (attempt %d/3)", key, attempt, exc_info=True
+                    )
+                    time.sleep(0.5)
+                else:
+                    logger.error(
+                        "Force delete abandoned for %s after 3 exceptions", key, exc_info=True
+                    )
+                continue
+            failed = [(k, r) for k, r in zip(keys, results) if r not in (None, 0, -704)]
+            if not failed:
+                logger.debug("Force-deleted %s (%d keys)", key, len(results))
+                return
+            if attempt < 3:
+                time.sleep(0.5)
+                logger.warning(
+                    "Retrying force delete for %s: %d keys failed (attempt %d/3)",
+                    key,
+                    len(failed),
+                    attempt,
+                )
+            else:
+                logger.error("Force delete abandoned for %s: %s", key, failed)
+                return
+            keys = [k for k, _ in failed]

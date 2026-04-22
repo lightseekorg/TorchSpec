@@ -54,7 +54,6 @@ torchspec/
 │       ├── eagle_store.py   #     EagleMooncakeStore
 │       ├── buffers.py       #     HostBufferPool, GPUReceiveBuffer
 │       ├── helpers.py       #     Buffer size calculation
-│       ├── deferred_delete.py #   Deferred key deletion
 │       └── utils.py         #     Mooncake utility helpers
 ├── data/                    # Data pipeline
 │   ├── dataset.py           #   load_conversation_dataset()
@@ -155,7 +154,7 @@ Distributed tensor transfer for multi-node training:
 - **`store.py`**: `MooncakeHiddenStateStore` - Base class with RDMA buffer management
 - **`eagle_store.py`**: `EagleMooncakeStore` - Eagle3-specific wrapper with:
   - Zero-copy `batch_put_from` for tensor storage
-  - Deferred deletion (respects 5-second lease TTL)
+  - Force deletion via `batch_remove(force=True)`
   - Lazy tensor retrieval interface
 - **`buffers.py`**: `HostBufferPool` (pre-allocated host buffers), `GPUReceiveBuffer` (GPU Direct RDMA)
 - **`helpers.py`**: Buffer size calculation and Mooncake master process management
@@ -316,7 +315,7 @@ python train.py --config base.yaml --config experiment.yaml training.learning_ra
 
 | Module | Purpose |
 |--------|-------|
-| `torchspec/transfer/mooncake/` | Mooncake tensor transfer (RDMA/TCP, buffer pools, deferred delete) |
+| `torchspec/transfer/mooncake/` | Mooncake tensor transfer (RDMA/TCP, buffer pools, force delete) |
 | `torchspec/utils/distributed.py` | Device mesh setup, TP/DP primitives (`get_tp_group`, `get_tp_device_mesh`) |
 | `torchspec/utils/env.py` | Ray actor env-var forwarding (`get_torchspec_env_vars`) |
 | `torchspec/utils/logging.py` | Unified logger |

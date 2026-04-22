@@ -122,8 +122,9 @@ class AsyncPutManager:
     because ``MooncakeDistributedStore`` is not thread-safe for concurrent puts.
     """
 
-    def __init__(self, store: Any, max_workers: int = 1):
+    def __init__(self, store: Any, max_workers: int = 1, replicate_config: Any = None):
         self._store = store
+        self._replicate_config = replicate_config
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="async_put")
         self._in_flight: Dict[int, Future] = {}
         self._last_error: Optional[BaseException] = None
@@ -193,17 +194,22 @@ class AsyncPutManager:
                 torch.cuda.set_device(device_index)
             wait_event.synchronize()
         with self._put_lock:
-            results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+            if self._replicate_config is not None:
+                results = self._store.batch_put_from(
+                    keys, buffer_ptrs, sizes, config=self._replicate_config
+                )
+            else:
+                results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
         failures = [(k, r) for k, r in zip(keys, results) if r != 0]
         if failures:
-            for k in keys:
-                try:
-                    self._store.remove(k)
-                except Exception:
-                    logger.debug(
-                        "Failed to remove partial key %s after async batch_put_from failure.",
-                        k,
-                    )
+            try:
+                self._store.batch_remove(keys, force=True)
+            except Exception:
+                logger.warning(
+                    "Failed to cleanup keys after async batch_put_from failure: %s",
+                    keys,
+                    exc_info=True,
+                )
             detail = ", ".join(f"{k} (code={r})" for k, r in failures)
             raise RuntimeError(f"async batch_put_from failed: {detail}")
 

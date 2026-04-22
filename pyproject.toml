@@ -23,7 +23,7 @@ dependencies = [
     "ninja",
     "packaging",
     "pyzmq",
-    "mooncake-transfer-engine",
+    "mooncake-transfer-engine>=0.3.10.post1",
     "openai",
     "omegaconf",
     "ray",
