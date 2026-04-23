@@ -415,7 +415,7 @@ class TestDFlashModelForward(unittest.TestCase):
         lm_head_weight = torch.randn(self.V, self.H)
 
         with torch.no_grad():
-            loss, acc = self.model(
+            loss, acc, loss_pp, acc_pp = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -426,6 +426,8 @@ class TestDFlashModelForward(unittest.TestCase):
         self.assertGreaterEqual(loss.item(), 0.0)
         self.assertGreaterEqual(acc.item(), 0.0)
         self.assertLessEqual(acc.item(), 1.0)
+        self.assertEqual(loss_pp.shape, (self.model.block_size,))
+        self.assertEqual(acc_pp.shape, (self.model.block_size,))
 
     def test_loss_requires_grad(self):
         """Loss should be differentiable through the draft model."""
@@ -438,7 +440,7 @@ class TestDFlashModelForward(unittest.TestCase):
         lm_head_weight = torch.randn(self.V, self.H)
 
         self.model.train()
-        loss, acc = self.model(
+        loss, acc, _, _ = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
@@ -471,7 +473,7 @@ class TestDFlashModelForward(unittest.TestCase):
         # All valid
         loss_mask_full = torch.ones(B, seq_len)
         with torch.no_grad():
-            loss_full, _ = self.model(
+            loss_full, *_ = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask_full,
@@ -482,7 +484,7 @@ class TestDFlashModelForward(unittest.TestCase):
         loss_mask_half = torch.ones(B, seq_len)
         loss_mask_half[:, :32] = 0.0
         with torch.no_grad():
-            loss_half, _ = self.model(
+            loss_half, *_ = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask_half,
@@ -563,7 +565,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
         losses = []
         for step in range(10):
             optimizer.zero_grad()
-            loss, acc = model(
+            loss, acc, _, _ = model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -591,7 +593,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
 
         model.train()
         model.zero_grad()
-        loss1, _ = model(
+        loss1, *_ = model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
@@ -599,7 +601,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
         )
         (loss1 / 2).backward()
 
-        loss2, _ = model(
+        loss2, *_ = model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
@@ -896,7 +898,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         losses, accs = [], []
         for _ in range(steps):
             optimizer.zero_grad()
-            loss, acc = model(
+            loss, acc, _, _ = model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -946,7 +948,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         grad_norms = []
         for _ in range(10):
             optimizer.zero_grad()
-            loss, _ = model(
+            loss, *_ = model(
                 input_ids=input_ids,
                 hidden_states_list=hs_list,
                 loss_mask=mask,
@@ -1035,7 +1037,7 @@ class TestDFlashVsEagle3Architecture(unittest.TestCase):
         lm_head_weight = torch.randn(V, H)
 
         with torch.no_grad():
-            loss, acc = model(
+            loss, acc, _, _ = model(
                 input_ids=input_ids,
                 hidden_states_list=hs_list,
                 loss_mask=loss_mask,

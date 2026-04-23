@@ -251,7 +251,9 @@ class DFlashTrainer(Trainer):
         per_layer_dim = total_dim // self.num_target_layers
         return list(hidden_states.split(per_layer_dim, dim=-1))
 
-    def _forward(self, batch: dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward(
+        self, batch: dict
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         device = torch.device("cuda")
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         hidden_states = batch["hidden_states"].to(device, non_blocking=True)
@@ -264,14 +266,14 @@ class DFlashTrainer(Trainer):
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
-        loss, accuracy = self.model(
+        loss, accuracy, loss_per_position, acc_per_position = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
             lm_head_weight=self.target_lm_head_weight,
         )
 
-        return loss, accuracy
+        return loss, accuracy, loss_per_position, acc_per_position
 
     def _backward(self, loss: torch.Tensor, accumulation_steps: int = 1) -> torch.Tensor:
         scaled_loss = loss / accumulation_steps
@@ -279,12 +281,93 @@ class DFlashTrainer(Trainer):
         return loss
 
     # ------------------------------------------------------------------
-    # Eval — disabled for DFlash (eval hangs in colocate/SGLang mode;
-    # benchmark τ separately after training via scripts/modal/modal_dflash_benchmark_sglang.py)
+    # Eval (no-grad forward on CPU-cached data) — mirrors Eagle3Trainer
     # ------------------------------------------------------------------
 
+    def eval_forward(self, batch: dict) -> dict:
+        """Single forward pass without backward — returns per-position tensors."""
+        with torch.no_grad():
+            _, _, loss_per_position, acc_per_position = self._forward(batch)
+        return {
+            "loss_pp": loss_per_position.detach(),
+            "acc_pp": acc_per_position.detach(),
+        }
+
     def eval_from_cache(self) -> dict:
-        return {}
+        """Run forward-only eval over all CPU-cached eval samples.
+
+        Samples are stored individually (no padding). Re-collate into batches
+        of ``eval_micro_batch_size`` (or ``micro_batch_size``) so the eval
+        forward batch size is independent of cache generation throughput.
+        """
+        if not getattr(self, "_eval_cache", None):
+            return {}
+
+        eval_mbs = getattr(self.args, "eval_micro_batch_size", None) or self.args.micro_batch_size
+
+        self.model.eval()
+        all_metrics: list[dict] = []
+        for i in range(0, len(self._eval_cache), eval_mbs):
+            chunk = self._eval_cache[i : i + eval_mbs]
+            batch = self._eval_collator(chunk)
+            gpu_batch = {
+                k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()
+            }
+            all_metrics.append(self.eval_forward(gpu_batch))
+
+        self.model.train()
+
+        return self._aggregate_eval_metrics(all_metrics)
+
+    def _aggregate_eval_metrics(self, all_step_metrics: list[dict]) -> dict:
+        if not all_step_metrics:
+            return {}
+
+        avg_loss_pp = torch.stack([m["loss_pp"] for m in all_step_metrics]).mean(dim=0)
+        avg_acc_pp = torch.stack([m["acc_pp"] for m in all_step_metrics]).mean(dim=0)
+
+        dist.all_reduce(avg_loss_pp, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_acc_pp, op=dist.ReduceOp.AVG)
+
+        # Drop anchor slot (index 0) — see _aggregate_metrics for rationale.
+        pred_loss_pp = avg_loss_pp[1:]
+        pred_acc_pp = avg_acc_pp[1:]
+
+        cumulative = 1.0
+        simulated_acc_len = 0.0
+        for i in range(pred_acc_pp.shape[0]):
+            cumulative *= pred_acc_pp[i].item()
+            simulated_acc_len += cumulative
+
+        # Weighted avg loss using the same decay as the training objective,
+        # so eval/avg_loss is directly comparable to train/avg_loss.
+        gamma = self.loss_decay_gamma
+        if gamma is not None and gamma > 0:
+            k = torch.arange(pred_loss_pp.shape[0], device=pred_loss_pp.device)
+            # In forward, position-in-block k has weight exp(-(k-1)/gamma) for k>=1.
+            # After slicing away index 0, predicted index i corresponds to k=i+1,
+            # so weights become exp(-i/gamma).
+            weights = torch.exp(-k.float() / gamma)
+        else:
+            weights = torch.ones_like(pred_loss_pp)
+        weighted_avg_loss = (pred_loss_pp * weights).sum().item() / weights.sum().item()
+
+        metrics: dict = {
+            "eval/avg_loss": weighted_avg_loss,
+            "eval/avg_acc": pred_acc_pp.mean().item(),
+            "eval/simulated_acc_len": simulated_acc_len,
+        }
+        for i in range(pred_loss_pp.shape[0]):
+            metrics[f"eval/ploss_{i}"] = pred_loss_pp[i].item()
+            metrics[f"eval/acc_{i}"] = pred_acc_pp[i].item()
+
+        if dist.get_rank() == 0:
+            logger.info(
+                f"eval: loss={weighted_avg_loss:.4f}, acc={pred_acc_pp.mean().item():.4f}, "
+                f"sim_acc_len={simulated_acc_len:.2f}"
+            )
+
+        return metrics
 
     # ------------------------------------------------------------------
     # Subclass contract implementations
@@ -304,7 +387,7 @@ class DFlashTrainer(Trainer):
         evt_bwd_e = torch.cuda.Event(enable_timing=True)
 
         evt_fwd_s.record()
-        loss, accuracy = self._forward(batch)
+        loss, accuracy, loss_per_position, acc_per_position = self._forward(batch)
         evt_fwd_e.record()
 
         evt_bwd_s.record()
@@ -314,6 +397,8 @@ class DFlashTrainer(Trainer):
         return {
             "loss": loss.detach(),
             "accuracy": accuracy.detach(),
+            "loss_per_position": loss_per_position.detach(),
+            "acc_per_position": acc_per_position.detach(),
             "total_loss": total_loss.detach(),
             "_fwd_events": (evt_fwd_s, evt_fwd_e),
             "_bwd_events": (evt_bwd_s, evt_bwd_e),
@@ -327,18 +412,41 @@ class DFlashTrainer(Trainer):
 
         avg_loss = torch.stack([m["loss"] for m in all_step_metrics]).mean()
         avg_acc = torch.stack([m["accuracy"] for m in all_step_metrics]).mean()
+        avg_loss_pp = torch.stack([m["loss_per_position"] for m in all_step_metrics]).mean(dim=0)
+        avg_acc_pp = torch.stack([m["acc_per_position"] for m in all_step_metrics]).mean(dim=0)
 
         dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
         dist.all_reduce(avg_acc, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_loss_pp, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_acc_pp, op=dist.ReduceOp.AVG)
+
+        # Skip index 0 (anchor slot, always zero); indices 1..B-1 are the
+        # predicted tokens at 1..B-1 steps past the anchor. Re-index to 0..B-2
+        # so the naming matches Eagle3 (acc_0 = first predicted token).
+        pred_loss_pp = avg_loss_pp[1:]
+        pred_acc_pp = avg_acc_pp[1:]
+
+        # Simulated accepted length: acc_0 + acc_0*acc_1 + ... + prod(acc_0..acc_{B-2})
+        # Models the expected number of consecutively accepted draft tokens.
+        cumulative = 1.0
+        simulated_acc_len = 0.0
+        for i in range(pred_acc_pp.shape[0]):
+            cumulative *= pred_acc_pp[i].item()
+            simulated_acc_len += cumulative
 
         metrics = {
             "train/avg_loss": avg_loss.item(),
             "train/avg_acc": avg_acc.item(),
+            "train/simulated_acc_len": simulated_acc_len,
             "train/grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
             "train/global_step": self.global_step,
             "train/lr": self.optimizer.get_learning_rate(),
             "train/step": step,
         }
+
+        for i in range(pred_loss_pp.shape[0]):
+            metrics[f"train/ploss_{i}"] = pred_loss_pp[i].item()
+            metrics[f"train/acc_{i}"] = pred_acc_pp[i].item()
 
         # Sub-timing breakdown (forward vs backward)
         fwd_ms = sum(
