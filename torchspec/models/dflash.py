@@ -215,7 +215,7 @@ class DFlashModel(nn.Module):
         hidden_states_list: List[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full DFlash training forward pass.
 
         Matches SpecForge's OnlineDFlashModel.forward().
@@ -227,6 +227,8 @@ class DFlashModel(nn.Module):
                 (index 0 is the anchor slot and always 0; indices 1..B-1 are the
                 predicted tokens at 1..B-1 steps past the anchor)
             acc_per_position: [block_size] mean accuracy at each within-block position
+            count_per_position: [block_size] valid label count at each within-block
+                position before loss decay is applied
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -332,21 +334,22 @@ class DFlashModel(nn.Module):
         flat_weights = weight_mask.view(-1)
 
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        valid_token_count = flat_weights.sum() + 1e-6
+        valid_token_count = flat_weights.sum().clamp(min=1e-6)
         loss = (loss_per_token * flat_weights).sum() / valid_token_count
 
         # 10. Accuracy (using binary mask without decay)
         with torch.no_grad():
             pred_ids = torch.argmax(flat_logits, dim=-1)
             correct = (pred_ids == flat_targets) & (binary_eval_mask > 0.5)
-            actual_token_count = binary_eval_mask.sum() + 1e-6
+            actual_token_count = binary_eval_mask.sum().clamp(min=1e-6)
             accuracy = correct.sum().float() / actual_token_count
 
             # Per-position-within-block metrics (index 0 = anchor, masked out;
             # indices 1..block_size-1 correspond to 1..B-1 tokens past the anchor).
             # Matches Eagle3's per-TTT-position breakdown semantically.
             binary_weights = binary_eval_mask.view(bsz, n_blocks, self.block_size)
-            count_per_pos = binary_weights.sum(dim=(0, 1)).clamp(min=1.0)
+            count_per_position = binary_weights.sum(dim=(0, 1))
+            count_per_pos = count_per_position.clamp(min=1.0)
 
             loss_per_position = (
                 loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
@@ -355,4 +358,4 @@ class DFlashModel(nn.Module):
                 dim=(0, 1)
             ) / count_per_pos
 
-        return loss, accuracy, loss_per_position, acc_per_position
+        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
