@@ -10,6 +10,7 @@ Covers:
 
 import math
 import unittest
+from unittest import mock
 
 import torch
 
@@ -415,7 +416,7 @@ class TestDFlashModelForward(unittest.TestCase):
         lm_head_weight = torch.randn(self.V, self.H)
 
         with torch.no_grad():
-            loss, acc = self.model(
+            loss, acc, loss_pp, acc_pp, count_pp = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -426,6 +427,9 @@ class TestDFlashModelForward(unittest.TestCase):
         self.assertGreaterEqual(loss.item(), 0.0)
         self.assertGreaterEqual(acc.item(), 0.0)
         self.assertLessEqual(acc.item(), 1.0)
+        self.assertEqual(loss_pp.shape, (self.model.block_size,))
+        self.assertEqual(acc_pp.shape, (self.model.block_size,))
+        self.assertEqual(count_pp.shape, (self.model.block_size,))
 
     def test_loss_requires_grad(self):
         """Loss should be differentiable through the draft model."""
@@ -438,7 +442,7 @@ class TestDFlashModelForward(unittest.TestCase):
         lm_head_weight = torch.randn(self.V, self.H)
 
         self.model.train()
-        loss, acc = self.model(
+        loss, acc, _, _, _ = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
@@ -471,7 +475,7 @@ class TestDFlashModelForward(unittest.TestCase):
         # All valid
         loss_mask_full = torch.ones(B, seq_len)
         with torch.no_grad():
-            loss_full, _ = self.model(
+            loss_full, *_ = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask_full,
@@ -482,7 +486,7 @@ class TestDFlashModelForward(unittest.TestCase):
         loss_mask_half = torch.ones(B, seq_len)
         loss_mask_half[:, :32] = 0.0
         with torch.no_grad():
-            loss_half, _ = self.model(
+            loss_half, *_ = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask_half,
@@ -540,6 +544,92 @@ class TestDFlashModelForward(unittest.TestCase):
             self.assertEqual(anchor_weight[0, 0, i].item(), 1.0)
 
 
+class TestDFlashTrainerAggregation(unittest.TestCase):
+    class _DummyOptimizer:
+        def get_learning_rate(self):
+            return 1e-3
+
+    @staticmethod
+    def _make_trainer():
+        from torchspec.training.dflash_trainer import DFlashTrainer
+
+        trainer = object.__new__(DFlashTrainer)
+        trainer.loss_decay_gamma = 1.0
+        trainer.global_step = 7
+        trainer.optimizer = TestDFlashTrainerAggregation._DummyOptimizer()
+        return trainer
+
+    @staticmethod
+    def _step_metrics(loss_key: str, acc_key: str, count_key: str) -> list[dict]:
+        return [
+            {
+                loss_key: torch.tensor([0.0, 1.0, 5.0, 0.0]),
+                acc_key: torch.tensor([0.0, 0.5, 1.0, 0.0]),
+                count_key: torch.tensor([0.0, 10.0, 2.0, 0.0]),
+            },
+            {
+                loss_key: torch.tensor([0.0, 0.0, 2.0, 4.0]),
+                acc_key: torch.tensor([0.0, 0.0, 0.25, 0.5]),
+                count_key: torch.tensor([0.0, 0.0, 8.0, 4.0]),
+            },
+        ]
+
+    @staticmethod
+    def _expected_avg_loss() -> float:
+        counts = [10.0, 10.0, 4.0]
+        losses = [1.0, 2.6, 4.0]
+        weights = [math.exp(-i) for i in range(len(losses))]
+        numerator = sum(losses[i] * counts[i] * weights[i] for i in range(len(losses)))
+        denominator = sum(counts[i] * weights[i] for i in range(len(losses)))
+        return numerator / denominator
+
+    @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    @mock.patch(
+        "torchspec.training.dflash_trainer.dist.all_reduce",
+        side_effect=lambda tensor, op=None: None,
+    )
+    def test_aggregate_metrics_uses_per_position_counts(self, _mock_all_reduce, _mock_get_rank):
+        trainer = self._make_trainer()
+        metrics = trainer._aggregate_metrics(
+            self._step_metrics("loss_per_position", "acc_per_position", "count_per_position"),
+            step=11,
+            grad_norm=torch.tensor(3.0),
+        )
+
+        self.assertAlmostEqual(metrics["train/ploss_0"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["train/ploss_1"], 2.6, places=6)
+        self.assertAlmostEqual(metrics["train/ploss_2"], 4.0, places=6)
+        self.assertAlmostEqual(metrics["train/acc_0"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["train/acc_1"], 0.4, places=6)
+        self.assertAlmostEqual(metrics["train/acc_2"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["train/avg_acc"], 11.0 / 24.0, places=6)
+        self.assertAlmostEqual(metrics["train/avg_loss"], self._expected_avg_loss(), places=6)
+        self.assertAlmostEqual(metrics["train/simulated_acc_len"], 0.8, places=6)
+
+    @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    @mock.patch(
+        "torchspec.training.dflash_trainer.dist.all_reduce",
+        side_effect=lambda tensor, op=None: None,
+    )
+    def test_aggregate_eval_metrics_uses_exact_scalar_reduction(
+        self, _mock_all_reduce, _mock_get_rank
+    ):
+        trainer = self._make_trainer()
+        metrics = trainer._aggregate_eval_metrics(
+            self._step_metrics("loss_pp", "acc_pp", "count_pp")
+        )
+
+        self.assertAlmostEqual(metrics["eval/ploss_0"], 1.0, places=6)
+        self.assertAlmostEqual(metrics["eval/ploss_1"], 2.6, places=6)
+        self.assertAlmostEqual(metrics["eval/ploss_2"], 4.0, places=6)
+        self.assertAlmostEqual(metrics["eval/acc_0"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["eval/acc_1"], 0.4, places=6)
+        self.assertAlmostEqual(metrics["eval/acc_2"], 0.5, places=6)
+        self.assertAlmostEqual(metrics["eval/avg_acc"], 11.0 / 24.0, places=6)
+        self.assertAlmostEqual(metrics["eval/avg_loss"], self._expected_avg_loss(), places=6)
+        self.assertAlmostEqual(metrics["eval/simulated_acc_len"], 0.8, places=6)
+
+
 class TestMiniTrainingLoop(unittest.TestCase):
     """Smoke test: forward → backward → optimizer step should not crash and loss should decrease."""
 
@@ -563,7 +653,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
         losses = []
         for step in range(10):
             optimizer.zero_grad()
-            loss, acc = model(
+            loss, acc, _, _, _ = model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -591,7 +681,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
 
         model.train()
         model.zero_grad()
-        loss1, _ = model(
+        loss1, *_ = model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
@@ -599,7 +689,7 @@ class TestMiniTrainingLoop(unittest.TestCase):
         )
         (loss1 / 2).backward()
 
-        loss2, _ = model(
+        loss2, *_ = model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
@@ -896,7 +986,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         losses, accs = [], []
         for _ in range(steps):
             optimizer.zero_grad()
-            loss, acc = model(
+            loss, acc, _, _, _ = model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -946,7 +1036,7 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         grad_norms = []
         for _ in range(10):
             optimizer.zero_grad()
-            loss, _ = model(
+            loss, *_ = model(
                 input_ids=input_ids,
                 hidden_states_list=hs_list,
                 loss_mask=mask,
@@ -1035,7 +1125,7 @@ class TestDFlashVsEagle3Architecture(unittest.TestCase):
         lm_head_weight = torch.randn(V, H)
 
         with torch.no_grad():
-            loss, acc = model(
+            loss, acc, _, _, _ = model(
                 input_ids=input_ids,
                 hidden_states_list=hs_list,
                 loss_mask=loss_mask,

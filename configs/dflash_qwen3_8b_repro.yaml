@@ -65,6 +65,10 @@ mooncake:
   protocol: tcp
   global_segment_size: 16GB
   local_buffer_size: 4GB
+  # Hard-pin: master-side TTL is disabled; we rely on our explicit
+  # batch_remove(force=True) (see mooncake/eagle_store.py). Requires
+  # mooncake-transfer-engine >= 0.3.10.post1.
+  enable_hard_pin: true
 
 output_dir: ./outputs/dflash_repro
 cache_dir: ./cache/dflash_repro
