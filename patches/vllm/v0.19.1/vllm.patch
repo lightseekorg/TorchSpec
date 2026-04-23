@@ -1,4 +1,4 @@
-TorchSpec patches for vllm v0.19.0
+TorchSpec patches for vllm v0.19.1
 
 1. Fix flash_attn rotary embedding import with FA4
    vllm/model_executor/layers/rotary_embedding/common.py
@@ -8,7 +8,7 @@ TorchSpec patches for vllm v0.19.0
 
 3. Fix extract_hidden_states for VLM models (PR #38987)
    vllm/transformers_utils/configs/extract_hidden_states.py
-   (already in vllm >= 0.19.0, included here for older versions)
+  (already in vllm >= 0.19.0, kept here for version-local patching)
 
 4. Use explicit HiddenStatesCacheSpec for extract_hidden_states
    vllm/model_executor/models/extract_hidden_states.py

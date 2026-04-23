@@ -31,6 +31,7 @@ This replaces the previous worker-extension approach that monkey-patched
 MRV2, CUDA graphs, and ``torch.compile``.
 """
 
+import gc
 import os
 import socket
 from typing import Any
@@ -563,16 +564,22 @@ class VllmEngine(InferenceEngine, RayActor):
     def shutdown(self) -> None:
         if self._engine is not None:
             try:
-                if hasattr(self._engine, "close"):
+                llm_engine = getattr(self._engine, "llm_engine", None)
+                engine_core = getattr(llm_engine, "engine_core", None)
+
+                if engine_core is not None and hasattr(engine_core, "shutdown"):
+                    engine_core.shutdown()
+                elif llm_engine is not None and hasattr(llm_engine, "shutdown"):
+                    llm_engine.shutdown()
+                elif hasattr(self._engine, "close"):
                     self._engine.close()
-                elif hasattr(self._engine, "llm_engine"):
-                    llm_engine = self._engine.llm_engine
-                    if hasattr(llm_engine, "shutdown"):
-                        llm_engine.shutdown()
             except Exception as e:
                 logger.warning(f"VllmEngine rank {self.rank}: Error during engine shutdown: {e}")
             finally:
                 self._engine = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         logger.info(f"VllmEngine rank {self.rank}: shutdown complete")
 

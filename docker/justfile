@@ -1,6 +1,6 @@
 BACKEND := env("BACKEND", "sglang")
 SGLANG_VERSION := env("SGLANG_VERSION", "v0.5.8.post1")
-VLLM_VERSION := env("VLLM_VERSION", "v0.19.0")
+VLLM_VERSION := env("VLLM_VERSION", "v0.19.1")
 IMAGE_REPO := env("IMAGE_REPO", "ghcr.io/torchspec-project/torchspec")
 IMAGE_TAG := env("IMAGE_TAG", "")
 

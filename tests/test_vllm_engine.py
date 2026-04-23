@@ -263,6 +263,33 @@ class TestGenerateWithExtractHiddenStates:
         assert results[0]["input_ids_list"] == [10, 20, 30]
 
 
+class TestVllmEngineShutdown:
+    def test_shutdown_uses_engine_core_when_available(self, monkeypatch):
+        try:
+            from torchspec.inference.engine.vllm_engine import VllmEngine
+        except ImportError as e:
+            pytest.skip(f"VllmEngine import failed: {e}")
+
+        engine = VllmEngine.__new__(VllmEngine)
+        engine.rank = 0
+        engine.args = MagicMock()
+        engine._hidden_size = None
+
+        engine_core = MagicMock()
+        llm_engine = MagicMock()
+        llm_engine.engine_core = engine_core
+        mock_llm = MagicMock()
+        mock_llm.llm_engine = llm_engine
+        engine._engine = mock_llm
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        engine.shutdown()
+
+        engine_core.shutdown.assert_called_once_with()
+        assert engine._engine is None
+
+
 # =============================================================================
 # Metadata contract: connector output matches training pipeline expectations
 # =============================================================================

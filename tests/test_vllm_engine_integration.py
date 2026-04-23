@@ -20,8 +20,10 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import socket
+import time
 from pathlib import Path
 
 import torch
@@ -107,6 +109,23 @@ def create_engine(
         **extra_args,
     )
     return engine
+
+
+def shutdown_engine(engine) -> None:
+    """Release vLLM worker processes before creating another engine."""
+    if engine is None:
+        return
+
+    llm_engine = getattr(engine, "llm_engine", None)
+    engine_core = getattr(llm_engine, "engine_core", None)
+    if engine_core is not None and hasattr(engine_core, "shutdown"):
+        engine_core.shutdown()
+
+    del engine
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    time.sleep(2)
 
 
 def fetch_and_dump(
@@ -357,7 +376,7 @@ def main():
     # ── Test 4: Chunked prefill ─────────────────────────────────────────
     # Destroy the first engine and create one with a small token budget
     # so sequences are split across multiple scheduler steps.
-    del engine
+    shutdown_engine(engine)
 
     print(f"\n{'=' * 60}")
     print("Creating chunked-prefill engine (max_num_batched_tokens=128)")
@@ -394,7 +413,7 @@ def main():
         "chunked_prefill",
     )
 
-    del chunked_engine
+    shutdown_engine(chunked_engine)
 
     # ── Summary ──────────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
