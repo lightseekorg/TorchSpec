@@ -933,6 +933,12 @@ index d91ced805..2708630cc 100644
 +            nargs="+",
 +            help="Layer IDs to capture as auxiliary hidden states. If omitted, model defaults are used.",
 +        )
++        parser.add_argument(
++            "--spec-training-store-last-hidden-states",
++            action=argparse.BooleanOptionalAction,
++            default=True,
++            help="Whether to store last hidden states for spec training requests.",
++        )
 +
          # Expert parallelism
          parser.add_argument(

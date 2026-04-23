@@ -1,4 +1,10 @@
+BACKEND := env("BACKEND", "sglang")
 SGLANG_VERSION := env("SGLANG_VERSION", "v0.5.8.post1")
+VLLM_VERSION := env("VLLM_VERSION", "v0.19.0")
+IMAGE_REPO := env("IMAGE_REPO", "ghcr.io/torchspec-project/torchspec")
+IMAGE_TAG := env("IMAGE_TAG", "")
+
+_dockerfile := if BACKEND == "vllm" { "docker/vllm/" + VLLM_VERSION + "/Dockerfile" } else { "docker/sglang/" + SGLANG_VERSION + "/Dockerfile" }
 
 build:
     ARG_TAG_POSTFIX="${ARG_TAG_POSTFIX:-""}" ARG_BUILD_EXTRA_ARGS="" just _build-only
@@ -12,23 +18,25 @@ _build-only:
     set -euxo pipefail
     cd ..
 
-    VERSION="$(cat docker/version.txt | tr -d '\n')"
+    VERSION="${IMAGE_TAG:-$(tr -d '\n' < docker/version.txt)}"
     IMAGE_TAG=${VERSION}${ARG_TAG_POSTFIX}
+    IMAGE_NAME="{{IMAGE_REPO}}:$IMAGE_TAG"
 
-    docker build -f docker/sglang/{{SGLANG_VERSION}}/Dockerfile . $ARG_BUILD_EXTRA_ARGS -t ghcr.io/torchspec-project/torchspec:$IMAGE_TAG
+    docker build -f {{_dockerfile}} . $ARG_BUILD_EXTRA_ARGS -t "$IMAGE_NAME"
 
 _release-raw:
     #!/bin/bash
     set -euxo pipefail
     cd ..
 
-    VERSION="$(cat docker/version.txt | tr -d '\n')"
+    VERSION="${IMAGE_TAG:-$(tr -d '\n' < docker/version.txt)}"
     IMAGE_TAG=${VERSION}${ARG_TAG_POSTFIX}
+    IMAGE_NAME="{{IMAGE_REPO}}:$IMAGE_TAG"
 
-    docker build -f docker/sglang/{{SGLANG_VERSION}}/Dockerfile . $ARG_BUILD_EXTRA_ARGS -t ghcr.io/torchspec-project/torchspec:$IMAGE_TAG
-    docker push ghcr.io/torchspec-project/torchspec:$IMAGE_TAG
+    docker build -f {{_dockerfile}} . $ARG_BUILD_EXTRA_ARGS -t "$IMAGE_NAME"
+    docker push "$IMAGE_NAME"
 
-    if [ -z "${ARG_TAG_POSTFIX}" ]; then
-        docker tag ghcr.io/torchspec-project/torchspec:$IMAGE_TAG ghcr.io/torchspec-project/torchspec:latest
-        docker push ghcr.io/torchspec-project/torchspec:latest
+    if [ -z "${ARG_TAG_POSTFIX}" ] && [ -z "{{IMAGE_TAG}}" ]; then
+        docker tag "$IMAGE_NAME" "{{IMAGE_REPO}}:latest"
+        docker push "{{IMAGE_REPO}}:latest"
     fi

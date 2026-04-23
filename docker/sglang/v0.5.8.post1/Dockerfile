@@ -23,8 +23,7 @@ RUN rm -rf /sgl-workspace/sglang && \
 RUN pip install flashinfer-jit-cache==0.6.2 --index-url https://flashinfer.ai/whl/cu129
 
 COPY . /root/torchspec
-RUN pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base -y 2>/dev/null; \
-    cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"
+RUN cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"
 
 RUN chmod 755 /usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master
 # Avoid mooncake modifying the binary permissions.
