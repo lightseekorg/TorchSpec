@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
@@ -29,6 +30,12 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torchspec.models.ops.loss import (
     compiled_forward_kl_loss,
     compiled_forward_kl_loss_from_hs,
+    compiled_sum_forward_kl_loss_from_hs,
+)
+from torchspec.utils.distributed import (
+    get_draft_sp_group,
+    get_draft_sp_scalar_group,
+    get_sp_ulysses_group,
 )
 from torchspec.utils.tensor import padding
 
@@ -63,6 +70,14 @@ class Eagle3Model(nn.Module):
         self.attention_backend = attention_backend
         self.gradient_checkpointing = gradient_checkpointing
         self.vocab_pruning = draft_model.vocab_size != draft_model.target_vocab_size
+        self._usp_sp_group = get_draft_sp_group() if attention_backend == "usp" else None
+        self._usp_scalar_group = get_draft_sp_scalar_group() if attention_backend == "usp" else None
+        self._usp_ulysses_group = get_sp_ulysses_group() if attention_backend == "usp" else None
+        self._usp_ulysses_world_size = (
+            dist.get_world_size(self._usp_ulysses_group)
+            if self._usp_ulysses_group is not None
+            else 1
+        )
 
     def _calculate_loss(
         self,
@@ -74,25 +89,14 @@ class Eagle3Model(nn.Module):
         norm_weight: torch.Tensor,
         lm_head_weight: torch.Tensor,
         norm_eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute forward-KL loss and accuracy for one TTT step.
-
-        Both paths pass full (B*T, ...) flat views + valid_idx into the
-        compiled function so torch.compile can fuse index_select with
-        subsequent ops, avoiding separate (N_valid, V) copies outside.
-
-        - PrecomputedTarget (vocab pruning): compiled_forward_kl_loss
-          with pre-computed target probs.
-        - LazyTarget (no pruning): compiled_forward_kl_loss_from_hs
-          computes target softmax inside the compiled graph.
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         valid_idx = mask.flatten().nonzero().squeeze(-1)
         if valid_idx.numel() == 0:
             # FSDP requires every trainable param to participate in gradient
             # all-reduce/reduce-scatter.
             total = sum(p.reshape(-1)[0] for p in self.parameters() if p.requires_grad)
             zero = total * 0.0
-            return zero, zero.detach()
+            return zero, zero.detach(), zero.detach()
         # Important as it prevents recompilation.
         torch._dynamo.maybe_mark_dynamic(valid_idx, 0)
         hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -109,7 +113,6 @@ class Eagle3Model(nn.Module):
                 )
             return compiled_forward_kl_loss(*args)
         else:
-            # lazy
             ths_flat = target.hidden_states_padded[:, idx : idx + seq_length, :].reshape(
                 -1, target.lm_head_weight.shape[-1]
             )
@@ -122,12 +125,17 @@ class Eagle3Model(nn.Module):
                 target.lm_head_weight,
                 norm_eps,
             )
+            use_sum_lazy_loss = self.attention_backend == "usp"
             if self.gradient_checkpointing and self.training:
                 return torch_checkpoint(
-                    compiled_forward_kl_loss_from_hs,
+                    compiled_sum_forward_kl_loss_from_hs
+                    if use_sum_lazy_loss
+                    else compiled_forward_kl_loss_from_hs,
                     *args,
                     use_reentrant=False,
                 )
+            if use_sum_lazy_loss:
+                return compiled_sum_forward_kl_loss_from_hs(*args)
             return compiled_forward_kl_loss_from_hs(*args)
 
     def forward(
@@ -139,19 +147,32 @@ class Eagle3Model(nn.Module):
         hidden_states: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         batch_size, seq_length, _ = hidden_states.shape
         seq_length_with_past = seq_length
         past_key_values_length = 0
 
         norm_weight, lm_head_weight, norm_eps = self.draft_model.get_lm_head_params()
-
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         if past_key_values is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
-        if position_ids is None:
+        if self.attention_backend == "usp":
+            usp_chunk_size = seq_length - self.length
+            if usp_chunk_size <= 0:
+                raise ValueError(
+                    f"USP local seq_length ({seq_length}) must be larger than ttt_length ({self.length})"
+                )
+            if position_ids is None:
+                device = hidden_states.device
+                position_ids = torch.arange(
+                    past_key_values_length,
+                    usp_chunk_size * self._usp_ulysses_world_size + past_key_values_length,
+                    dtype=torch.long,
+                    device=device,
+                ).unsqueeze(0)
+        elif position_ids is None:
             device = hidden_states.device
             position_ids = torch.arange(
                 past_key_values_length,
@@ -172,8 +193,6 @@ class Eagle3Model(nn.Module):
                 past_key_values_length=past_key_values_length,
             )
 
-        # position_mask (vocab pruning) is a subset of loss_mask that further
-        # filters to tokens whose target argmax falls in the draft vocab.
         if isinstance(target, PrecomputedTarget) and target.position_mask is not None:
             mask = target.position_mask
         else:
@@ -182,37 +201,55 @@ class Eagle3Model(nn.Module):
         plosses = []
         vlosses = []
         acces = []
+        acc_counts = []
         cache_keys = None
         cache_values = None
 
-        # Clamp multimodal placeholder IDs (hash-based pad values from SGLang)
-        # to valid vocab range before embedding lookup.
         input_ids = input_ids.clamp(min=0, max=self.draft_model.target_vocab_size - 1)
 
         for idx in range(self.length):
             is_last = idx == self.length - 1
 
-            inputs_embeds = self.draft_model.embed_input_ids(input_ids)
-            inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+            step_input_ids = input_ids
+            step_hidden_states = hidden_states
+            step_attention_mask = attention_mask
+            step_position_ids = position_ids
+            step_mask = mask
+            step_seq_length = seq_length
+
+            if self.attention_backend == "usp":
+                step_seq_length = seq_length - self.length
+                step_input_ids = input_ids[:, :step_seq_length]
+                step_hidden_states = hidden_states[:, :step_seq_length, :]
+                step_mask = mask[:, :step_seq_length]
+                if attention_mask is not None:
+                    step_attention_mask = attention_mask[:, :step_seq_length]
+                if position_ids is not None:
+                    step_position_ids = position_ids[
+                        :, : step_seq_length * self._usp_ulysses_world_size
+                    ]
+
+            inputs_embeds = self.draft_model.embed_input_ids(step_input_ids)
+            inputs_embeds = inputs_embeds.to(step_hidden_states.dtype)
 
             if self.gradient_checkpointing and self.training:
                 hidden_states_out, cache_keys, cache_values = torch_checkpoint(
                     self.draft_model.backbone,
                     inputs_embeds,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
+                    step_hidden_states,
+                    step_attention_mask,
+                    step_position_ids,
                     cache_keys,
                     cache_values,
-                    True,  # use_cache
+                    True,
                     use_reentrant=False,
                 )
             else:
                 hidden_states_out, cache_keys, cache_values = self.draft_model.backbone(
                     input_embeds=inputs_embeds,
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+                    hidden_states=step_hidden_states,
+                    attention_mask=step_attention_mask,
+                    position_ids=step_position_ids,
                     cache_keys=cache_keys,
                     cache_values=cache_values,
                     use_cache=True,
@@ -220,23 +257,64 @@ class Eagle3Model(nn.Module):
 
             hidden_states = hidden_states_out
 
-            loss, acc = self._calculate_loss(
+            local_sum_loss, local_correct, local_count = self._calculate_loss(
                 hidden_states=hidden_states,
                 target=target,
-                mask=mask,
+                mask=step_mask,
                 idx=idx,
-                seq_length=seq_length,
+                seq_length=step_seq_length,
                 norm_weight=norm_weight,
                 lm_head_weight=lm_head_weight,
                 norm_eps=norm_eps,
             )
+
+            loss = local_sum_loss / local_count.clamp_min(1.0)
+            metric_loss = loss.detach()
+            metric_acc = (
+                (local_correct / local_count.clamp_min(1.0)).detach()
+                if float(local_count.detach().float().cpu()) > 0.0
+                else local_correct.detach().float() * 0.0
+            )
+
+            if self.attention_backend == "usp" and self._usp_scalar_group is not None:
+                reduced_sum_loss = local_sum_loss.detach().float()
+                reduced_correct = local_correct.detach().float()
+                reduced_count = local_count.detach().float()
+                dist.all_reduce(reduced_sum_loss, op=dist.ReduceOp.SUM, group=self._usp_sp_group)
+                dist.all_reduce(
+                    reduced_correct,
+                    op=dist.ReduceOp.SUM,
+                    group=self._usp_scalar_group,
+                )
+                dist.all_reduce(
+                    reduced_count,
+                    op=dist.ReduceOp.SUM,
+                    group=self._usp_scalar_group,
+                )
+                denom = reduced_count.clamp_min(1.0)
+                loss = (local_sum_loss / denom).to(loss.dtype)
+                if reduced_count.item() > 0:
+                    metric_loss = (reduced_sum_loss / denom).detach()
+                    metric_acc = (reduced_correct / denom).to(
+                        device=loss.device, dtype=torch.float32
+                    )
+                    metric_count = reduced_count.to(device=loss.device, dtype=torch.float32)
+                else:
+                    metric_loss = reduced_sum_loss.detach() * 0.0
+                    metric_acc = local_correct.detach().float() * 0.0
+                    metric_count = reduced_count.to(device=loss.device, dtype=torch.float32)
+            else:
+                metric_count = local_count.detach().float().to(device=loss.device)
+
             plosses.append(loss)
-            acces.append(acc)
+            vlosses.append(metric_loss)
+            acces.append(metric_acc)
+            acc_counts.append(metric_count)
 
             if not is_last:
                 input_ids = padding(input_ids, left=False)
                 mask = padding(mask, left=False)
-        return plosses, vlosses, acces
+        return plosses, vlosses, acces, acc_counts
 
 
 @torch.no_grad()
@@ -249,21 +327,25 @@ def compute_target_p_padded(
     chunk_size: int = 4096,
 ) -> PrecomputedTarget:
     target_lm_head_weight = target_lm_head_weight.detach()
-    pruned_weight = target_lm_head_weight[t2d]  # (V_draft, D)
+    pruned_weight = target_lm_head_weight[t2d]
 
-    B, T, _D = target_hidden_states.shape
+    bsz, seq_len, hidden_size = target_hidden_states.shape
     loss_mask_bool = loss_mask.bool()
 
     valid_flat_idx = loss_mask_bool.reshape(-1).nonzero(as_tuple=True)[0]
-    valid_hs = target_hidden_states.reshape(-1, _D)[valid_flat_idx]  # (N_valid, D)
+    valid_hs = target_hidden_states.reshape(-1, hidden_size)[valid_flat_idx]
 
-    position_mask_flat = torch.zeros(B * T, device=target_hidden_states.device, dtype=torch.float)
+    position_mask_flat = torch.zeros(
+        bsz * seq_len,
+        device=target_hidden_states.device,
+        dtype=torch.float,
+    )
     for i in range(0, valid_hs.shape[0], chunk_size):
         chunk_hs = valid_hs[i : i + chunk_size]
         chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
         in_draft = t2d[chunk_argmax]
         position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
-    position_mask = position_mask_flat.reshape(B, T)
+    position_mask = position_mask_flat.reshape(bsz, seq_len)
 
     target_logits_pruned = F.linear(target_hidden_states, pruned_weight)
     target_p = F.softmax(target_logits_pruned.float(), dim=-1)
@@ -277,11 +359,6 @@ def compute_lazy_target_padded(
     target_lm_head_weight: torch.Tensor,
     length: int,
 ) -> LazyTarget:
-    """Build a LazyTarget that defers softmax to the forward loop.
-
-    Used for non-pruning cases to avoid materializing the full
-    (B, T, V_full) target probability tensor.
-    """
     return LazyTarget(
         hidden_states_padded=F.pad(target_hidden_states, (0, 0, 0, length), value=0.0),
         lm_head_weight=target_lm_head_weight.detach(),

@@ -28,7 +28,7 @@ from torchspec import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.ray.ray_actor import RayActor
 from torchspec.training.eagle3_trainer import Eagle3Trainer
-from torchspec.utils.distributed import init_gloo_group
+from torchspec.utils.distributed import init_gloo_group, init_usp_groups
 from torchspec.utils.logging import setup_file_logging
 
 
@@ -59,6 +59,12 @@ class TrainerActor(RayActor):
             backend=backend,
             timeout=timedelta(minutes=getattr(args, "distributed_timeout_minutes", 30)),
         )
+
+        if getattr(args, "attention_backend", None) == "usp":
+            init_usp_groups(
+                sp_ulysses_size=getattr(args, "sp_ulysses_size", 1),
+                sp_ring_size=getattr(args, "sp_ring_size", 1),
+            )
 
         init_gloo_group()
 

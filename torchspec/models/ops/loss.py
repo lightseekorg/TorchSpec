@@ -23,6 +23,31 @@ import torch.nn.functional as F
 
 
 @torch.compile(dynamic=None)
+def compiled_sum_forward_kl_loss(
+    prenorm_hidden_states_flat,
+    target_p_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    norm_eps,
+):
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    tp = target_p_flat.index_select(0, valid_idx)
+
+    hs_f32 = hs.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)
+    log_p = F.log_softmax(logits.float(), dim=-1)
+    token_loss = -(tp * log_p).sum(-1)
+    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count
+
+
+@torch.compile(dynamic=None)
 def compiled_forward_kl_loss(
     prenorm_hidden_states_flat,
     target_p_flat,
@@ -55,14 +80,39 @@ def compiled_forward_kl_loss(
 
     logits = F.linear(norm_hs, lm_head_weight)  # (N, V_out)
 
-    # Forward KL loss
     log_p = F.log_softmax(logits.float(), dim=-1)
-    loss = -(tp * log_p).sum(-1).mean()
+    token_loss = -(tp * log_p).sum(-1)
+    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count
 
-    # Accuracy
-    acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
 
-    return loss, acc
+@torch.compile(dynamic=None)
+def compiled_sum_forward_kl_loss_from_hs(
+    prenorm_hidden_states_flat,
+    target_hidden_states_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    target_lm_head_weight,
+    norm_eps,
+):
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    ths = target_hidden_states_flat.index_select(0, valid_idx)
+
+    tp = F.softmax(F.linear(ths, target_lm_head_weight).float(), dim=-1)
+
+    hs_f32 = hs.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)
+    log_p = F.log_softmax(logits.float(), dim=-1)
+    token_loss = -(tp * log_p).sum(-1)
+    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count
 
 
 @torch.compile(dynamic=None)
@@ -98,11 +148,8 @@ def compiled_forward_kl_loss_from_hs(
 
     logits = F.linear(norm_hs, lm_head_weight)
 
-    # Forward KL loss
     log_p = F.log_softmax(logits.float(), dim=-1)
-    loss = -(tp * log_p).sum(-1).mean()
-
-    # Accuracy
-    acc = (logits.argmax(-1) == tp.argmax(-1)).float().mean()
-
-    return loss, acc
+    token_loss = -(tp * log_p).sum(-1)
+    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count

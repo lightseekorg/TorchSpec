@@ -26,6 +26,7 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from torchspec.utils.distributed import _build_usp_group_ranks
 from torchspec.utils.env import get_torchspec_env_vars
 
 
@@ -164,10 +165,7 @@ class RayTrainGroup:
             mooncake_config: MooncakeConfig object. Each actor initializes its own store.
             per_dp_rank_batch_size: Number of samples per DP rank per training step.
         """
-        if len(queues) != len(self._actor_handlers):
-            raise ValueError(
-                f"Number of queues ({len(queues)}) must match number of actors ({len(self._actor_handlers)})"
-            )
+        queues = self._expand_queues_for_usp(queues)
         return ray.get(
             [
                 actor.set_train_queue.remote(
@@ -181,11 +179,7 @@ class RayTrainGroup:
 
     def set_eval_queues(self, queues, mooncake_config, per_dp_rank_batch_size: int = 1):
         """Set eval data queues — mirrors set_train_queues."""
-        if len(queues) != len(self._actor_handlers):
-            raise ValueError(
-                f"Number of eval queues ({len(queues)}) must match "
-                f"number of actors ({len(self._actor_handlers)})"
-            )
+        queues = self._expand_queues_for_usp(queues)
         return ray.get(
             [
                 actor.set_eval_queue.remote(
@@ -196,6 +190,38 @@ class RayTrainGroup:
                 for actor, queue in zip(self._actor_handlers, queues, strict=True)
             ]
         )
+
+    def _expand_queues_for_usp(self, queues):
+        actor_count = len(self._actor_handlers)
+        if len(queues) == actor_count:
+            return queues
+
+        attention_backend = getattr(self.args, "attention_backend", None)
+        if attention_backend != "usp":
+            raise ValueError(
+                f"Number of queues ({len(queues)}) must match number of actors ({actor_count})"
+            )
+
+        sp_size = getattr(self.args, "sp_ulysses_size", 1) * getattr(self.args, "sp_ring_size", 1)
+        if sp_size <= 0 or actor_count % sp_size != 0:
+            raise ValueError(
+                f"Invalid USP topology: actor_count={actor_count}, sp_size={sp_size}"
+            )
+        dp_size = actor_count // sp_size
+        if len(queues) != dp_size:
+            raise ValueError(
+                f"USP expects {dp_size} queues for {actor_count} actors with sp_size={sp_size}, "
+                f"got {len(queues)}"
+            )
+        draft_sp_groups, _, _ = _build_usp_group_ranks(
+            world_size=actor_count,
+            sp_ulysses_size=getattr(self.args, "sp_ulysses_size", 1),
+            sp_ring_size=getattr(self.args, "sp_ring_size", 1),
+        )
+        rank_to_dp_idx = {
+            rank: dp_idx for dp_idx, ranks in enumerate(draft_sp_groups) for rank in ranks
+        }
+        return [queues[rank_to_dp_idx[rank]] for rank in range(actor_count)]
 
     def cache_eval_samples(self, count: int):
         """Tell every actor to drain ``count`` individual samples from its eval queue into CPU cache."""

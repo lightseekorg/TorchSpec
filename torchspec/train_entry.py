@@ -147,6 +147,7 @@ def parse_config():
             setattr(flat_args, key, value)
 
     _resolve_batch_size(flat_args)
+    _validate_usp_args(flat_args)
 
     return flat_args
 
@@ -168,17 +169,65 @@ def _maybe_create_scratch_draft(args, train_group):
 
 def _resolve_batch_size(args):
     """Derive dp_size, per_dp_rank_batch_size, dispatch_batch_size, and global_batch_size."""
-    dp_size = (
-        getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
-    )
-    args.dp_size = dp_size
-    sp_size = getattr(args, "sp_size", None)
-    if sp_size is not None and sp_size != 1:
-        raise NotImplementedError(f"Sequence parallel is not yet supported (got sp_size={sp_size})")
-    sp_size = sp_size or 1
+    world_size = args.training_num_nodes * args.training_num_gpus_per_node
+    if getattr(args, "attention_backend", None) == "usp":
+        sp_size = getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
+        if sp_size <= 0:
+            raise ValueError(f"USP requires positive sp_size, got {sp_size}")
+        if world_size % sp_size != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by USP sp_size ({sp_size})"
+            )
+        dp_size = getattr(args, "dp_size", None) or (world_size // sp_size)
+        if dp_size * sp_size != world_size:
+            raise ValueError(
+                f"dp_size ({dp_size}) * sp_size ({sp_size}) must equal world_size ({world_size})"
+            )
+        args.dp_size = dp_size
+        args.sp_size = sp_size
+        args.per_dp_rank_batch_size = 1
+    else:
+        dp_size = getattr(args, "dp_size", None) or world_size
+        args.dp_size = dp_size
+        sp_size = getattr(args, "sp_size", None)
+        if sp_size is not None and sp_size != 1:
+            raise NotImplementedError(
+                f"Sequence parallel is not yet supported (got sp_size={sp_size})"
+            )
+        sp_size = sp_size or 1
+        args.per_dp_rank_batch_size = args.micro_batch_size * sp_size
+
     accumulation_steps = getattr(args, "draft_accumulation_steps", 1)
-    args.per_dp_rank_batch_size = args.micro_batch_size * sp_size
     args.global_batch_size = args.per_dp_rank_batch_size * dp_size * accumulation_steps
+
+
+def _validate_usp_args(args) -> None:
+    if getattr(args, "attention_backend", None) != "usp":
+        return
+
+    sp_size = getattr(args, "sp_size", None)
+    if sp_size is None:
+        sp_size = getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
+    if sp_size <= 1:
+        raise NotImplementedError(f"USP requires sp_size > 1, got {sp_size}")
+
+    inference_engine_type = getattr(args, "inference_engine_type", "sgl")
+    if inference_engine_type != "sgl":
+        raise ValueError(
+            f"USP currently only supports inference_engine_type=sgl, got {inference_engine_type}"
+        )
+
+    fsdp_strategy = getattr(args, "fsdp_strategy", "REPLICATE").upper()
+    if fsdp_strategy != "REPLICATE":
+        raise NotImplementedError(
+            f"USP currently only supports fsdp_strategy=REPLICATE, got {fsdp_strategy}"
+        )
+
+    micro_batch_size = getattr(args, "micro_batch_size", 1)
+    if micro_batch_size != 1:
+        raise NotImplementedError(
+            f"USP currently only supports micro_batch_size=1, got {micro_batch_size}"
+        )
 
 
 def _get_draft_model_config(args):

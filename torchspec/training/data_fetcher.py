@@ -31,11 +31,20 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 from ray.util.queue import Queue as RayQueue
 from torch.utils.data import DataLoader, IterableDataset
 
-from torchspec.data.utils import resolve_loss_mask
+from torchspec.data.utils import deserialize_packed_loss_mask, resolve_loss_mask, unpack_loss_mask
+from torchspec.utils.distributed import (
+    get_draft_sp_group,
+    get_sp_ring_group,
+    get_sp_ulysses_group,
+    get_usp_rank_coords,
+)
 from torchspec.utils.logging import logger
+from torchspec.utils.usp import split_usp_batch
 
 
 @dataclass
@@ -68,6 +77,9 @@ class MooncakeDataset(IterableDataset):
         skip_after_header: int = 0,
         batch_size: int = 1,
         min_loss_tokens: int = 0,
+        usp_enabled: bool = False,
+        ttt_length: int = 1,
+        max_seq_length: Optional[int] = None,
     ):
         self.ray_queue = ray_queue
         self.mooncake_store = mooncake_store
@@ -81,6 +93,36 @@ class MooncakeDataset(IterableDataset):
         self.skip_after_header = skip_after_header
         self._batch_size = batch_size
         self._min_loss_tokens = min_loss_tokens
+        self.usp_enabled = usp_enabled
+        self.ttt_length = ttt_length
+        self.max_seq_length = max_seq_length
+        self._init_sp_context()
+
+    def _init_sp_context(self) -> None:
+        self._sp_group = None
+        self._sp_world_size = 1
+        self._sp_rank = 0
+        self._sp_ring_size = 1
+        self._sp_ring_rank = 0
+        if not self.usp_enabled:
+            return
+
+        sp_group = get_draft_sp_group()
+        if sp_group is None:
+            return
+
+        self._sp_group = sp_group
+        self._sp_world_size = dist.get_world_size(sp_group)
+        self._sp_rank = dist.get_rank(sp_group)
+
+        ring_group = get_sp_ring_group()
+        if ring_group is not None:
+            self._sp_ring_size = dist.get_world_size(ring_group)
+            self._sp_ring_rank = dist.get_rank(ring_group)
+
+        ulysses_group = get_sp_ulysses_group()
+        if ulysses_group is not None:
+            dist.get_rank(ulysses_group)
 
     def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
         """Load tensors from mooncake key into device memory."""
@@ -128,6 +170,28 @@ class MooncakeDataset(IterableDataset):
             result["last_turn_loss_only"] = sample.last_turn_loss_only
         return result
 
+    def _load_from_mooncake_no_cleanup(self, sample: TrainSample) -> Dict[str, Any]:
+        dtypes_raw = sample.tensor_dtypes or {}
+        dtypes = {}
+        for key, dtype_val in dtypes_raw.items():
+            if isinstance(dtype_val, str):
+                dtypes[key] = getattr(torch, dtype_val.replace("torch.", ""))
+            else:
+                dtypes[key] = dtype_val
+
+        tensors = self.mooncake_store.get(
+            key=sample.mooncake_key,
+            shapes=sample.tensor_shapes,
+            dtypes=dtypes,
+            device=self.device,
+        )
+        result = tensors.to_tensor_dict()
+        if sample.packed_loss_mask is not None:
+            result["packed_loss_mask"] = sample.packed_loss_mask
+        if sample.last_turn_loss_only is not None:
+            result["last_turn_loss_only"] = sample.last_turn_loss_only
+        return result
+
     def _cleanup_mooncake_data(self, sample: TrainSample) -> None:
         """Remove data from mooncake store to release buffer space."""
         shapes = sample.tensor_shapes or {}
@@ -150,6 +214,33 @@ class MooncakeDataset(IterableDataset):
             skip_after_header=self.skip_after_header,
         )
 
+    def _should_skip_for_loss_mask(
+        self, data: Dict[str, Any], mooncake_key: str, skip_count: int
+    ) -> tuple[bool, int]:
+        mask = self._compute_loss_mask(data)
+        if mask is None:
+            skip_count += 1
+            logger.warning(
+                f"Skipping sample with all-zero loss mask "
+                f"(mooncake_key={mooncake_key}, total_skipped={skip_count})"
+            )
+            return True, skip_count
+
+        if (
+            self._min_loss_tokens > 0
+            and isinstance(mask, torch.Tensor)
+            and mask.sum() < self._min_loss_tokens
+        ):
+            skip_count += 1
+            logger.warning(
+                f"Skipping sample with too few loss-masked tokens "
+                f"({int(mask.sum())} < {self._min_loss_tokens}, "
+                f"mooncake_key={mooncake_key}, total_skipped={skip_count})"
+            )
+            return True, skip_count
+
+        return False, skip_count
+
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Iterate over samples synchronously.
 
@@ -159,6 +250,15 @@ class MooncakeDataset(IterableDataset):
         yield_count = 0
         skip_count = 0
         while True:
+            if self.usp_enabled:
+                data, skipped = self._usp_get_item(skip_count=skip_count)
+                skip_count += skipped
+                if data is None:
+                    break
+                yield_count += 1
+                yield data
+                continue
+
             logger.debug(f"__iter__: waiting for item from ray_queue (yield_count={yield_count})")
             try:
                 item = self.ray_queue.get(block=True, timeout=self.timeout)
@@ -173,26 +273,10 @@ class MooncakeDataset(IterableDataset):
             logger.debug(f"__iter__: got item, mooncake_key={item.mooncake_key}")
             data = self._load_from_mooncake(item)
 
-            mask = self._compute_loss_mask(data)
-            if mask is None:
-                skip_count += 1
-                logger.warning(
-                    f"Skipping sample with all-zero loss mask "
-                    f"(mooncake_key={item.mooncake_key}, total_skipped={skip_count})"
-                )
-                continue
-
-            if (
-                self._min_loss_tokens > 0
-                and isinstance(mask, torch.Tensor)
-                and mask.sum() < self._min_loss_tokens
-            ):
-                skip_count += 1
-                logger.warning(
-                    f"Skipping sample with too few loss-masked tokens "
-                    f"({int(mask.sum())} < {self._min_loss_tokens}, "
-                    f"mooncake_key={item.mooncake_key}, total_skipped={skip_count})"
-                )
+            should_skip, skip_count = self._should_skip_for_loss_mask(
+                data, item.mooncake_key, skip_count
+            )
+            if should_skip:
                 continue
 
             # Note: target is computed in the collator from last_hidden_states for sglang mode
@@ -222,6 +306,162 @@ class MooncakeDataset(IterableDataset):
             logger.debug(f"__iter__: yielding batch {yield_count}, keys={list(data.keys())}")
             yield data
 
+    def _usp_get_item(self, skip_count: int) -> tuple[Dict[str, torch.Tensor] | None, int]:
+        sp_group = self._sp_group
+        sp_world_size = self._sp_world_size
+        sp_rank = self._sp_rank
+        sp_ring_size = self._sp_ring_size
+
+        if sp_group is None:
+            raise RuntimeError("USP enabled but draft SP group has not been initialized")
+
+        skipped = 0
+        while True:
+            if sp_rank == 0:
+                try:
+                    item = self.ray_queue.get(block=True, timeout=self.timeout)
+                except Exception as e:
+                    logger.warning(
+                        f"_usp_get_item: Exception waiting for data: {e}, timeout={self.timeout}"
+                    )
+                    item = None
+                payload = None if item is None else item.__dict__
+            else:
+                item = None
+                payload = None
+
+            obj_list = [payload]
+            dist.broadcast_object_list(obj_list, group=sp_group, group_src=0)
+            payload = obj_list[0]
+            if payload is None:
+                return None, skipped
+
+            item = TrainSample(**payload)
+
+            if sp_rank == 0:
+                full_data = self._load_from_mooncake_no_cleanup(item)
+                should_skip, next_skip_count = self._should_skip_for_loss_mask(
+                    full_data,
+                    item.mooncake_key,
+                    skip_count + skipped,
+                )
+                if should_skip:
+                    skipped = next_skip_count - skip_count
+                    self._cleanup_mooncake_data(item)
+                    per_rank = None
+                    meta = None
+                else:
+                    max_len = full_data["input_ids"].shape[-1]
+                    if self.max_seq_length is not None:
+                        max_len = min(self.max_seq_length, max_len)
+
+                    full_input_ids = full_data["input_ids"]
+                    if full_input_ids.dim() == 2:
+                        full_input_ids = full_input_ids.squeeze(0)
+                    full_input_ids = full_input_ids[:max_len].to(device=self.device)
+
+                    full_hidden_states = full_data["hidden_states"]
+                    if full_hidden_states.dim() == 3:
+                        full_hidden_states = full_hidden_states.squeeze(0)
+                    full_hidden_states = full_hidden_states[:max_len, :].to(device=self.device)
+
+                    if "loss_mask" in full_data:
+                        full_loss_mask = full_data["loss_mask"]
+                        if full_loss_mask.dim() == 1:
+                            full_loss_mask = full_loss_mask.unsqueeze(0)
+                    elif item.packed_loss_mask is not None:
+                        packed = deserialize_packed_loss_mask(item.packed_loss_mask)
+                        full_loss_mask = unpack_loss_mask(packed)[None, :].to(device=self.device)
+                    else:
+                        full_loss_mask = torch.ones(1, max_len, dtype=torch.long, device=self.device)
+                    full_loss_mask = full_loss_mask[:, :max_len].to(device=self.device)
+
+                    if "last_hidden_states" in full_data:
+                        target_hs = full_data["last_hidden_states"]
+                        target_key = "last_hidden_states"
+                    elif "target" in full_data:
+                        target_hs = full_data["target"]
+                        target_key = "target"
+                    else:
+                        raise KeyError("USP requires last_hidden_states or target in mooncake data")
+                    if target_hs.dim() == 3:
+                        target_hs = target_hs.squeeze(0)
+                    target_hs = target_hs[:max_len, :].to(device=self.device)
+
+                    seq_len = full_input_ids.shape[-1]
+                    pad_len = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
+                    if pad_len:
+                        full_input_ids = F.pad(full_input_ids, (0, pad_len))
+                        full_loss_mask = F.pad(full_loss_mask, (0, pad_len))
+                        full_hidden_states = F.pad(full_hidden_states, (0, 0, 0, pad_len))
+                        target_hs = F.pad(target_hs, (0, 0, 0, pad_len))
+
+                    per_rank = []
+                    sp_ulysses_size = max(1, sp_world_size // sp_ring_size)
+                    for rank in range(sp_world_size):
+                        _, ring_rank = get_usp_rank_coords(
+                            sp_rank=rank,
+                            sp_ulysses_size=sp_ulysses_size,
+                            sp_ring_size=sp_ring_size,
+                        )
+                        (
+                            input_ids,
+                            attention_mask,
+                            loss_mask,
+                            hidden_states,
+                            target_hidden_states,
+                            position_ids,
+                        ) = split_usp_batch(
+                            input_ids=full_input_ids,
+                            loss_mask=full_loss_mask,
+                            hidden_states=full_hidden_states,
+                            target_hidden_states=target_hs,
+                            ttt_length=self.ttt_length,
+                            sp_rank=rank,
+                            sp_size=sp_world_size,
+                            ring_rank=ring_rank,
+                            sp_ring_size=sp_ring_size,
+                        )
+                        per_rank.append(
+                            {
+                                "input_ids": input_ids,
+                                "attention_mask": attention_mask,
+                                "loss_mask": loss_mask,
+                                "hidden_states": hidden_states,
+                                target_key: target_hidden_states,
+                                "position_ids": position_ids,
+                            }
+                        )
+
+                    meta = {
+                        key: (per_rank[0][key].shape, per_rank[0][key].dtype) for key in per_rank[0]
+                    }
+            else:
+                per_rank = None
+                meta = None
+                should_skip = False
+
+            skip_list = [should_skip]
+            dist.broadcast_object_list(skip_list, group=sp_group, group_src=0)
+            if skip_list[0]:
+                continue
+
+            meta_list = [meta]
+            dist.broadcast_object_list(meta_list, group=sp_group, group_src=0)
+            meta = meta_list[0]
+
+            data = {}
+            for key, (shape, dtype) in meta.items():
+                recv_tensor = torch.empty(shape, dtype=dtype, device=self.device)
+                scatter_list = [item[key] for item in per_rank] if sp_rank == 0 else None
+                dist.scatter(recv_tensor, scatter_list=scatter_list, group=sp_group, group_src=0)
+                data[key] = recv_tensor
+
+            if sp_rank == 0:
+                self._cleanup_mooncake_data(item)
+
+            return data, skipped
+
 
 def create_mooncake_dataloader(
     ray_queue: RayQueue,
@@ -237,6 +477,9 @@ def create_mooncake_dataloader(
     last_turn_loss_only: bool = False,
     skip_after_header: int = 0,
     min_loss_tokens: int = 0,
+    usp_enabled: bool = False,
+    ttt_length: int = 1,
+    max_seq_length: Optional[int] = None,
 ) -> DataLoader:
     """Create a DataLoader that fetches from mooncake via queue.
 
@@ -277,6 +520,9 @@ def create_mooncake_dataloader(
         skip_after_header=skip_after_header,
         batch_size=batch_size,
         min_loss_tokens=min_loss_tokens,
+        usp_enabled=usp_enabled,
+        ttt_length=ttt_length,
+        max_seq_length=max_seq_length,
     )
 
     return DataLoader(
@@ -318,6 +564,9 @@ class MooncakeDataFetcher:
         last_turn_loss_only: bool = False,
         skip_after_header: int = 0,
         min_loss_tokens: int = 0,
+        usp_enabled: bool = False,
+        ttt_length: int = 1,
+        max_seq_length: Optional[int] = None,
     ):
         self.batch_size = batch_size
         self._dataloader = create_mooncake_dataloader(
@@ -334,6 +583,9 @@ class MooncakeDataFetcher:
             last_turn_loss_only=last_turn_loss_only,
             skip_after_header=skip_after_header,
             min_loss_tokens=min_loss_tokens,
+            usp_enabled=usp_enabled,
+            ttt_length=ttt_length,
+            max_seq_length=max_seq_length,
         )
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:

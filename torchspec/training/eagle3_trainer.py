@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
 from argparse import Namespace
 from typing import List, Optional, Tuple
 
@@ -288,14 +289,14 @@ class Eagle3Trainer(Trainer):
             )
         del target_hidden_states
 
-        plosses, _, acces = self.model(
+        plosses, _, acces, acc_counts = self.model(
             input_ids=input_ids,
             attention_mask=batch["attention_mask"].cuda(),
             target=target,
             loss_mask=loss_mask,
             hidden_states=batch["hidden_states"].cuda(),
         )
-        return plosses, acces
+        return plosses, acces, acc_counts
 
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
         ploss_weight = [0.8**i for i in range(len(plosses))]
@@ -310,10 +311,11 @@ class Eagle3Trainer(Trainer):
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position metrics."""
         with torch.no_grad():
-            plosses, acces = self._forward(batch)
+            plosses, acces, acc_counts = self._forward(batch)
         return {
             "plosses": torch.stack(plosses).detach(),
             "acces": torch.stack(acces).detach(),
+            "acc_counts": torch.stack(acc_counts).detach(),
         }
 
     def eval_from_cache(self) -> dict:
@@ -349,9 +351,17 @@ class Eagle3Trainer(Trainer):
 
         avg_plosses = torch.stack([m["plosses"] for m in all_step_metrics]).mean(dim=0)
         avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
+        avg_acc_counts = torch.stack([m["acc_counts"] for m in all_step_metrics]).mean(dim=0)
 
         dist.all_reduce(avg_plosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_acc_counts, op=dist.ReduceOp.AVG)
+
+        if getattr(self.args, "attention_backend", None) == "usp":
+            total_count = avg_acc_counts.sum().clamp_min(1.0)
+            avg_acc_scalar = ((avg_acces * avg_acc_counts).sum() / total_count).item()
+        else:
+            avg_acc_scalar = avg_acces.mean().item()
 
         cumulative = 1.0
         simulated_acc_len = 0.0
@@ -366,7 +376,7 @@ class Eagle3Trainer(Trainer):
 
         metrics: dict = {
             "eval/avg_loss": weighted_avg_loss,
-            "eval/avg_acc": avg_acces.mean().item(),
+            "eval/avg_acc": avg_acc_scalar,
             "eval/simulated_acc_len": simulated_acc_len,
         }
         for i in range(avg_plosses.shape[0]):
@@ -375,7 +385,7 @@ class Eagle3Trainer(Trainer):
 
         if dist.get_rank() == 0:
             logger.info(
-                f"eval: loss={weighted_avg_loss:.4f}, acc={avg_acces.mean().item():.4f}, "
+                f"eval: loss={weighted_avg_loss:.4f}, acc={avg_acc_scalar:.4f}, "
                 f"sim_acc_len={simulated_acc_len:.2f}"
             )
 
@@ -393,12 +403,13 @@ class Eagle3Trainer(Trainer):
         batch_idx: int,
         num_batches: int,
     ) -> dict:
-        plosses, acces = self._forward(batch)
+        plosses, acces, acc_counts = self._forward(batch)
         total_loss = self._backward(plosses, accumulation_steps=accumulation_steps)
 
         return {
             "plosses": torch.stack(plosses).detach(),
             "acces": torch.stack(acces).detach(),
+            "acc_counts": torch.stack(acc_counts).detach(),
             "plosses_raw": [p.detach() for p in plosses],
             "acces_raw": [a.detach() for a in acces],
             "total_loss": total_loss.detach(),
@@ -437,9 +448,17 @@ class Eagle3Trainer(Trainer):
 
         avg_plosses = torch.stack(plosses).mean(dim=0)
         avg_acces = torch.stack(acces).mean(dim=0)
+        avg_acc_counts = torch.stack([m["acc_counts"] for m in all_step_metrics]).mean(dim=0)
 
         dist.all_reduce(avg_plosses, op=dist.ReduceOp.AVG)
         dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        dist.all_reduce(avg_acc_counts, op=dist.ReduceOp.AVG)
+
+        if getattr(self.args, "attention_backend", None) == "usp":
+            total_count = avg_acc_counts.sum().clamp_min(1.0)
+            avg_acc_scalar = ((avg_acces * avg_acc_counts).sum() / total_count).item()
+        else:
+            avg_acc_scalar = avg_acces.mean().item()
 
         # Simulated acceptance length: acc_0 + acc_0*acc_1 + acc_0*acc_1*acc_2 + ...
         # Models the expected number of consecutively accepted draft tokens,
@@ -458,7 +477,7 @@ class Eagle3Trainer(Trainer):
 
         metrics = {
             "train/avg_loss": weighted_avg_loss,
-            "train/avg_acc": avg_acces.mean().item(),
+            "train/avg_acc": avg_acc_scalar,
             "train/simulated_acc_len": simulated_acc_len,
             "train/grad_norm": grad_norm.item() if grad_norm is not None else 0.0,
             "train/global_step": self.global_step,

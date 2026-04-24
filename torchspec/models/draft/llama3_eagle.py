@@ -22,6 +22,7 @@ import math
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -34,6 +35,7 @@ from torchspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from torchspec.utils.distributed import get_sp_ring_group, get_sp_ulysses_group
 from torchspec.utils.logging import logger, print_with_rank
 
 _flash_attn_import_error: ImportError | None = None
@@ -1904,6 +1906,209 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
         return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None, None
 
 
+class _USPFlashCachedMergeFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, softmax_scale: float):
+        bsz, q_len, num_heads, head_dim = q.shape
+        num_blocks = cache_k.shape[1]
+        num_kv_heads = cache_k.shape[3]
+        num_groups = num_heads // num_kv_heads
+        q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+
+        k0 = cache_k[:, 0].contiguous()
+        v0 = cache_v[:, 0].contiguous()
+        assert _std_flash_attn_forward is not None and _std_flash_attn_backward is not None, (
+            "USP cached merge requires standard flash-attn forward/backward "
+            f"(standard import error: {_std_flash_attn_import_error!r})"
+        )
+        out0, lse0_kernel = _standard_flash_attn_forward(
+            q.contiguous(),
+            k0,
+            v0,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        out0_expanded = out0.view(bsz, q_len, num_kv_heads, num_groups, head_dim).float()
+        lse0 = lse0_kernel.transpose(1, 2).reshape(bsz, q_len, num_kv_heads, num_groups).float()
+        lse_terms = [lse0]
+        attn_terms = [out0_expanded]
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].unsqueeze(-2).float()
+            vi = cache_v[:, i].unsqueeze(-2).float()
+            lse_terms.append((q_expanded.float() * ki).sum(-1) * softmax_scale)
+            attn_terms.append(vi.expand_as(out0_expanded))
+
+        merged_lse = torch.logsumexp(torch.stack(lse_terms, dim=-1), dim=-1)
+        out = sum(
+            term * torch.exp(lse - merged_lse).unsqueeze(-1)
+            for term, lse in zip(attn_terms, lse_terms)
+        )
+        ctx.save_for_backward(q, cache_k, cache_v, out, merged_lse)
+        ctx.softmax_scale = softmax_scale
+        return out.to(q.dtype).reshape_as(q)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
+        bsz, q_len, num_heads, head_dim = q.shape
+        num_blocks = cache_k.shape[1]
+        num_kv_heads = cache_k.shape[3]
+        num_groups = num_heads // num_kv_heads
+        scale = ctx.softmax_scale
+
+        grad_out_f = grad_out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        q_f = q.float()
+        q_expanded = q_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_f = out.float()
+        out_expanded = out_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+
+        dq = torch.zeros_like(q_f)
+        dcache_k = torch.zeros_like(cache_k.float())
+        dcache_v = torch.zeros_like(cache_v.float())
+
+        merged_lse_kernel = merged_lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+        dq0 = torch.empty_like(q)
+        dk0 = torch.empty_like(cache_k[:, 0])
+        dv0 = torch.empty_like(cache_v[:, 0])
+        _standard_flash_attn_backward_call(
+            grad_out.contiguous(),
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out.to(q.dtype).reshape_as(q).contiguous(),
+            merged_lse_kernel,
+            dq0,
+            dk0,
+            dv0,
+            softmax_scale=scale,
+            causal=True,
+        )
+        dq += dq0.float()
+        dcache_k[:, 0] += dk0.float()
+        dcache_v[:, 0] += dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float().unsqueeze(-2)
+            vi = cache_v[:, i].float().unsqueeze(-2)
+            lse_i = (q_expanded * ki).sum(-1) * scale
+            wi = torch.exp(lse_i - merged_lse)
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (grad_out_f * (vi.expand_as(out_expanded) - out_expanded)).sum(-1)
+            dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
+            dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
+            dcache_v[:, i] += d_out_i.sum(dim=3)
+
+        return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None
+
+
+class LlamaUSPFlashAttention(LlamaAttention):
+    """USP attention with Ulysses all-to-all and local flash attention."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "LlamaUSPFlashAttention requires torch.distributed to be initialized first."
+            )
+        try:
+            from yunchang.comm import SeqAllToAll4D
+        except ImportError as exc:
+            raise RuntimeError(
+                "USP requires yunchang; please install it to use USP attention."
+            ) from exc
+
+        self._SeqAllToAll4D = SeqAllToAll4D
+        self.ring_pg = get_sp_ring_group()
+        self.ulysses_pg = get_sp_ulysses_group()
+        if self.ring_pg is None or self.ulysses_pg is None:
+            raise RuntimeError("USP requires sp ring/ulysses groups to be initialized.")
+        self.sp_ring_degree = dist.get_world_size(self.ring_pg)
+        self.sp_ulysses_degree = dist.get_world_size(self.ulysses_pg)
+        self.scatter_idx = 2
+        self.gather_idx = 1
+        self.use_sync = False
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_keys: Optional[torch.Tensor] = None,
+        cache_values: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        del attention_mask, use_cache
+        bsz, q_len, _ = hidden_states.size()
+        local_q_len = q_len
+
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
+        query_states = self._SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            query_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        key_states = self.k_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        key_states = self._SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            key_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        value_states = self.v_proj(hidden_states).view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
+        value_states = self._SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            value_states,
+            self.scatter_idx,
+            self.gather_idx,
+            self.use_sync,
+        )
+
+        q_len = query_states.shape[1]
+        global_q_len = local_q_len * self.sp_ring_degree * self.sp_ulysses_degree
+
+        lck = 0 if cache_keys is None else cache_keys.shape[1]
+        cos, sin = self.rotary_emb(query_states, seq_len=global_q_len + lck)
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids + lck, unsqueeze_dim=2
+        )
+
+        if cache_keys is not None:
+            cache_keys = torch.cat([cache_keys, key_states.unsqueeze(1)], dim=1)
+            cache_values = torch.cat([cache_values, value_states.unsqueeze(1)], dim=1)
+        else:
+            cache_keys = key_states.unsqueeze(1)
+            cache_values = value_states.unsqueeze(1)
+
+        attn_output = _USPFlashCachedMergeFunc.apply(
+            query_states,
+            cache_keys,
+            cache_values,
+            1.0 / math.sqrt(self.head_dim),
+        )
+
+        attn_output = self._SeqAllToAll4D.apply(
+            self.ulysses_pg,
+            attn_output,
+            self.gather_idx,
+            self.scatter_idx,
+            self.use_sync,
+        )
+        attn_output = attn_output.reshape(bsz, local_q_len, self.head_dim * self.num_heads)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, cache_keys, cache_values
+
+
+
 def warmup_flash_attention_masked(
     q_len: int,
     num_heads: int,
@@ -2054,6 +2259,8 @@ class LlamaDecoderLayer(nn.Module):
             self.self_attn = LlamaFlashAttentionMasked(config=config)
         elif attention_backend == "fa":
             self.self_attn = LlamaFlashAttention(config=config)
+        elif attention_backend == "usp":
+            self.self_attn = LlamaUSPFlashAttention(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 

@@ -225,6 +225,15 @@ def resolve_loss_mask(
     packed = data.get("packed_loss_mask")
     if packed is not None:
         mask = unpack_loss_mask(packed)
+        input_ids = data.get("input_ids")
+        if input_ids is not None:
+            if input_ids.dim() == 2:
+                input_ids = input_ids.squeeze(0)
+            expected_len = input_ids.shape[-1]
+            if mask.shape[0] > expected_len:
+                mask = mask[:expected_len]
+            elif mask.shape[0] < expected_len:
+                mask = torch.nn.functional.pad(mask, (0, expected_len - mask.shape[0]))
         if not mask.any():
             return None
         data["loss_mask"] = mask

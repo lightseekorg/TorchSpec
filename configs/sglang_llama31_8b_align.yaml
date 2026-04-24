@@ -1,0 +1,69 @@
+model:
+  target_model_path: /nfs/volume-1615-2/models/Meta-Llama-3.1-8B-Instruct
+  draft_model_config: /nfs/ofs-llab-volume/users/fengyu/SpecForge/configs/llama3-8B-eagle3.json
+  trust_remote_code: false
+  target_model_backend: sglang
+
+dataset:
+  train_data_path: /nfs/ofs-fengyu/hf/datasets/sharegpt_train_1w.jsonl
+  eval_data_path: null
+  eval_interval: 0
+  chat_template: llama3
+  prompt_key: conversations
+  last_turn_loss_only: false
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 4096
+  num_epochs: 10
+  save_interval: 5000
+  seed: 0
+  training_num_gpus_per_node: 8
+  training_num_nodes: 1
+  ttt_length: 7
+  warmup_ratio: 0.015
+  colocate: true
+
+inference:
+  inference_engine_type: sgl
+  inference_batch_size: 1
+  inference_fetch_batch: 1
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 32
+  inference_buffer_threshold: 16
+  sglang:
+    tp_size: 1
+    nnodes: 1
+    mem_fraction_static: 0.4
+    extra_args:
+      attention_backend: flashinfer
+      enable_nccl_nvls: false
+      enable_symm_mem: false
+      enable_torch_compile: false
+      enable_dp_attention: false
+      enable_dp_lm_head: false
+      enable_piecewise_cuda_graph: false
+      piecewise_cuda_graph_max_tokens: 4096
+      piecewise_cuda_graph_tokens: null
+      ep_size: 1
+      max_running_requests: 1
+      max_total_tokens: 4096
+
+logging:
+  report_to: tensorboard
+
+output_dir: ./outputs/llama31_8b_align
+cache_dir: ./cache/llama31_8b_align
+model_download_dir: null
+
+debug:
+  debug_train_only: false
+  debug_inference_only: false
+  save_debug_train_data: null
