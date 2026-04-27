@@ -1,22 +1,27 @@
-torchspec sglang patch (base: 94f03a39db)
+From 9f24221fde09f574c03e03b645efaaf4999fae89 Mon Sep 17 00:00:00 2001
+From: Dogac Eldenk <dogacel@gmail.com>
+Date: Mon, 27 Apr 2026 12:35:25 +0800
+Subject: [PATCH] torchspec sglang patch
+
 ---
- python/sglang/srt/entrypoints/engine.py            |   8 ++
- python/sglang/srt/entrypoints/http_server.py       |  17 +++
- python/sglang/srt/layers/logits_processor.py       |  54 ++++++++
- python/sglang/srt/managers/detokenizer_manager.py  |   3 +
- python/sglang/srt/managers/io_struct.py            |  48 +++++++
- python/sglang/srt/managers/schedule_batch.py       |  54 +++++++-
- python/sglang/srt/managers/scheduler.py            |  57 ++++++++-
- .../managers/scheduler_output_processor_mixin.py   | 138 ++++++++++++++++++---
- python/sglang/srt/managers/tokenizer_manager.py    |  16 +++
- python/sglang/srt/managers/utils.py                |   5 +-
- .../srt/model_executor/forward_batch_info.py       |   4 +
- python/sglang/srt/model_executor/model_runner.py   |  16 +++
- python/sglang/srt/models/qwen3_next.py             |   8 ++
- python/sglang/srt/models/qwen3_next_mtp.py         |   3 +
- python/sglang/srt/server_args.py                   |  24 ++++
- .../sglang/srt/speculative/spec_training_info.py   |  50 ++++++++
- 16 files changed, 483 insertions(+), 22 deletions(-)
+ python/sglang/srt/entrypoints/engine.py       |   8 +
+ python/sglang/srt/entrypoints/http_server.py  |  17 +++
+ python/sglang/srt/layers/logits_processor.py  |  54 +++++++
+ .../srt/managers/detokenizer_manager.py       |   3 +
+ python/sglang/srt/managers/io_struct.py       |  48 ++++++
+ python/sglang/srt/managers/schedule_batch.py  |  54 ++++++-
+ python/sglang/srt/managers/scheduler.py       |  57 +++++++-
+ .../scheduler_output_processor_mixin.py       | 138 +++++++++++++++---
+ .../sglang/srt/managers/tokenizer_manager.py  |  16 ++
+ python/sglang/srt/managers/utils.py           |   5 +-
+ .../srt/model_executor/forward_batch_info.py  |   4 +
+ .../sglang/srt/model_executor/model_runner.py |  16 ++
+ python/sglang/srt/models/qwen3_next.py        |   8 +
+ python/sglang/srt/models/qwen3_next_mtp.py    |   3 +
+ python/sglang/srt/server_args.py              |  30 ++++
+ .../srt/speculative/spec_training_info.py     |  50 +++++++
+ 16 files changed, 489 insertions(+), 22 deletions(-)
+ create mode 100644 python/sglang/srt/speculative/spec_training_info.py
 
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
 index d864e4aba..b74514924 100644
@@ -896,7 +901,7 @@ index b2bdbbbe8..833c055ab 100644
      def forward(
          self,
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index d91ced805..2708630cc 100644
+index d91ced805..5ceef2cb2 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -514,6 +514,12 @@ class ServerArgs:
@@ -912,7 +917,7 @@ index d91ced805..2708630cc 100644
      # Expert parallelism
      ep_size: int = 1
      moe_a2a_backend: Literal[
-@@ -4896,6 +4902,24 @@ class ServerArgs:
+@@ -4896,6 +4902,30 @@ class ServerArgs:
              help="Enable multi-layer Eagle speculative decoding.",
          )
  
@@ -999,3 +1004,6 @@ index 000000000..24af14b7a
 +
 +    def is_empty(self) -> bool:
 +        return len(self.data_ids) == 0
+-- 
+2.43.0
+

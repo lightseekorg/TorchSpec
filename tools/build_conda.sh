@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 # Parse command line arguments
 # Usage: ./build_conda.sh [MODE] [BACKEND]
 #   MODE:
-#     1       - Create new micromamba env and install (default)
+#     1       - Create a new micromamba/conda env and install (default)
 #     current - Install into current environment
 #     0       - Skip env creation and installation
 #   BACKEND:
@@ -32,23 +32,39 @@ echo "TorchSpec Installation"
 echo "Backend: $BACKEND"
 echo "=========================================="
 
+ENV_MANAGER=""
+ENV_CREATE_CMD=()
+ENV_RUN_CMD=()
+ACTIVATE_HINT=""
+
+if command -v micromamba &> /dev/null; then
+    ENV_MANAGER="micromamba"
+    export MAMBA_EXE="${MAMBA_EXE:-$(command -v micromamba)}"
+    export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
+    ENV_CREATE_CMD=("$MAMBA_EXE" create -n torchspec python=3.12 uv -c conda-forge -y)
+    ENV_RUN_CMD=("$MAMBA_EXE" run -n torchspec)
+    ACTIVATE_HINT="micromamba activate torchspec"
+elif command -v conda &> /dev/null; then
+    ENV_MANAGER="conda"
+    ENV_CREATE_CMD=(conda create -n torchspec python=3.12 uv -c conda-forge -y)
+    ENV_RUN_CMD=(conda run -n torchspec)
+    ACTIVATE_HINT="conda activate torchspec"
+fi
+
 if [ "$MODE" = "1" ]; then
-    if ! command -v micromamba &> /dev/null; then
-        echo "Error: micromamba is not installed."
-        echo "Please install it first: https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html"
+    if [ -z "$ENV_MANAGER" ]; then
+        echo "Error: neither micromamba nor conda is installed."
+        echo "Please install one of them first:"
+        echo "  micromamba: https://mamba.readthedocs.io/en/latest/installation/micromamba-installation.html"
+        echo "  conda:      https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html"
         exit 1
     fi
 
-    # Initialize micromamba for this script
-    export MAMBA_EXE="${MAMBA_EXE:-$(command -v micromamba)}"
-    export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
-    eval "$("$MAMBA_EXE" shell hook --shell bash)"
-
-    micromamba create -n torchspec python=3.12 uv -c conda-forge -y
+    "${ENV_CREATE_CMD[@]}"
 elif [ "$MODE" = "current" ]; then
     echo "Using current environment: $(python3 --version), $(which python3)"
 else
-    echo "Skipping micromamba setup (mode=0)"
+    echo "Skipping environment setup (mode=0)"
 fi
 
 # Install SGLang if requested
@@ -74,7 +90,7 @@ if [ "$BACKEND" = "sglang" ] || [ "$BACKEND" = "both" ]; then
     cd "$PROJECT_ROOT"
 
     if [ "$MODE" = "1" ]; then
-        micromamba run -n torchspec pip install -e "${SGLANG_FOLDER_NAME}/python[all]"
+        "${ENV_RUN_CMD[@]}" pip install -e "${SGLANG_FOLDER_NAME}/python[all]"
     elif [ "$MODE" = "current" ]; then
         pip install -e "${SGLANG_FOLDER_NAME}/python[all]"
     fi
@@ -94,7 +110,7 @@ if [ "$BACKEND" = "vllm" ] || [ "$BACKEND" = "both" ]; then
     echo "=========================================="
 
     if [ "$MODE" = "1" ]; then
-        micromamba run -n torchspec uv pip install "vllm>=0.16.0"
+        "${ENV_RUN_CMD[@]}" uv pip install "vllm>=0.16.0"
     elif [ "$MODE" = "current" ]; then
         pip install "vllm>=0.16.0"
     fi
@@ -113,13 +129,13 @@ if [ "$MODE" = "1" ]; then
         EXTRAS="dev,vllm"
     fi
 
-    micromamba run -n torchspec uv pip install -e ".[$EXTRAS]"
+    "${ENV_RUN_CMD[@]}" uv pip install -e ".[$EXTRAS]"
 
     echo ""
     echo "=========================================="
     echo "✓ TorchSpec environment setup complete!"
     echo "=========================================="
-    echo "Activate with: micromamba activate torchspec"
+    echo "Activate with: $ACTIVATE_HINT"
     echo ""
     if [ "$BACKEND" = "sglang" ]; then
         echo "Backend: SGLang"

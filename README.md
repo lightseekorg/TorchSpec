@@ -178,6 +178,10 @@ Set `TORCHSPEC_LOG_LEVEL=DEBUG` for more verbose logging when diagnosing issues:
 TORCHSPEC_LOG_LEVEL=DEBUG ./examples/qwen3-8b-single-node/run.sh
 ```
 
+## Mooncake SEGFAULT
+
+Current Mooncake version has a bug with TCP-only hosts causing a SEGFAULT error. Set `MC_STORE_MEMCPY=0` until the [upstream issue](https://github.com/kvcache-ai/Mooncake/issues/1986) is fixed.
+
 ### Per-Rank File Logging
 
 Set `TORCHSPEC_LOG_DIR` to an absolute path on a shared filesystem (NFS) to enable per-rank log files for every Ray actor on both training and inference:

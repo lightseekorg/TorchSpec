@@ -337,6 +337,9 @@ def flatten_multimodal_content(messages, image_placeholder="<image>"):
     """
     for msg in messages:
         content = msg.get("content")
+        if content is None:
+            msg["content"] = ""
+            continue
         if not isinstance(content, (str, list)):
             raise ValueError(
                 f"Message content must be a str or list, got {type(content).__name__}: {repr(content)[:100]}"
@@ -389,28 +392,40 @@ def load_local_json(data_path):
                     yield json.loads(line)
 
 
+def _list_hub_data_files(data_path: str, suffixes: tuple[str, ...]) -> list[str]:
+    """List repo files matching ``suffixes``, preferring those under ``data/``."""
+    files = list_repo_files(data_path, repo_type="dataset")
+    matching = sorted(f for f in files if f.endswith(suffixes))
+    preferred = [f for f in matching if f.startswith("data/")]
+    return preferred or matching
+
+
 def _load_hub_json_files(data_path):
     """Download JSON/JSONL files from a HF Hub dataset and yield rows.
 
     Uses raw json module instead of load_dataset to avoid PyArrow schema
     inference failures on datasets with mixed-type columns.
     """
-
-    files = list_repo_files(data_path, repo_type="dataset")
-    all_json = sorted(f for f in files if f.endswith((".jsonl", ".json")))
-    # Prefer files under data/ to avoid metadata files like stats.json
-    data_files = [f for f in all_json if f.startswith("data/")]
+    data_files = _list_hub_data_files(data_path, (".jsonl", ".json"))
     if not data_files:
-        data_files = all_json
-    if not data_files:
-        raise ValueError(
-            f"No JSON/JSONL files found in HF Hub dataset '{data_path}'. "
-            "Parquet-only Hub datasets are not yet supported via this path."
-        )
+        raise ValueError(f"No JSON/JSONL files found in HF Hub dataset '{data_path}'.")
 
     for filename in data_files:
         local_path = hf_hub_download(repo_id=data_path, filename=filename, repo_type="dataset")
         yield from load_local_json(local_path)
+
+
+def _load_hub_parquet_dataset(data_path: str):
+    """Stream parquet files from a HF Hub dataset.
+
+    Used when ``load_dataset(repo_id, ...)`` fails due to schema/card parsing
+    issues but the repo's parquet shards themselves are valid.
+    """
+    parquet_files = _list_hub_data_files(data_path, (".parquet",))
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in HF Hub dataset '{data_path}'.")
+    urls = [f"https://huggingface.co/datasets/{data_path}/resolve/main/{f}" for f in parquet_files]
+    return load_dataset("parquet", data_files=urls, split="train", streaming=True)
 
 
 def load_hf_dataset(data_path: str):
@@ -458,13 +473,17 @@ def load_hf_dataset(data_path: str):
             ds = ds.remove_columns(drop_cols)
         return ds
     except (ValueError, TypeError, ArithmeticError, KeyError) as e:
-        # Schema inference failures (e.g., mixed-type columns in Arrow/Parquet).
-        # Fall back to manual JSON download.
+        # Schema inference / card-parsing failures (e.g., mixed-type columns in
+        # Arrow/Parquet, malformed dataset_info YAML). Fall back to direct file
+        # streaming — parquet first, then JSON/JSONL.
         import logging
 
-        logging.getLogger(__name__).info(
-            f"load_dataset failed for '{data_path}' ({e}), falling back to JSON download"
-        )
-        return IterableDataset.from_generator(
-            _load_hub_json_files, gen_kwargs={"data_path": data_path}
-        )
+        log = logging.getLogger(__name__)
+        log.info(f"load_dataset failed for '{data_path}' ({e}), trying direct file streaming")
+        try:
+            return _load_hub_parquet_dataset(data_path)
+        except ValueError as parquet_err:
+            log.info(f"parquet streaming failed ({parquet_err}), falling back to JSON download")
+            return IterableDataset.from_generator(
+                _load_hub_json_files, gen_kwargs={"data_path": data_path}
+            )
