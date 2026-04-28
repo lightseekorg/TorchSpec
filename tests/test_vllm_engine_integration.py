@@ -48,16 +48,23 @@ os.environ.setdefault("MOONCAKE_MASTER_SERVER", f"{LOCAL_IP}:51135")
 
 
 def get_aux_layer_ids(model_path: str) -> list[int]:
-    """Replicate VllmEngine's aux layer resolution: default Eagle3 layers + final layer."""
+    """Replicate VllmEngine's aux layer resolution: default Eagle3 layers + final layer.
+
+    See ``VllmEngine.init`` for the canonical implementation.  vllm's hidden
+    state hook captures index ``layer_idx + 1`` after each layer runs, so
+    valid capture indices are ``[0, num_hidden_layers]``; index
+    ``num_hidden_layers`` is the pre-``norm`` slot used as
+    ``last_hidden_states`` for target logit computation.
+    """
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     cfg = getattr(cfg, "text_config", cfg)
     num_layers = cfg.num_hidden_layers
-    # Default Eagle3 aux layers
-    aux_ids = [1, num_layers // 2 - 1, num_layers - 4]
-    # VllmEngine appends the final layer for last_hidden_states capture
-    final_layer = num_layers - 1
-    if final_layer not in aux_ids:
-        aux_ids.append(final_layer)
+    # TorchSpec post-layer ids for default Eagle3 aux layers, shifted +1 to
+    # match vllm's capture-after-layer convention.
+    aux_ids = [lid + 1 for lid in [1, num_layers // 2 - 1, num_layers - 4]]
+    # Append the post-last-layer / pre-norm slot for last_hidden_states capture.
+    if num_layers not in aux_ids:
+        aux_ids.append(num_layers)
     return aux_ids, cfg.hidden_size, num_layers
 
 
@@ -260,10 +267,11 @@ def main():
     # Resolve aux layers
     auto_aux_ids, hidden_size, num_layers = get_aux_layer_ids(args.model)
     if args.aux_layers is not None:
-        aux_layer_ids = list(args.aux_layers)
-        final_layer = num_layers - 1
-        if final_layer not in aux_layer_ids:
-            aux_layer_ids.append(final_layer)
+        # User passes TorchSpec post-layer ids; shift +1 to vllm's
+        # capture-after-layer convention and append the pre-norm slot.
+        aux_layer_ids = [lid + 1 for lid in args.aux_layers if lid < num_layers]
+        if num_layers not in aux_layer_ids:
+            aux_layer_ids.append(num_layers)
     else:
         aux_layer_ids = auto_aux_ids
 
