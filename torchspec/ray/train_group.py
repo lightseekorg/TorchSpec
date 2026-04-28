@@ -40,8 +40,8 @@ class RayTrainGroup:
         num_gpus_per_node (int): Number of gpus for this training group.
         pg (PlacementGroup, optional): Placement group to schedule training workers on.
             If none, create new placement group automatically. Defaults to None.
-        num_gpus_per_actor (float, optional): Number of gpus allocated for each training worker.
-            If < 1.0, multiple models can share same gpu. Defaults to 1.
+        num_gpus_per_actor (float, optional): Legacy CPU reservation size for each
+            training worker when scheduled inside a GPU placement-group bundle.
         resources (Dict[str, float], optional): Custom resources to allocate for each training worker.
             See https://docs.ray.io/en/latest/ray-core/scheduling/resources.html
         num_resources_per_node (int, optional): Number of custom resources to allocate for each node.
@@ -73,7 +73,7 @@ class RayTrainGroup:
 
         # Use placement group to lock resources for models of same type
         assert pg is not None
-        pg, reordered_bundle_indices, _reordered_gpu_ids = pg
+        pg, reordered_bundle_indices, reordered_gpu_ids = pg
 
         train_env_vars = self.args.train_env_vars
         if isinstance(train_env_vars, str):
@@ -98,9 +98,11 @@ class RayTrainGroup:
             os.environ.get("TORCHINDUCTOR_FX_GRAPH_CACHE", "1"),
         )
 
-        TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(
-            self._training_class
-        )
+        # The placement group has already reserved the GPU bundle. Requesting an
+        # additional fractional GPU from the actor creates transient GPU_group_*
+        # demands that Ray's autoscaler can misreport as infeasible. Keep actor
+        # resource accounting CPU-only and pass the intended GPU id explicitly.
+        TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(self._training_class)
 
         # Create worker actors
         self._actor_handlers = []
@@ -108,12 +110,17 @@ class RayTrainGroup:
         for rank in range(world_size):
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
-                num_gpus=num_gpus_per_actor,
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],
                 ),
-            ).remote(world_size, rank, master_addr, master_port)
+            ).remote(
+                world_size,
+                rank,
+                master_addr,
+                master_port,
+                int(reordered_gpu_ids[rank]),
+            )
             if rank == 0:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             self._actor_handlers.append(actor)

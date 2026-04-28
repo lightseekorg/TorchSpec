@@ -207,9 +207,11 @@ def _prepare_sgl_engines(
             placement_group_bundle_index=reordered_bundle_indices[bundle_offset],
         )
 
+        # The placement group already reserves the target GPU. Keep the actor's
+        # Ray resource request CPU-only and pass base_gpu_id for CUDA setup to
+        # avoid noisy fractional GPU_group_* demands in the autoscaler.
         engine = SglRayActor.options(
             num_cpus=0.2,
-            num_gpus=0.2,
             scheduling_strategy=scheduling_strategy,
             runtime_env={"env_vars": env_vars},
         ).remote(
@@ -349,9 +351,11 @@ def _prepare_vllm_engines(
             placement_group_bundle_index=reordered_bundle_indices[bundle_offset],
         )
 
+        # The placement group already reserves the target GPU. Keep the actor's
+        # Ray resource request CPU-only and pass base_gpu_id for CUDA setup to
+        # avoid noisy fractional GPU_group_* demands in the autoscaler.
         engine = VllmRayActor.options(
             num_cpus=0.2,
-            num_gpus=0.2,
             scheduling_strategy=scheduling_strategy,
             runtime_env={"env_vars": env_vars},
         ).remote(
@@ -460,8 +464,10 @@ def _create_and_init_actors(
     init_handles = []
 
     for i in range(num_engines):
-        num_gpus = 0.2
-        num_cpus = num_gpus
+        # The placement group already reserves the target GPU. Keep the actor's
+        # Ray resource request CPU-only and pass base_gpu_id for CUDA setup to
+        # avoid noisy fractional GPU_group_* demands in the autoscaler.
+        num_cpus = 0.2
 
         base_gpu_id = int(reordered_gpu_ids[i * num_gpus_per_engine])
 
@@ -484,7 +490,6 @@ def _create_and_init_actors(
 
         engine = ray_actor_cls.options(
             num_cpus=num_cpus,
-            num_gpus=num_gpus,
             scheduling_strategy=scheduling_strategy,
             runtime_env={"env_vars": env_vars},
         ).remote(**constructor_kwargs)

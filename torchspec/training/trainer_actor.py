@@ -33,7 +33,14 @@ from torchspec.utils.logging import setup_file_logging
 
 
 class TrainerActor(RayActor):
-    def __init__(self, world_size: int, rank: int, master_addr: str, master_port: int):
+    def __init__(
+        self,
+        world_size: int,
+        rank: int,
+        master_addr: str,
+        master_port: int,
+        base_gpu_id: int | None = None,
+    ):
         self._world_size = world_size
         self._rank = rank
 
@@ -44,7 +51,7 @@ class TrainerActor(RayActor):
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
 
-        self.setup_gpu()
+        self.setup_gpu(base_gpu_id)
         setup_file_logging("training", self._rank)
 
     def init(self, args: Namespace, role: str, mooncake_config=None, with_ref: bool = False) -> int:
