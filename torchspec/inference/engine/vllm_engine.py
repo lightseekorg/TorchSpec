@@ -156,11 +156,13 @@ class VllmEngine(InferenceEngine, RayActor):
         # after layer N runs".  vllm's capture hook fires at the INPUT of each
         # listed layer (= output of the previous layer), so we shift by +1 to
         # align with sglang's convention.
-        # Skip the shift for the final layer — it would overflow to
-        # num_hidden_layers, and the append block below handles it correctly.
+        # vllm's `_maybe_add_hidden_state` is called with `layer_idx + 1`
+        # *after* each layer runs, so valid capture indices are
+        # [0, num_hidden_layers]; we keep ids up to num_hidden_layers
+        # (the pre-`norm` slot, see final-layer block below).
         num_layers = _cfg.num_hidden_layers
         self.aux_hidden_state_layer_ids = [
-            lid + 1 for lid in self.aux_hidden_state_layer_ids if lid + 1 < num_layers
+            lid + 1 for lid in self.aux_hidden_state_layer_ids if lid < num_layers
         ]
         if self.rank == 0:
             logger.info(
@@ -169,9 +171,10 @@ class VllmEngine(InferenceEngine, RayActor):
             )
 
         # Append the model's final layer to capture last_hidden_states
-        # (pre-norm) for target logit computation.  No +1 here: training
-        # applies the model's final norm itself.
-        final_layer_id = _cfg.num_hidden_layers - 1
+        # (pre-norm) for target logit computation.  Index `num_hidden_layers`
+        # is vllm's reserved post-last-layer / pre-`norm` slot, so training
+        # can apply the model's final norm itself on top of this.
+        final_layer_id = num_layers
         if final_layer_id not in self.aux_hidden_state_layer_ids:
             self.aux_hidden_state_layer_ids.append(final_layer_id)
             if self.rank == 0:

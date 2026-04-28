@@ -291,6 +291,128 @@ class TestVllmEngineShutdown:
 
 
 # =============================================================================
+# Regression: aux-layer id resolution in VllmEngine.init() (issue #87)
+# =============================================================================
+
+
+class TestAuxLayerIdResolution:
+    """Regression tests for issue #87.
+
+    TorchSpec uses post-layer semantics for aux ids; vLLM's
+    ``_maybe_add_hidden_state`` is called with ``layer_idx + 1`` *after*
+    each layer, so valid capture indices are ``[0, num_hidden_layers]``
+    and index ``num_hidden_layers`` is the pre-``norm`` slot used as
+    ``last_hidden_states`` for target logit computation.
+    """
+
+    @staticmethod
+    def _run_init(
+        monkeypatch,
+        num_hidden_layers: int,
+        aux_layers: list[int] | None = None,
+    ) -> list[int]:
+        """Drive ``VllmEngine.init()`` with heavy deps stubbed and return
+        the resolved ``aux_hidden_state_layer_ids``."""
+        try:
+            from torchspec.inference.engine import vllm_engine as vllm_engine_module
+            from torchspec.inference.engine.vllm_engine import VllmEngine
+        except ImportError as e:
+            pytest.skip(f"VllmEngine import failed: {e}")
+
+        from types import SimpleNamespace
+
+        import transformers
+
+        args = MagicMock()
+        args.target_model_path = "mock-model"
+        args.aux_hidden_states_layers = aux_layers
+        args.trust_remote_code = True
+        args.vllm_pp_size = 1
+        args.vllm_nnodes = 1
+        args.vllm_mem_fraction_static = None
+
+        engine = VllmEngine.__new__(VllmEngine)
+        engine.args = args
+        engine.rank = 0
+        engine.base_gpu_id = None
+        engine.num_gpus_per_engine = 1
+        engine.node_rank = 0
+        engine._engine = None
+        engine._mooncake_config = None
+        engine._hidden_size = None
+        engine.local_gpu_id = None
+
+        # SimpleNamespace lacks `text_config`, so the production
+        # `getattr(_cfg, "text_config", _cfg)` falls through to _cfg itself.
+        stub_cfg = SimpleNamespace(num_hidden_layers=num_hidden_layers)
+        monkeypatch.setattr(
+            transformers.AutoConfig,
+            "from_pretrained",
+            lambda *a, **kw: stub_cfg,
+        )
+        monkeypatch.setattr(
+            vllm_engine_module,
+            "get_default_eagle3_aux_layer_ids",
+            lambda model_path: [
+                1,
+                num_hidden_layers // 2 - 1,
+                num_hidden_layers - 4,
+            ],
+        )
+        monkeypatch.setattr(VllmEngine, "_init_engine", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            VllmEngine, "_get_hidden_size_from_engine", lambda self: 4096
+        )
+
+        engine.init()
+        return engine.aux_hidden_state_layer_ids
+
+    def test_qwen3_8b_default_layers_final_id_is_num_hidden_layers(
+        self, monkeypatch
+    ):
+        """Issue #87: for Qwen3-8B (36 layers) the final aux id must be 36
+        (vllm's pre-`norm` last_hidden_states slot), not 35 which is the
+        input to the last layer."""
+        result = self._run_init(monkeypatch, num_hidden_layers=36)
+        # Default ids = [1, 17, 32] -> +1 -> [2, 18, 33] -> append 36
+        assert result == [2, 18, 33, 36]
+        assert 35 not in result, (
+            "Final id 35 means we captured the input to the last layer "
+            "(off-by-one bug from issue #87), not the pre-norm "
+            "last_hidden_states required for target logit computation."
+        )
+
+    def test_user_passing_final_post_layer_is_kept_not_silently_dropped(
+        self, monkeypatch
+    ):
+        """If the user passes the final post-layer (num_hidden_layers - 1)
+        explicitly, the filter must keep it (mapping to num_hidden_layers
+        in vllm's convention) and the append block must not double-add it."""
+        result = self._run_init(
+            monkeypatch, num_hidden_layers=36, aux_layers=[1, 35]
+        )
+        assert result == [2, 36]
+        assert result.count(36) == 1
+
+    def test_out_of_range_user_ids_dropped_but_final_still_appended(
+        self, monkeypatch
+    ):
+        """User-provided ids that shift past num_hidden_layers are filtered
+        out, but the final-layer slot is still guaranteed."""
+        result = self._run_init(
+            monkeypatch, num_hidden_layers=36, aux_layers=[100]
+        )
+        assert result == [36]
+
+    def test_mid_layer_id_shifted_by_one(self, monkeypatch):
+        """Sanity: a mid-layer post-layer id N maps to vllm capture index N+1."""
+        result = self._run_init(
+            monkeypatch, num_hidden_layers=36, aux_layers=[10]
+        )
+        assert result == [11, 36]
+
+
+# =============================================================================
 # Metadata contract: connector output matches training pipeline expectations
 # =============================================================================
 
