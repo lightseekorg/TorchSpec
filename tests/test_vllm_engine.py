@@ -360,16 +360,12 @@ class TestAuxLayerIdResolution:
             ],
         )
         monkeypatch.setattr(VllmEngine, "_init_engine", lambda *a, **kw: None)
-        monkeypatch.setattr(
-            VllmEngine, "_get_hidden_size_from_engine", lambda self: 4096
-        )
+        monkeypatch.setattr(VllmEngine, "_get_hidden_size_from_engine", lambda self: 4096)
 
         engine.init()
         return engine.aux_hidden_state_layer_ids
 
-    def test_qwen3_8b_default_layers_final_id_is_num_hidden_layers(
-        self, monkeypatch
-    ):
+    def test_qwen3_8b_default_layers_final_id_is_num_hidden_layers(self, monkeypatch):
         """Issue #87: for Qwen3-8B (36 layers) the final aux id must be 36
         (vllm's pre-`norm` last_hidden_states slot), not 35 which is the
         input to the last layer."""
@@ -382,33 +378,23 @@ class TestAuxLayerIdResolution:
             "last_hidden_states required for target logit computation."
         )
 
-    def test_user_passing_final_post_layer_is_kept_not_silently_dropped(
-        self, monkeypatch
-    ):
+    def test_user_passing_final_post_layer_is_kept_not_silently_dropped(self, monkeypatch):
         """If the user passes the final post-layer (num_hidden_layers - 1)
         explicitly, the filter must keep it (mapping to num_hidden_layers
         in vllm's convention) and the append block must not double-add it."""
-        result = self._run_init(
-            monkeypatch, num_hidden_layers=36, aux_layers=[1, 35]
-        )
+        result = self._run_init(monkeypatch, num_hidden_layers=36, aux_layers=[1, 35])
         assert result == [2, 36]
         assert result.count(36) == 1
 
-    def test_out_of_range_user_ids_dropped_but_final_still_appended(
-        self, monkeypatch
-    ):
+    def test_out_of_range_user_ids_dropped_but_final_still_appended(self, monkeypatch):
         """User-provided ids that shift past num_hidden_layers are filtered
         out, but the final-layer slot is still guaranteed."""
-        result = self._run_init(
-            monkeypatch, num_hidden_layers=36, aux_layers=[100]
-        )
+        result = self._run_init(monkeypatch, num_hidden_layers=36, aux_layers=[100])
         assert result == [36]
 
     def test_mid_layer_id_shifted_by_one(self, monkeypatch):
         """Sanity: a mid-layer post-layer id N maps to vllm capture index N+1."""
-        result = self._run_init(
-            monkeypatch, num_hidden_layers=36, aux_layers=[10]
-        )
+        result = self._run_init(monkeypatch, num_hidden_layers=36, aux_layers=[10])
         assert result == [11, 36]
 
 
