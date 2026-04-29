@@ -44,7 +44,7 @@ from torchspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataF
 from torchspec.training.fsdp import init_empty_weights
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-from torchspec.utils.distributed import get_usp_device_mesh
+from torchspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
@@ -109,11 +109,14 @@ class Trainer(abc.ABC):
             self.mesh = usp_mesh
             self.dp_size = getattr(self.args, "dp_size", world_size)
             self.dp_mesh = usp_mesh["draft_dp"]
+            self.grad_sync_mesh = get_usp_grad_sync_mesh()
+            if self.grad_sync_mesh is None:
+                raise RuntimeError("USP grad sync mesh has not been initialized")
             self.dp_group = usp_mesh.get_group("draft_dp")
             self.dp_rank = dist.get_rank(self.dp_group)
             logger.info(
                 f"[Rank {rank}] Device mesh (USP): world_size={world_size}, dp_size={self.dp_size}, "
-                f"dp_rank={self.dp_rank}"
+                f"dp_rank={self.dp_rank}, grad_sync_size={world_size}"
             )
             return
 
@@ -123,6 +126,7 @@ class Trainer(abc.ABC):
         self.mesh = init_device_mesh("cuda", mesh_shape=(self.dp_size,), mesh_dim_names=("dp",))
         self.dp_group = self.mesh.get_group("dp")
         self.dp_mesh = self.mesh
+        self.grad_sync_mesh = self.dp_mesh
 
         logger.info(
             f"[Rank {rank}] Device mesh (1D): world_size={world_size}, dp_size={self.dp_size}"

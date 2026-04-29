@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -2340,8 +2341,14 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             raise ValueError(
                 f"Target hidden states size mismatch: {hidden_states.size(-1)} != expected: {expected_size}"
             )
-
-        return self.fc(hidden_states)
+        if os.environ.get("TORCHSPEC_EAGLE3_PROJ_FP32", "1") in {"0", "false", "False"}:
+            return self.fc(hidden_states.to(self.fc.weight.dtype))
+        proj = F.linear(
+            hidden_states.to(torch.float32),
+            self.fc.weight.to(torch.float32),
+            None if self.fc.bias is None else self.fc.bias.to(torch.float32),
+        )
+        return proj.to(self.fc.weight.dtype)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         norm_hidden_states = self.norm(hidden_states)

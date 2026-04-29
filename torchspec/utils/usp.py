@@ -33,8 +33,6 @@ def split_usp_batch(
     end = min(start + local_len, global_len)
 
     loss_mask = loss_mask[:, :global_len].clone()
-    if loss_mask.numel() > 0:
-        loss_mask[:, global_len - 1] = 0
 
     def _slice_and_pad(tensor: torch.Tensor, axis: int, pad_value: int = 0):
         if tensor.dim() == 1:

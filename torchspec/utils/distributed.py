@@ -25,6 +25,7 @@ GLOO_GROUP = None
 _TP_DEVICE_MESH = None
 _TP_GROUP = None
 _USP_DEVICE_MESH = None
+_USP_GRAD_SYNC_MESH = None
 _DRAFT_SP_GROUP = None
 _DRAFT_SP_SCALAR_GROUP = None
 _SP_ULYSSES_GROUP = None
@@ -60,6 +61,11 @@ def get_tp_device_mesh():
 def get_usp_device_mesh():
     global _USP_DEVICE_MESH
     return _USP_DEVICE_MESH
+
+
+def get_usp_grad_sync_mesh():
+    global _USP_GRAD_SYNC_MESH
+    return _USP_GRAD_SYNC_MESH
 
 
 def _build_usp_group_ranks(
@@ -98,12 +104,14 @@ def _build_usp_group_ranks(
 
 def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
     global _USP_DEVICE_MESH
+    global _USP_GRAD_SYNC_MESH
     global _DRAFT_SP_GROUP, _DRAFT_SP_SCALAR_GROUP
     global _SP_ULYSSES_GROUP, _SP_RING_GROUP
 
     sp_size = sp_ulysses_size * sp_ring_size
     if sp_size == 1:
         _USP_DEVICE_MESH = None
+        _USP_GRAD_SYNC_MESH = None
         _DRAFT_SP_GROUP = None
         _DRAFT_SP_SCALAR_GROUP = None
         _SP_ULYSSES_GROUP = None
@@ -142,6 +150,11 @@ def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
         mesh_dim_names=("draft_dp", "draft_sp"),
     )
     _DRAFT_SP_GROUP = _USP_DEVICE_MESH.get_group("draft_sp")
+    _USP_GRAD_SYNC_MESH = dist.device_mesh.init_device_mesh(
+        "cuda",
+        (world_size,),
+        mesh_dim_names=("draft_dp_with_sp",),
+    )
 
     import yunchang
     from yunchang.globals import PROCESS_GROUP as YUNCHANG_PROCESS_GROUP

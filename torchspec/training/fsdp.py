@@ -28,6 +28,16 @@ import torch.nn as nn
 from torchspec.utils.logging import logger
 
 
+def _allreduce_with_divide_factor_hook(state: dict, bucket: dist.GradBucket):
+    tensor = bucket.buffer()
+    tensor.div_(state["divide_factor"])
+    return (
+        dist.all_reduce(tensor, group=state["process_group"], async_op=True)
+        .get_future()
+        .then(lambda fut: fut.value()[0])
+    )
+
+
 @contextmanager
 def _init_on_device(device: torch.device, include_buffers: Optional[bool] = False):
     if include_buffers:
@@ -165,6 +175,27 @@ def apply_fsdp2(
     if strategy == "REPLICATE":
         logger.info("Using REPLICATE strategy (DDP-like, gradient all-reduce only)")
         replicate(model, device_mesh=mesh)
+        if args is not None and getattr(args, "attention_backend", None) == "usp":
+            sp_size = getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
+            if sp_size > 1:
+                process_group = mesh.get_group() if mesh is not None else dist.group.WORLD
+                divide_factor = dist.get_world_size(process_group) // sp_size
+                if divide_factor <= 0:
+                    raise ValueError(
+                        f"Invalid USP grad divide factor: world_size="
+                        f"{dist.get_world_size(process_group)}, sp_size={sp_size}"
+                    )
+                model.register_comm_hook(
+                    {
+                        "process_group": process_group,
+                        "divide_factor": divide_factor,
+                    },
+                    _allreduce_with_divide_factor_hook,
+                )
+                logger.info(
+                    "Registered USP replicate grad hook "
+                    f"(all_reduce / {divide_factor}, sp_size={sp_size})"
+                )
         return model
     elif strategy != "FULL_SHARD":
         raise ValueError(f"Unknown fsdp_strategy: {strategy}. Use 'FULL_SHARD' or 'REPLICATE'")
