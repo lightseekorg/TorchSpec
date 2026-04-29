@@ -28,7 +28,7 @@ export SGLANG_DISABLE_CUDNN_CHECK="${SGLANG_DISABLE_CUDNN_CHECK:-1}"
 mkdir -p "$SGLANG_DG_CACHE_DIR"
 
 RAY_TMP_ROOT="${RAY_TMP_ROOT:-/tmp}"
-RAY_TEMP_DIR="${RAY_TEMP_DIR:-$RAY_TMP_ROOT/ray_ts_l31_usp_u2_fix_grad_proj_bf16_only_$(id -u)}"
+RAY_TEMP_DIR="${RAY_TEMP_DIR:-$RAY_TMP_ROOT/ray_l31_bf16_$(id -u)}"
 export RAY_TMPDIR="$RAY_TEMP_DIR"
 export RAY_TEMP_DIR="$RAY_TMPDIR"
 mkdir -p "$RAY_TEMP_DIR"
