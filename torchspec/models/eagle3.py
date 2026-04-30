@@ -34,7 +34,6 @@ from torchspec.models.ops.loss import (
 )
 from torchspec.utils.distributed import (
     get_draft_sp_group,
-    get_draft_sp_scalar_group,
     get_sp_ulysses_group,
 )
 from torchspec.utils.tensor import padding
@@ -71,7 +70,6 @@ class Eagle3Model(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.vocab_pruning = draft_model.vocab_size != draft_model.target_vocab_size
         self._usp_sp_group = get_draft_sp_group() if attention_backend == "usp" else None
-        self._usp_scalar_group = get_draft_sp_scalar_group() if attention_backend == "usp" else None
         self._usp_ulysses_group = get_sp_ulysses_group() if attention_backend == "usp" else None
         self._usp_ulysses_world_size = (
             dist.get_world_size(self._usp_ulysses_group)
@@ -276,21 +274,16 @@ class Eagle3Model(nn.Module):
                 else local_correct.detach().float() * 0.0
             )
 
-            if self.attention_backend == "usp" and self._usp_scalar_group is not None:
-                reduced_sum_loss = local_sum_loss.detach().clone().float()
-                reduced_correct = local_correct.detach().clone().float()
-                reduced_count = local_count.detach().clone().float()
-                dist.all_reduce(reduced_sum_loss, op=dist.ReduceOp.SUM, group=self._usp_sp_group)
-                dist.all_reduce(
-                    reduced_correct,
-                    op=dist.ReduceOp.SUM,
-                    group=self._usp_scalar_group,
+            if self._usp_sp_group is not None:
+                reduced_stats = torch.stack(
+                    (
+                        local_sum_loss.detach().clone().float(),
+                        local_correct.detach().clone().float(),
+                        local_count.detach().clone().float(),
+                    )
                 )
-                dist.all_reduce(
-                    reduced_count,
-                    op=dist.ReduceOp.SUM,
-                    group=self._usp_scalar_group,
-                )
+                dist.all_reduce(reduced_stats, op=dist.ReduceOp.SUM, group=self._usp_sp_group)
+                reduced_sum_loss, reduced_correct, reduced_count = reduced_stats.unbind()
                 denom = reduced_count.clamp_min(1.0)
                 loss = (local_sum_loss / denom).to(loss.dtype)
                 if reduced_count.item() > 0:

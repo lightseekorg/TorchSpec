@@ -27,7 +27,6 @@ _TP_GROUP = None
 _USP_DEVICE_MESH = None
 _USP_GRAD_SYNC_MESH = None
 _DRAFT_SP_GROUP = None
-_DRAFT_SP_SCALAR_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
 
@@ -105,7 +104,7 @@ def _build_usp_group_ranks(
 def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
     global _USP_DEVICE_MESH
     global _USP_GRAD_SYNC_MESH
-    global _DRAFT_SP_GROUP, _DRAFT_SP_SCALAR_GROUP
+    global _DRAFT_SP_GROUP
     global _SP_ULYSSES_GROUP, _SP_RING_GROUP
 
     sp_size = sp_ulysses_size * sp_ring_size
@@ -113,7 +112,6 @@ def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
         _USP_DEVICE_MESH = None
         _USP_GRAD_SYNC_MESH = None
         _DRAFT_SP_GROUP = None
-        _DRAFT_SP_SCALAR_GROUP = None
         _SP_ULYSSES_GROUP = None
         _SP_RING_GROUP = None
         return None, None, None
@@ -130,19 +128,8 @@ def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
     draft_dp_size = world_size // sp_size
 
     _DRAFT_SP_GROUP = None
-    _DRAFT_SP_SCALAR_GROUP = None
     _SP_ULYSSES_GROUP = None
     _SP_RING_GROUP = None
-
-    draft_sp_groups, _, _ = _build_usp_group_ranks(
-        world_size=world_size,
-        sp_ulysses_size=sp_ulysses_size,
-        sp_ring_size=sp_ring_size,
-    )
-    for ranks in draft_sp_groups:
-        scalar_group = dist.new_group(ranks=ranks, backend="gloo")
-        if rank in ranks:
-            _DRAFT_SP_SCALAR_GROUP = scalar_group
 
     _USP_DEVICE_MESH = dist.device_mesh.init_device_mesh(
         "cuda",
@@ -176,11 +163,6 @@ def init_usp_groups(sp_ulysses_size: int = 1, sp_ring_size: int = 1):
 def get_draft_sp_group():
     global _DRAFT_SP_GROUP
     return _DRAFT_SP_GROUP
-
-
-def get_draft_sp_scalar_group():
-    global _DRAFT_SP_SCALAR_GROUP
-    return _DRAFT_SP_SCALAR_GROUP
 
 
 def get_sp_ulysses_group():
