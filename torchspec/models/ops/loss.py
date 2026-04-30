@@ -22,6 +22,16 @@ import torch
 import torch.nn.functional as F
 
 
+def _forward_kl_from_logits(logits: torch.Tensor, target_p: torch.Tensor) -> torch.Tensor:
+    logits_f32 = logits.float()
+    return torch.logsumexp(logits_f32, dim=-1) - (target_p * logits_f32).sum(-1)
+
+
+def _softmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    logits_f32 = logits.float()
+    return torch.exp(logits_f32 - torch.logsumexp(logits_f32, dim=-1, keepdim=True))
+
+
 @torch.compile(dynamic=None)
 def compiled_sum_forward_kl_loss(
     prenorm_hidden_states_flat,
@@ -40,8 +50,7 @@ def compiled_sum_forward_kl_loss(
     norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
 
     logits = F.linear(norm_hs, lm_head_weight)
-    log_p = F.log_softmax(logits.float(), dim=-1)
-    token_loss = -(tp * log_p).sum(-1)
+    token_loss = _forward_kl_from_logits(logits, tp)
     correct = (logits.argmax(-1) == tp.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
     return token_loss.sum(), correct.sum(), count
@@ -80,8 +89,7 @@ def compiled_forward_kl_loss(
 
     logits = F.linear(norm_hs, lm_head_weight)  # (N, V_out)
 
-    log_p = F.log_softmax(logits.float(), dim=-1)
-    token_loss = -(tp * log_p).sum(-1)
+    token_loss = _forward_kl_from_logits(logits, tp)
     correct = (logits.argmax(-1) == tp.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
     return token_loss.sum(), correct.sum(), count
@@ -100,7 +108,8 @@ def compiled_sum_forward_kl_loss_from_hs(
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     ths = target_hidden_states_flat.index_select(0, valid_idx)
 
-    tp = F.softmax(F.linear(ths, target_lm_head_weight).float(), dim=-1)
+    target_logits = F.linear(ths, target_lm_head_weight)
+    tp = _softmax_from_logits(target_logits)
 
     hs_f32 = hs.float()
     variance = hs_f32.pow(2).mean(-1, keepdim=True)
@@ -108,9 +117,8 @@ def compiled_sum_forward_kl_loss_from_hs(
     norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
 
     logits = F.linear(norm_hs, lm_head_weight)
-    log_p = F.log_softmax(logits.float(), dim=-1)
-    token_loss = -(tp * log_p).sum(-1)
-    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    token_loss = _forward_kl_from_logits(logits, tp)
+    correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
     return token_loss.sum(), correct.sum(), count
 
@@ -138,7 +146,8 @@ def compiled_forward_kl_loss_from_hs(
     ths = target_hidden_states_flat.index_select(0, valid_idx)
 
     # Target probs (detached weights → no grad flows through target)
-    tp = F.softmax(F.linear(ths, target_lm_head_weight).float(), dim=-1)
+    target_logits = F.linear(ths, target_lm_head_weight)
+    tp = _softmax_from_logits(target_logits)
 
     # RMSNorm
     hs_f32 = hs.float()
@@ -148,8 +157,7 @@ def compiled_forward_kl_loss_from_hs(
 
     logits = F.linear(norm_hs, lm_head_weight)
 
-    log_p = F.log_softmax(logits.float(), dim=-1)
-    token_loss = -(tp * log_p).sum(-1)
-    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    token_loss = _forward_kl_from_logits(logits, tp)
+    correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
     return token_loss.sum(), correct.sum(), count
