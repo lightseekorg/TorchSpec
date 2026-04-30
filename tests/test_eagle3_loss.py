@@ -102,9 +102,11 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         raw_logits = F.linear(hs.float(), lm_head_weight.float())
         target_p = F.softmax(raw_logits + torch.randn_like(raw_logits) * 0.5, dim=-1)
 
-        loss, acc = compiled_forward_kl_loss(
+        loss_sum, correct, count = compiled_forward_kl_loss(
             hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
         )
+        loss = loss_sum / count
+        acc = correct / count
         ref_loss, ref_acc = _reference_forward_kl_loss(
             hs, target_p, norm_weight, lm_head_weight, norm_eps
         )
@@ -131,9 +133,11 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         target_p = F.softmax(logits, dim=-1)
         expected_entropy = -(target_p * target_p.log()).sum(-1).mean()
 
-        loss, acc = compiled_forward_kl_loss(
+        loss_sum, correct, count = compiled_forward_kl_loss(
             hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
         )
+        loss = loss_sum / count
+        acc = correct / count
         torch.testing.assert_close(loss, expected_entropy, atol=1e-3, rtol=1e-3)
         self.assertAlmostEqual(acc.item(), 1.0, places=2)
 
@@ -146,9 +150,11 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         target_p = F.softmax(torch.randn(N, V), dim=-1)
         valid_idx = torch.arange(N)
 
-        loss, acc = compiled_forward_kl_loss(
+        loss_sum, correct, count = compiled_forward_kl_loss(
             hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6
         )
+        loss = loss_sum / count
+        acc = correct / count
         self.assertTrue(torch.isfinite(loss))
         self.assertGreaterEqual(loss.item(), 0.0)
         self.assertGreaterEqual(acc.item(), 0.0)
@@ -230,7 +236,7 @@ class TestLazyVsPrecomputedTarget(unittest.TestCase):
 
         precomputed = PrecomputedTarget(target_p_padded)
         with torch.no_grad():
-            plosses_pre, _, acces_pre = model(
+            plosses_pre, _, acces_pre, _ = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 target=precomputed,
@@ -244,7 +250,7 @@ class TestLazyVsPrecomputedTarget(unittest.TestCase):
             length,
         )
         with torch.no_grad():
-            plosses_lazy, _, acces_lazy = model(
+            plosses_lazy, _, acces_lazy, _ = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 target=lazy,
@@ -376,7 +382,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
         tp_flat = F.softmax(torch.randn(self.BT, self.V), dim=-1)
         norm_eps = 1e-6
 
-        loss, acc = compiled_forward_kl_loss(
+        loss_sum, correct, count = compiled_forward_kl_loss(
             hs_flat,
             tp_flat,
             valid_idx,
@@ -384,11 +390,13 @@ class TestValidIdxSubsetting(unittest.TestCase):
             lm_head_weight,
             norm_eps,
         )
+        loss = loss_sum / count
+        acc = correct / count
 
         hs_valid = hs_flat[valid_idx]
         tp_valid = tp_flat[valid_idx]
         all_idx = torch.arange(hs_valid.shape[0])
-        loss_ref, acc_ref = compiled_forward_kl_loss(
+        loss_sum_ref, correct_ref, count_ref = compiled_forward_kl_loss(
             hs_valid,
             tp_valid,
             all_idx,
@@ -396,6 +404,8 @@ class TestValidIdxSubsetting(unittest.TestCase):
             lm_head_weight,
             norm_eps,
         )
+        loss_ref = loss_sum_ref / count_ref
+        acc_ref = correct_ref / count_ref
 
         torch.testing.assert_close(loss, loss_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(acc, acc_ref, atol=1e-5, rtol=1e-5)
@@ -409,7 +419,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
         target_lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
         norm_eps = 1e-6
 
-        loss, acc = compiled_forward_kl_loss_from_hs(
+        loss_sum, correct, count = compiled_forward_kl_loss_from_hs(
             hs_flat,
             ths_flat,
             valid_idx,
@@ -418,11 +428,13 @@ class TestValidIdxSubsetting(unittest.TestCase):
             target_lm_head_weight,
             norm_eps,
         )
+        loss = loss_sum / count
+        acc = correct / count
 
         hs_valid = hs_flat[valid_idx]
         ths_valid = ths_flat[valid_idx]
         all_idx = torch.arange(hs_valid.shape[0])
-        loss_ref, acc_ref = compiled_forward_kl_loss_from_hs(
+        loss_sum_ref, correct_ref, count_ref = compiled_forward_kl_loss_from_hs(
             hs_valid,
             ths_valid,
             all_idx,
@@ -431,6 +443,8 @@ class TestValidIdxSubsetting(unittest.TestCase):
             target_lm_head_weight,
             norm_eps,
         )
+        loss_ref = loss_sum_ref / count_ref
+        acc_ref = correct_ref / count_ref
 
         torch.testing.assert_close(loss, loss_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(acc, acc_ref, atol=1e-5, rtol=1e-5)
