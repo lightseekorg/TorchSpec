@@ -277,9 +277,9 @@ class Eagle3Model(nn.Module):
             )
 
             if self.attention_backend == "usp" and self._usp_scalar_group is not None:
-                reduced_sum_loss = local_sum_loss.detach().float()
-                reduced_correct = local_correct.detach().float()
-                reduced_count = local_count.detach().float()
+                reduced_sum_loss = local_sum_loss.detach().clone().float()
+                reduced_correct = local_correct.detach().clone().float()
+                reduced_count = local_count.detach().clone().float()
                 dist.all_reduce(reduced_sum_loss, op=dist.ReduceOp.SUM, group=self._usp_sp_group)
                 dist.all_reduce(
                     reduced_correct,
