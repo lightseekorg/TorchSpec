@@ -19,16 +19,20 @@
 # SOFTWARE.
 
 from torchspec.models.ops.flex_attention import (
+    build_eagle3_block_mask,
     compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
+    eagle3_block_mask,
     generate_eagle3_mask,
 )
 from torchspec.models.ops.loss import compiled_forward_kl_loss
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 __all__ = [
+    "build_eagle3_block_mask",
     "compile_friendly_create_block_mask",
     "compile_friendly_flex_attention",
+    "eagle3_block_mask",
     "generate_eagle3_mask",
     "compiled_forward_kl_loss",
     "compute_assistant_loss_mask",

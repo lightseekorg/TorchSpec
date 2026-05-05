@@ -30,8 +30,8 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 from torchspec.models.draft.base import Eagle3DraftModel
 from torchspec.models.ops.flex_attention import (
-    compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
+    eagle3_block_mask,
     generate_eagle3_mask,
 )
 from torchspec.utils.logging import logger, print_with_rank
@@ -1410,27 +1410,16 @@ class LlamaFlexAttention(LlamaAttention):
         # Shrink the attention mask to align with the padding to the right.
         # This is equivalent to the shrinking logic in eagle3.py
         seq_lengths -= lck
-        # TODO: Remove the usage of uncompiled create_block_mask after
-        # https://github.com/pytorch/pytorch/issues/160018
-        if q_len <= 128:
-            create_block_mask_func = create_block_mask
-            flex_attention_func = flex_attention
-        else:
-            create_block_mask_func = compile_friendly_create_block_mask
-            flex_attention_func = compile_friendly_flex_attention
+        flex_attention_func = flex_attention if q_len <= 128 else compile_friendly_flex_attention
 
-        block_mask = create_block_mask_func(
-            mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths,
-                Q_LEN=q_len,
-                KV_LEN=key_cache.shape[-2],
-                lck=lck,
-            ),
-            B=bsz,
-            H=1,  # Rely on broadcast
+        block_mask = eagle3_block_mask(
             Q_LEN=q_len,
             KV_LEN=key_cache.shape[-2],
+            B=bsz,
+            H=1,  # Rely on broadcast
             device=query_states.device,
+            seq_lengths=seq_lengths,
+            lck=lck,
         )
         attn_output = flex_attention_func(
             query=query_states,

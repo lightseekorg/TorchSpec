@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import flex_attention
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
 from torchspec.models.draft.base import Eagle3DraftModel
@@ -50,9 +50,8 @@ from torchspec.models.draft.llama3_eagle import (
     yarn_get_mscale,
 )
 from torchspec.models.ops.flex_attention import (
-    compile_friendly_create_block_mask,
     compile_friendly_flex_attention,
-    generate_eagle3_mask,
+    eagle3_block_mask,
 )
 from torchspec.utils.logging import logger, print_with_rank
 
@@ -387,7 +386,8 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
       cache_keys:   [B, H, total_seq, qk_head_dim]
       cache_values: [B, H, total_seq, v_head_dim]
 
-    EAGLE3 mask pattern is handled by generate_eagle3_mask + create_block_mask.
+    EAGLE3 mask pattern is handled by eagle3_block_mask (analytical when shapes
+    align to BLOCK_SIZE/Q_LEN, create_block_mask fallback otherwise).
     """
 
     def forward(
@@ -423,25 +423,16 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
         seq_lengths = attention_mask.sum(dim=-1)
         seq_lengths -= lck
 
-        if q_len <= 128:
-            create_block_mask_func = create_block_mask
-            flex_attention_func = flex_attention
-        else:
-            create_block_mask_func = compile_friendly_create_block_mask
-            flex_attention_func = compile_friendly_flex_attention
+        flex_attention_func = flex_attention if q_len <= 128 else compile_friendly_flex_attention
 
-        block_mask = create_block_mask_func(
-            mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths,
-                Q_LEN=q_len,
-                KV_LEN=key_cache.shape[-2],
-                lck=lck,
-            ),
-            B=bsz,
-            H=1,  # Rely on broadcast
+        block_mask = eagle3_block_mask(
             Q_LEN=q_len,
             KV_LEN=key_cache.shape[-2],
+            B=bsz,
+            H=1,  # Rely on broadcast
             device=query_states.device,
+            seq_lengths=seq_lengths,
+            lck=lck,
         )
 
         attn_output = flex_attention_func(
