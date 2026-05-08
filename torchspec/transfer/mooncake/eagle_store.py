@@ -27,6 +27,8 @@ import torch
 from torchspec.transfer.mooncake.helpers import _format_bytes
 from torchspec.transfer.mooncake.store import MooncakeHiddenStateStore
 from torchspec.utils.logging import logger
+from torchspec.utils.distributed import get_usp_rank_coords
+from torchspec.utils.usp import split_usp_batch
 
 if TYPE_CHECKING:
     from torchspec.models.target.eagle3_target_model import Eagle3TargetOutput
@@ -65,6 +67,138 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
     """
 
     TENSOR_SUFFIXES = ["_hs", "_tgt", "_ids", "_lhs"]
+
+    def _put_raw_tensors(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
+        if self._gpu_direct_available and self._gpu_send_buffer is not None:
+            buf = self._gpu_send_buffer
+            buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+            self._do_sync_batch_put(keys, buffer_ptrs, sizes)
+        elif self._host_buffer_pool is None or self._async_put_manager is None:
+            raise RuntimeError(
+                "put() requires either GPU Direct (enable_gpu_direct=True) or "
+                "async host-buffer puts (async_put_pool_size > 0). "
+                "Current config has async_put_pool_size=0 and GPU Direct is "
+                f"{'enabled but gpu_send_buffer failed to initialize' if self._gpu_direct_available else 'disabled'}. "
+                "Set async_put_pool_size >= 1 or enable GPU Direct."
+            )
+        else:
+            buf = self._host_buffer_pool.get_buffer()
+            self._async_put_manager.check_last_error()
+            self._async_put_manager.wait_for_buffer(buf.ptr)
+
+            compute_event = torch.cuda.Event()
+            compute_event.record()
+
+            with torch.cuda.stream(self._copy_stream):
+                self._copy_stream.wait_event(compute_event)
+                buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+                copy_done = torch.cuda.Event()
+                copy_done.record()
+
+            for t in tensors:
+                if t.is_cuda:
+                    t.record_stream(self._copy_stream)
+
+            self._async_put_manager.submit(
+                keys,
+                buffer_ptrs,
+                sizes,
+                buf.ptr,
+                wait_event=copy_done,
+                device_index=self._copy_stream.device.index,
+            )
+
+    def put_usp_shards(
+        self,
+        key: str,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor],
+        target: Optional[torch.Tensor],
+        *,
+        sp_size: int,
+        sp_ring_size: int,
+        ttt_length: int,
+        max_seq_length: Optional[int],
+    ) -> Dict[str, Any]:
+        self._ensure_initialized()
+        logger.debug("put_usp_shards: starting for key=%s, sp_size=%s", key, sp_size)
+
+        if hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE:
+            hidden_states = hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
+        if (
+            last_hidden_states is not None
+            and last_hidden_states.dtype != HIDDEN_STATES_STORAGE_DTYPE
+        ):
+            last_hidden_states = last_hidden_states.to(HIDDEN_STATES_STORAGE_DTYPE)
+        if target is not None and target.dtype != HIDDEN_STATES_STORAGE_DTYPE:
+            target = target.to(HIDDEN_STATES_STORAGE_DTYPE)
+
+        target_hs = last_hidden_states if last_hidden_states is not None else target
+        if target_hs is None:
+            raise ValueError("USP sharded Mooncake storage requires last_hidden_states or target")
+
+        if input_ids.dim() == 2:
+            loss_mask_len = input_ids.shape[-1]
+        else:
+            loss_mask_len = input_ids.shape[0]
+        dummy_loss_mask = torch.ones((1, loss_mask_len), dtype=torch.long, device=input_ids.device)
+        sp_ulysses_size = max(1, sp_size // sp_ring_size)
+
+        for sp_rank in range(sp_size):
+            _, ring_rank = get_usp_rank_coords(
+                sp_rank=sp_rank,
+                sp_ulysses_size=sp_ulysses_size,
+                sp_ring_size=sp_ring_size,
+            )
+            (
+                shard_input_ids,
+                _attention_mask,
+                _loss_mask,
+                shard_hidden_states,
+                shard_target_hs,
+                _position_ids,
+            ) = split_usp_batch(
+                input_ids=input_ids,
+                loss_mask=dummy_loss_mask,
+                hidden_states=hidden_states,
+                target_hidden_states=target_hs,
+                ttt_length=ttt_length,
+                sp_rank=sp_rank,
+                sp_size=sp_size,
+                ring_rank=ring_rank,
+                sp_ring_size=sp_ring_size,
+                max_len=max_seq_length,
+            )
+
+            shard_key = f"{key}_usp{sp_rank}"
+            keys = [f"{shard_key}_hs", f"{shard_key}_ids"]
+            tensors = [shard_hidden_states, shard_input_ids]
+            if last_hidden_states is not None:
+                keys.append(f"{shard_key}_lhs")
+                tensors.append(shard_target_hs)
+            else:
+                keys.append(f"{shard_key}_tgt")
+                tensors.append(shard_target_hs)
+            self._put_raw_tensors(keys, tensors)
+
+        shapes = {
+            "hidden_states": tuple(hidden_states.shape),
+            "input_ids": tuple(input_ids.shape),
+        }
+        dtypes = {
+            "hidden_states": hidden_states.dtype,
+            "input_ids": input_ids.dtype,
+        }
+        if target is not None:
+            shapes["target"] = tuple(target.shape)
+            dtypes["target"] = target.dtype
+        if last_hidden_states is not None:
+            shapes["last_hidden_states"] = tuple(last_hidden_states.shape)
+            dtypes["last_hidden_states"] = last_hidden_states.dtype
+
+        logger.debug("put_usp_shards: completed key=%s, shapes=%s", key, shapes)
+        return {"shapes": shapes, "dtypes": dtypes}
 
     def put(
         self,
@@ -112,46 +246,7 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
             keys.append(f"{key}_lhs")
             tensors.append(last_hidden_states)
 
-        if self._gpu_direct_available and self._gpu_send_buffer is not None:
-            buf = self._gpu_send_buffer
-            buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
-            self._do_sync_batch_put(keys, buffer_ptrs, sizes)
-        elif self._host_buffer_pool is None or self._async_put_manager is None:
-            raise RuntimeError(
-                "put() requires either GPU Direct (enable_gpu_direct=True) or "
-                "async host-buffer puts (async_put_pool_size > 0). "
-                "Current config has async_put_pool_size=0 and GPU Direct is "
-                f"{'enabled but gpu_send_buffer failed to initialize' if self._gpu_direct_available else 'disabled'}. "
-                "Set async_put_pool_size >= 1 or enable GPU Direct."
-            )
-        else:
-            buf = self._host_buffer_pool.get_buffer()
-            self._async_put_manager.check_last_error()
-            self._async_put_manager.wait_for_buffer(buf.ptr)
-
-            # Stage DtoH on a dedicated stream so the default (compute) stream
-            # is free to run the next prefill concurrently.
-            compute_event = torch.cuda.Event()
-            compute_event.record()
-
-            with torch.cuda.stream(self._copy_stream):
-                self._copy_stream.wait_event(compute_event)
-                buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
-                copy_done = torch.cuda.Event()
-                copy_done.record()
-
-            for t in tensors:
-                if t.is_cuda:
-                    t.record_stream(self._copy_stream)
-
-            self._async_put_manager.submit(
-                keys,
-                buffer_ptrs,
-                sizes,
-                buf.ptr,
-                wait_event=copy_done,
-                device_index=self._copy_stream.device.index,
-            )
+        self._put_raw_tensors(keys, tensors)
 
         shapes = {
             "hidden_states": tuple(hidden_states.shape),

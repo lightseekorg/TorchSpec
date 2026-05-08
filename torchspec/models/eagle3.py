@@ -265,6 +265,11 @@ class Eagle3Model(nn.Module):
                 lm_head_weight=lm_head_weight,
                 norm_eps=norm_eps,
             )
+            if self.attention_backend == "usp":
+                # A shard can have no local loss tokens while its Ulysses peers do.
+                # Keep the zero-loss path connected to this layer's activations so
+                # autograd still executes the same sequence-parallel collectives.
+                local_sum_loss = local_sum_loss + hidden_states.sum() * 0.0
 
             loss = local_sum_loss / local_count.clamp_min(1.0)
             metric_loss = loss.detach()

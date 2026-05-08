@@ -834,6 +834,37 @@ index d79f929d3..45c17b76b 100644
 +        else:
 +            req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
 +
++    def _put_spec_training_mooncake(
++        self: Scheduler,
++        key: str,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor,
++        last_hidden_states: Optional[torch.Tensor],
++    ):
++        import os
++
++        if os.getenv("TORCHSPEC_USP_SHARDED_MOONCAKE") == "1":
++            max_seq_raw = os.environ.get("TORCHSPEC_USP_MAX_SEQ_LENGTH")
++            self.eagle_mooncake_store.put_usp_shards(
++                key=key,
++                hidden_states=hidden_states,
++                input_ids=input_ids,
++                last_hidden_states=last_hidden_states,
++                target=None,
++                sp_size=int(os.environ["TORCHSPEC_USP_SP_SIZE"]),
++                sp_ring_size=int(os.environ.get("TORCHSPEC_USP_RING_SIZE", "1")),
++                ttt_length=int(os.environ.get("TORCHSPEC_USP_TTT_LENGTH", "1")),
++                max_seq_length=int(max_seq_raw) if max_seq_raw else None,
++            )
++            return
++
++        self.eagle_mooncake_store.put(
++            key=key,
++            hidden_states=hidden_states,
++            input_ids=input_ids,
++            last_hidden_states=last_hidden_states,
++        )
++
 +    def _send_hidden_states_to_mooncake(
 +        self: Scheduler,
 +        req: Req,
@@ -863,7 +894,7 @@ index d79f929d3..45c17b76b 100644
 +        if hidden_states.is_cuda and copy_done_event is not None:
 +            torch.cuda.current_stream().wait_event(copy_done_event)
 +
-+        self.eagle_mooncake_store.put(
++        self._put_spec_training_mooncake(
 +            key=key,
 +            hidden_states=hidden_states,
 +            input_ids=input_ids,
@@ -931,7 +962,7 @@ index d79f929d3..45c17b76b 100644
 +            f"lhs={tuple(all_last_hidden_states.shape) if all_last_hidden_states is not None else None}, "
 +            f"prompt={len(req.origin_input_ids)}, output={len(req.output_ids)}"
 +        )
-+        self.eagle_mooncake_store.put(
++        self._put_spec_training_mooncake(
 +            key=key,
 +            hidden_states=all_hidden_states,
 +            input_ids=input_ids,

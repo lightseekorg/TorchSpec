@@ -184,7 +184,7 @@ class Trainer(abc.ABC):
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
         prefetch_depth = getattr(self.args, "prefetch_depth", 0)
         gpu_device = torch.cuda.current_device()
@@ -241,7 +241,7 @@ class Trainer(abc.ABC):
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
         self._eval_data_fetcher = MooncakeDataFetcher(
             queue=queue,

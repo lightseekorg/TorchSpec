@@ -227,6 +227,28 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
 
         # Protected keys — always set by TorchSpec, never overridable
         max_seq_length = getattr(self.args, "max_seq_length", None)
+        usp_sharded_mooncake = getattr(self.args, "attention_backend", None) == "usp"
+        if usp_sharded_mooncake:
+            sp_size = getattr(self.args, "sp_ulysses_size", 1) * getattr(
+                self.args, "sp_ring_size", 1
+            )
+            os.environ["TORCHSPEC_USP_SHARDED_MOONCAKE"] = "1"
+            os.environ["TORCHSPEC_USP_SP_SIZE"] = str(sp_size)
+            os.environ["TORCHSPEC_USP_RING_SIZE"] = str(getattr(self.args, "sp_ring_size", 1))
+            os.environ["TORCHSPEC_USP_TTT_LENGTH"] = str(getattr(self.args, "ttt_length", 1))
+            if max_seq_length is not None:
+                os.environ["TORCHSPEC_USP_MAX_SEQ_LENGTH"] = str(max_seq_length)
+            else:
+                os.environ.pop("TORCHSPEC_USP_MAX_SEQ_LENGTH", None)
+        else:
+            for name in (
+                "TORCHSPEC_USP_SHARDED_MOONCAKE",
+                "TORCHSPEC_USP_SP_SIZE",
+                "TORCHSPEC_USP_RING_SIZE",
+                "TORCHSPEC_USP_TTT_LENGTH",
+                "TORCHSPEC_USP_MAX_SEQ_LENGTH",
+            ):
+                os.environ.pop(name, None)
 
         engine_kwargs.update(
             {
@@ -465,6 +487,8 @@ class SglEngine(SglDecodeEngineMixin, InferenceEngine, RayActor):
                     "tensor_shapes": tensor_shapes,
                     "tensor_dtypes": self._get_tensor_dtypes(),
                 }
+                if getattr(self.args, "attention_backend", None) == "usp":
+                    output["metadata"] = {"usp_sharded": True}
                 outputs.append(output)
 
         logger.debug(

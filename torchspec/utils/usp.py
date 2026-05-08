@@ -59,10 +59,12 @@ def split_usp_batch(
     loss_mask, _ = _slice_and_pad(loss_mask, axis=1, pad_value=0)
     if hidden_states.dim() == 2:
         hidden_states, _ = _slice_and_pad(hidden_states, axis=0, pad_value=0)
+        hidden_states = hidden_states.unsqueeze(0)
     else:
         hidden_states, _ = _slice_and_pad(hidden_states, axis=1, pad_value=0)
     if target_hidden_states.dim() == 2:
         target_hidden_states, _ = _slice_and_pad(target_hidden_states, axis=0, pad_value=0)
+        target_hidden_states = target_hidden_states.unsqueeze(0)
     else:
         target_hidden_states, _ = _slice_and_pad(target_hidden_states, axis=1, pad_value=0)
 

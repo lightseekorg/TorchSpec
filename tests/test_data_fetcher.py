@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
+from torchspec.data.utils import pack_loss_mask, serialize_packed_loss_mask
 from torchspec.training.data_fetcher import (
     MooncakeDataFetcher,
     MooncakeDataset,
@@ -141,6 +142,71 @@ class TestMooncakeDataset:
         samples = list(dataset)
 
         assert len(samples) == 1
+
+    def test_usp_sharded_keeps_local_zero_loss_shard_when_global_loss_exists(self):
+        """A local all-zero USP shard must not be skipped independently.
+
+        With SP=2, the first rank can own only prompt tokens while the second
+        rank owns loss-bearing response tokens.  If rank 0 skips locally and
+        rank 1 trains, subsequent USP collectives are ordered differently.
+        """
+        full_loss_mask = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+        packed_loss_mask = serialize_packed_loss_mask(pack_loss_mask(full_loss_mask))
+        sample = TrainSample(
+            mooncake_key="sample",
+            tensor_shapes={
+                "input_ids": (1, 8),
+                "hidden_states": (1, 8, 2),
+                "target": (1, 8, 2),
+            },
+            tensor_dtypes={
+                "input_ids": torch.long,
+                "hidden_states": torch.bfloat16,
+                "target": torch.bfloat16,
+            },
+            packed_loss_mask=packed_loss_mask,
+            metadata={"usp_sharded": True},
+        )
+
+        outputs = []
+        for sp_rank in (0, 1):
+            ray_queue = MockRayQueue()
+            ray_queue.put(sample)
+            ray_queue.put(None)
+
+            store = MockMooncakeStore()
+            store.put_tensors(
+                f"sample_usp{sp_rank}",
+                {
+                    "input_ids": torch.arange(sp_rank * 4, sp_rank * 4 + 4).view(1, 4),
+                    "hidden_states": torch.zeros(1, 4, 2, dtype=torch.bfloat16),
+                    "target": torch.zeros(1, 4, 2, dtype=torch.bfloat16),
+                },
+            )
+
+            dataset = MooncakeDataset(
+                ray_queue,
+                store,
+                torch.device("cpu"),
+                usp_enabled=True,
+                ttt_length=0,
+            )
+            dataset._sp_world_size = 2
+            dataset._sp_rank = sp_rank
+            dataset._sp_ring_size = 1
+
+            tensors, skipped = dataset._usp_get_sharded_item(skip_count=0)
+            outputs.append((tensors, skipped))
+
+        rank0_tensors, rank0_skipped = outputs[0]
+        rank1_tensors, rank1_skipped = outputs[1]
+
+        assert rank0_tensors is not None
+        assert rank1_tensors is not None
+        assert rank0_skipped == 0
+        assert rank1_skipped == 0
+        assert not rank0_tensors["loss_mask"].any()
+        assert rank1_tensors["loss_mask"].any()
 
 
 class TestCreateMooncakeDataloader:

@@ -124,6 +124,12 @@ class AsyncTrainingController:
     def __init__(self, args, dp_size: int):
         self.args = args
         self.dp_size = dp_size
+        self.sp_size = (
+            getattr(args, "sp_ulysses_size", 1) * getattr(args, "sp_ring_size", 1)
+            if getattr(args, "attention_backend", None) == "usp"
+            else 1
+        )
+        self.queue_count = dp_size * self.sp_size
 
         self.prompt_buffer: deque[InferenceInput] = deque()
         self._prompt_lock = threading.Lock()
@@ -133,7 +139,7 @@ class AsyncTrainingController:
         self._pool_bytes = 0
         self._sample_bytes: dict[str, int] = {}
 
-        self.train_queues = [Queue() for _ in range(dp_size)]
+        self.train_queues = [Queue() for _ in range(self.queue_count)]
 
         # Eval: separate pool and queues so eval data never mixes with training
         self.eval_pool: deque[InferenceOutput] = deque()
@@ -141,7 +147,7 @@ class AsyncTrainingController:
         self._eval_data_ids: set[str] = set()
         self._eval_expected_count: int = 0
         self._eval_dispatched_samples: int = 0
-        self.eval_queues = [Queue() for _ in range(dp_size)]
+        self.eval_queues = [Queue() for _ in range(self.queue_count)]
 
         self.batch_id = 0
         self.dispatch_batch_size = args.per_dp_rank_batch_size * dp_size
@@ -484,15 +490,20 @@ class AsyncTrainingController:
             for result in results:
                 metadata = getattr(result, "metadata", {}) or {}
                 last_turn_loss_only = metadata.get("has_thinking")
-                queues[dp_rank].put(
-                    TrainSample(
-                        mooncake_key=result.mooncake_key,
-                        tensor_shapes=result.tensor_shapes,
-                        tensor_dtypes=result.tensor_dtypes,
-                        packed_loss_mask=result.packed_loss_mask,
-                        last_turn_loss_only=last_turn_loss_only,
-                    )
+                sample = TrainSample(
+                    mooncake_key=result.mooncake_key,
+                    tensor_shapes=result.tensor_shapes,
+                    tensor_dtypes=result.tensor_dtypes,
+                    packed_loss_mask=result.packed_loss_mask,
+                    last_turn_loss_only=last_turn_loss_only,
+                    metadata=metadata,
                 )
+                if self.sp_size > 1 and len(queues) == self.queue_count:
+                    start = dp_rank * self.sp_size
+                    for rank in range(start, start + self.sp_size):
+                        queues[rank].put(sample)
+                else:
+                    queues[dp_rank].put(sample)
 
     def push_inference_sample(self, sample: InferenceOutput) -> int:
         """Add a single inference sample to the training pool.

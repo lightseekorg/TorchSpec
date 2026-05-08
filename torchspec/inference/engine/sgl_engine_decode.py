@@ -259,6 +259,8 @@ class SglDecodeEngineMixin:
                 "tensor_dtypes": self._get_tensor_dtypes(),
                 "packed_loss_mask": loss_mask,
             }
+            if getattr(self.args, "attention_backend", None) == "usp":
+                output_dict["metadata"] = {"usp_sharded": True}
 
             # Add performance metrics if available (for wandb logging)
             _METRIC_KEYS = (

@@ -47,8 +47,9 @@ def is_local_data_path(path: str, base_dir: str | None = None) -> bool:
 
 
 class DataCollatorWithPadding:
-    def __init__(self):
+    def __init__(self, usp_enabled: bool = False):
         self.sp_degree = 1
+        self.usp_enabled = usp_enabled
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         B, n, S = intensors.shape
@@ -93,8 +94,10 @@ class DataCollatorWithPadding:
         _BUCKET = 256
         max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
 
-        # All real tokens get attention_mask=1; paddingtensor2D zero-pads the rest.
-        attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
+        if self.usp_enabled:
+            attention_masks = [item["attention_mask"].long() for item in features]
+        else:
+            attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
 
         batch_input_ids = torch.cat(
             [self.paddingtensor2D(item["input_ids"], max_length) for item in features]

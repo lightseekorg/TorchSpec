@@ -40,11 +40,9 @@ from torchspec.data.utils import deserialize_packed_loss_mask, resolve_loss_mask
 from torchspec.utils.distributed import (
     get_draft_sp_group,
     get_sp_ring_group,
-    get_sp_ulysses_group,
     get_usp_rank_coords,
 )
 from torchspec.utils.logging import logger
-from torchspec.utils.usp import split_usp_batch
 
 
 @dataclass
@@ -54,6 +52,7 @@ class TrainSample:
     tensor_dtypes: Optional[Dict[str, torch.dtype]] = None
     packed_loss_mask: Optional[str] = None
     last_turn_loss_only: Optional[bool] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class MooncakeDataset(IterableDataset):
@@ -120,10 +119,6 @@ class MooncakeDataset(IterableDataset):
             self._sp_ring_size = dist.get_world_size(ring_group)
             self._sp_ring_rank = dist.get_rank(ring_group)
 
-        ulysses_group = get_sp_ulysses_group()
-        if ulysses_group is not None:
-            dist.get_rank(ulysses_group)
-
     def _load_from_mooncake(self, sample: TrainSample) -> Dict[str, Any]:
         """Load tensors from mooncake key into device memory."""
         dtypes_raw = sample.tensor_dtypes or {}
@@ -164,28 +159,6 @@ class MooncakeDataset(IterableDataset):
             result = dict(tensor_dict)
 
         self._cleanup_mooncake_data(sample)
-        if sample.packed_loss_mask is not None:
-            result["packed_loss_mask"] = sample.packed_loss_mask
-        if sample.last_turn_loss_only is not None:
-            result["last_turn_loss_only"] = sample.last_turn_loss_only
-        return result
-
-    def _load_from_mooncake_no_cleanup(self, sample: TrainSample) -> Dict[str, Any]:
-        dtypes_raw = sample.tensor_dtypes or {}
-        dtypes = {}
-        for key, dtype_val in dtypes_raw.items():
-            if isinstance(dtype_val, str):
-                dtypes[key] = getattr(torch, dtype_val.replace("torch.", ""))
-            else:
-                dtypes[key] = dtype_val
-
-        tensors = self.mooncake_store.get(
-            key=sample.mooncake_key,
-            shapes=sample.tensor_shapes,
-            dtypes=dtypes,
-            device=self.device,
-        )
-        result = tensors.to_tensor_dict()
         if sample.packed_loss_mask is not None:
             result["packed_loss_mask"] = sample.packed_loss_mask
         if sample.last_turn_loss_only is not None:
@@ -251,7 +224,7 @@ class MooncakeDataset(IterableDataset):
         skip_count = 0
         while True:
             if self.usp_enabled:
-                data, skipped = self._usp_get_item(skip_count=skip_count)
+                data, skipped = self._usp_get_sharded_item(skip_count=skip_count)
                 skip_count += skipped
                 if data is None:
                     break
@@ -306,161 +279,142 @@ class MooncakeDataset(IterableDataset):
             logger.debug(f"__iter__: yielding batch {yield_count}, keys={list(data.keys())}")
             yield data
 
-    def _usp_get_item(self, skip_count: int) -> tuple[Dict[str, torch.Tensor] | None, int]:
-        sp_group = self._sp_group
-        sp_world_size = self._sp_world_size
-        sp_rank = self._sp_rank
-        sp_ring_size = self._sp_ring_size
+    def _usp_global_len(self, sample: TrainSample) -> int:
+        global_len = sample.tensor_shapes["input_ids"][-1]
+        if self.max_seq_length is not None:
+            global_len = min(global_len, self.max_seq_length)
+        return global_len
 
-        if sp_group is None:
-            raise RuntimeError("USP enabled but draft SP group has not been initialized")
+    def _usp_chunk_size(self, global_len: int) -> int:
+        return (global_len + self._sp_world_size - 1) // self._sp_world_size
 
+    def _usp_loss_mask(self, sample: TrainSample, global_len: int) -> torch.Tensor:
+        if sample.packed_loss_mask is None:
+            raise RuntimeError("USP sharded Mooncake reads require packed_loss_mask metadata")
+        loss_mask = unpack_loss_mask(deserialize_packed_loss_mask(sample.packed_loss_mask))
+        loss_mask = loss_mask[:global_len]
+        if loss_mask.shape[0] < global_len:
+            loss_mask = F.pad(loss_mask, (0, global_len - loss_mask.shape[0]))
+        return loss_mask
+
+    def _local_usp_shapes(self, sample: TrainSample) -> dict[str, tuple[int, ...]]:
+        local_len = self._usp_chunk_size(self._usp_global_len(sample)) + self.ttt_length
+        shapes: dict[str, tuple[int, ...]] = {
+            "input_ids": (1, local_len),
+            "hidden_states": (1, local_len, sample.tensor_shapes["hidden_states"][-1]),
+        }
+        if "last_hidden_states" in sample.tensor_shapes:
+            shapes["last_hidden_states"] = (
+                1,
+                local_len,
+                sample.tensor_shapes["last_hidden_states"][-1],
+            )
+        if "target" in sample.tensor_shapes:
+            shapes["target"] = (1, local_len, sample.tensor_shapes["target"][-1])
+        return shapes
+
+    def _local_usp_loss_and_position(
+        self,
+        sample: TrainSample,
+        local_len: int,
+    ) -> dict[str, torch.Tensor]:
+        sp_ulysses_size = max(1, self._sp_world_size // self._sp_ring_size)
+        global_len = self._usp_global_len(sample)
+        chunk_size = self._usp_chunk_size(global_len)
+        start = self._sp_rank * chunk_size
+        end = min(start + local_len, global_len)
+        valid_len = max(0, end - start)
+
+        loss_mask = self._usp_loss_mask(sample, global_len)[start:end].unsqueeze(0)
+        if loss_mask.shape[-1] < local_len:
+            loss_mask = F.pad(loss_mask, (0, local_len - loss_mask.shape[-1]))
+
+        attention_mask = torch.zeros((1, local_len), dtype=torch.long)
+        attention_mask[:, :valid_len] = 1
+
+        usp_chunk_size = max(local_len - self.ttt_length, 0)
+        ring_chunk = usp_chunk_size * sp_ulysses_size
+        _, ring_rank = get_usp_rank_coords(
+            sp_rank=self._sp_rank,
+            sp_ulysses_size=sp_ulysses_size,
+            sp_ring_size=self._sp_ring_size,
+        )
+        ring_start = ring_rank * ring_chunk
+        position_ids = torch.arange(
+            ring_start,
+            ring_start + ring_chunk,
+            dtype=torch.long,
+        ).unsqueeze(0)
+
+        return {
+            "loss_mask": loss_mask.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
+            "position_ids": position_ids.to(self.device),
+        }
+
+    def _should_skip_usp_sharded_sample(self, sample: TrainSample) -> bool:
+        """Return the SP-consistent skip decision for a pre-sharded USP sample."""
+        full_loss_mask = self._usp_loss_mask(sample, self._usp_global_len(sample))
+        min_tokens = max(1, self._min_loss_tokens)
+        return int(full_loss_mask.sum().item()) < min_tokens
+
+    def _usp_get_sharded_item(self, skip_count: int) -> tuple[Dict[str, torch.Tensor] | None, int]:
         skipped = 0
         while True:
-            if sp_rank == 0:
-                try:
-                    item = self.ray_queue.get(block=True, timeout=self.timeout)
-                except Exception as e:
-                    logger.warning(
-                        f"_usp_get_item: Exception waiting for data: {e}, timeout={self.timeout}"
-                    )
-                    item = None
-                payload = None if item is None else item.__dict__
-            else:
-                item = None
-                payload = None
-
-            obj_list = [payload]
-            dist.broadcast_object_list(obj_list, group=sp_group, group_src=0)
-            payload = obj_list[0]
-            if payload is None:
+            try:
+                item = self.ray_queue.get(block=True, timeout=self.timeout)
+            except Exception as e:
+                logger.warning(
+                    f"_usp_get_sharded_item: Exception waiting for data: {e}, "
+                    f"timeout={self.timeout}"
+                )
+                return None, skipped
+            if item is None:
                 return None, skipped
 
-            item = TrainSample(**payload)
-
-            if sp_rank == 0:
-                full_data = self._load_from_mooncake_no_cleanup(item)
-                should_skip, next_skip_count = self._should_skip_for_loss_mask(
-                    full_data,
-                    item.mooncake_key,
-                    skip_count + skipped,
+            metadata = item.metadata or {}
+            if not metadata.get("usp_sharded", False):
+                raise RuntimeError(
+                    "USP sharded data fetcher received a non-sharded Mooncake sample. "
+                    f"mooncake_key={item.mooncake_key}"
                 )
-                if should_skip:
-                    skipped = next_skip_count - skip_count
-                    self._cleanup_mooncake_data(item)
-                    per_rank = None
-                    meta = None
+
+            shapes = self._local_usp_shapes(item)
+            dtypes_raw = item.tensor_dtypes or {}
+            dtypes = {}
+            for key, dtype_val in dtypes_raw.items():
+                if isinstance(dtype_val, str):
+                    dtypes[key] = getattr(torch, dtype_val.replace("torch.", ""))
                 else:
-                    max_len = full_data["input_ids"].shape[-1]
-                    if self.max_seq_length is not None:
-                        max_len = min(self.max_seq_length, max_len)
+                    dtypes[key] = dtype_val
 
-                    full_input_ids = full_data["input_ids"]
-                    if full_input_ids.dim() == 2:
-                        full_input_ids = full_input_ids.squeeze(0)
-                    full_input_ids = full_input_ids[:max_len].to(device=self.device)
+            should_skip = self._should_skip_usp_sharded_sample(item)
+            shard_key = f"{item.mooncake_key}_usp{self._sp_rank}"
+            tensors = self.mooncake_store.get(
+                key=shard_key,
+                shapes=shapes,
+                dtypes=dtypes,
+                device=self.device,
+            ).to_tensor_dict()
+            tensors.update(self._local_usp_loss_and_position(item, shapes["input_ids"][-1]))
 
-                    full_hidden_states = full_data["hidden_states"]
-                    if full_hidden_states.dim() == 3:
-                        full_hidden_states = full_hidden_states.squeeze(0)
-                    full_hidden_states = full_hidden_states[:max_len, :].to(device=self.device)
+            self.mooncake_store.remove_eagle3_tensors(
+                shard_key,
+                has_last_hidden_states="last_hidden_states" in shapes,
+                has_target="target" in shapes,
+            )
 
-                    if "loss_mask" in full_data:
-                        full_loss_mask = full_data["loss_mask"]
-                        if full_loss_mask.dim() == 1:
-                            full_loss_mask = full_loss_mask.unsqueeze(0)
-                    elif item.packed_loss_mask is not None:
-                        packed = deserialize_packed_loss_mask(item.packed_loss_mask)
-                        full_loss_mask = unpack_loss_mask(packed)[None, :].to(device=self.device)
-                    else:
-                        full_loss_mask = torch.ones(1, max_len, dtype=torch.long, device=self.device)
-                    full_loss_mask = full_loss_mask[:, :max_len].to(device=self.device)
-
-                    if "last_hidden_states" in full_data:
-                        target_hs = full_data["last_hidden_states"]
-                        target_key = "last_hidden_states"
-                    elif "target" in full_data:
-                        target_hs = full_data["target"]
-                        target_key = "target"
-                    else:
-                        raise KeyError("USP requires last_hidden_states or target in mooncake data")
-                    if target_hs.dim() == 3:
-                        target_hs = target_hs.squeeze(0)
-                    target_hs = target_hs[:max_len, :].to(device=self.device)
-
-                    seq_len = full_input_ids.shape[-1]
-                    pad_len = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
-                    if pad_len:
-                        full_input_ids = F.pad(full_input_ids, (0, pad_len))
-                        full_loss_mask = F.pad(full_loss_mask, (0, pad_len))
-                        full_hidden_states = F.pad(full_hidden_states, (0, 0, 0, pad_len))
-                        target_hs = F.pad(target_hs, (0, 0, 0, pad_len))
-
-                    per_rank = []
-                    sp_ulysses_size = max(1, sp_world_size // sp_ring_size)
-                    for rank in range(sp_world_size):
-                        _, ring_rank = get_usp_rank_coords(
-                            sp_rank=rank,
-                            sp_ulysses_size=sp_ulysses_size,
-                            sp_ring_size=sp_ring_size,
-                        )
-                        (
-                            input_ids,
-                            attention_mask,
-                            loss_mask,
-                            hidden_states,
-                            target_hidden_states,
-                            position_ids,
-                        ) = split_usp_batch(
-                            input_ids=full_input_ids,
-                            loss_mask=full_loss_mask,
-                            hidden_states=full_hidden_states,
-                            target_hidden_states=target_hs,
-                            ttt_length=self.ttt_length,
-                            sp_rank=rank,
-                            sp_size=sp_world_size,
-                            ring_rank=ring_rank,
-                            sp_ring_size=sp_ring_size,
-                        )
-                        per_rank.append(
-                            {
-                                "input_ids": input_ids,
-                                "attention_mask": attention_mask,
-                                "loss_mask": loss_mask,
-                                "hidden_states": hidden_states,
-                                target_key: target_hidden_states,
-                                "position_ids": position_ids,
-                            }
-                        )
-
-                    meta = {
-                        key: (per_rank[0][key].shape, per_rank[0][key].dtype) for key in per_rank[0]
-                    }
-            else:
-                per_rank = None
-                meta = None
-                should_skip = False
-
-            skip_list = [should_skip]
-            dist.broadcast_object_list(skip_list, group=sp_group, group_src=0)
-            if skip_list[0]:
+            if should_skip:
+                skipped += 1
+                total_skipped = skip_count + skipped
+                logger.warning(
+                    f"Skipping USP sharded sample with global all-zero loss mask "
+                    f"(mooncake_key={item.mooncake_key}, sp_rank={self._sp_rank}, "
+                    f"total_skipped={total_skipped})"
+                )
                 continue
 
-            meta_list = [meta]
-            dist.broadcast_object_list(meta_list, group=sp_group, group_src=0)
-            meta = meta_list[0]
-
-            data = {}
-            for key, (shape, dtype) in meta.items():
-                recv_tensor = torch.empty(shape, dtype=dtype, device=self.device)
-                scatter_list = [item[key] for item in per_rank] if sp_rank == 0 else None
-                dist.scatter(recv_tensor, scatter_list=scatter_list, group=sp_group, group_src=0)
-                data[key] = recv_tensor
-
-            if sp_rank == 0:
-                self._cleanup_mooncake_data(item)
-
-            return data, skipped
+            return tensors, skipped
 
 
 def create_mooncake_dataloader(
