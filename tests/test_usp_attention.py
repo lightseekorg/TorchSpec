@@ -201,8 +201,7 @@ def _run_usp_vs_flex_worker(
                 atol=3e-2,
                 rtol=3e-2,
                 msg=(
-                    f"USP gradient mismatch for {proj_name} "
-                    f"(max output diff={max_output_diff:.6f})"
+                    f"USP gradient mismatch for {proj_name} (max output diff={max_output_diff:.6f})"
                 ),
             )
 

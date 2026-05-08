@@ -26,8 +26,8 @@ import torch
 
 from torchspec.transfer.mooncake.helpers import _format_bytes
 from torchspec.transfer.mooncake.store import MooncakeHiddenStateStore
-from torchspec.utils.logging import logger
 from torchspec.utils.distributed import get_usp_rank_coords
+from torchspec.utils.logging import logger
 from torchspec.utils.usp import split_usp_batch
 
 if TYPE_CHECKING:

@@ -1977,9 +1977,7 @@ class _USPFlashCachedMergeFunc(torch.autograd.Function):
         dcache_k = torch.zeros_like(cache_k.float())
         dcache_v = torch.zeros_like(cache_v.float())
 
-        merged_lse_kernel = _USPFlashCachedMergeFunc._kernel_lse(
-            merged_lse, bsz, q_len, num_heads
-        )
+        merged_lse_kernel = _USPFlashCachedMergeFunc._kernel_lse(merged_lse, bsz, q_len, num_heads)
         dq0 = torch.empty_like(q)
         dk0 = torch.empty_like(cache_k[:, 0])
         dv0 = torch.empty_like(cache_v[:, 0])
@@ -2091,9 +2089,7 @@ class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
         dcache_k = torch.zeros_like(cache_k.float())
         dcache_v = torch.zeros_like(cache_v.float())
         out_q = out.to(q.dtype).reshape_as(q)
-        merged_lse_kernel = _USPFlashCachedMergeFunc._kernel_lse(
-            merged_lse, bsz, q_len, num_heads
-        )
+        merged_lse_kernel = _USPFlashCachedMergeFunc._kernel_lse(merged_lse, bsz, q_len, num_heads)
 
         dq, dk0, dv0 = ring_flash_attn_backward(
             ctx.ring_group,
@@ -2243,7 +2239,6 @@ class LlamaUSPFlashAttention(LlamaAttention):
         attn_output = attn_output.reshape(bsz, local_q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
         return attn_output, cache_keys, cache_values
-
 
 
 def warmup_flash_attention_masked(
