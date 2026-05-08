@@ -1909,11 +1909,22 @@ class _FlashCachedMergeFunc(torch.autograd.Function):
 
 class _USPFlashCachedMergeFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, cache_k, cache_v, softmax_scale: float):
+    def _merge_dims(q: torch.Tensor, cache_k: torch.Tensor):
         bsz, q_len, num_heads, head_dim = q.shape
         num_blocks = cache_k.shape[1]
         num_kv_heads = cache_k.shape[3]
         num_groups = num_heads // num_kv_heads
+        return bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups
+
+    @staticmethod
+    def _kernel_lse(lse: torch.Tensor, bsz: int, q_len: int, num_heads: int) -> torch.Tensor:
+        return lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, softmax_scale: float):
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _USPFlashCachedMergeFunc._merge_dims(q, cache_k)
+        )
         q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
 
         k0 = cache_k[:, 0].contiguous()
@@ -1951,10 +1962,9 @@ class _USPFlashCachedMergeFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
-        bsz, q_len, num_heads, head_dim = q.shape
-        num_blocks = cache_k.shape[1]
-        num_kv_heads = cache_k.shape[3]
-        num_groups = num_heads // num_kv_heads
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _USPFlashCachedMergeFunc._merge_dims(q, cache_k)
+        )
         scale = ctx.softmax_scale
 
         grad_out_f = grad_out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
@@ -1967,7 +1977,9 @@ class _USPFlashCachedMergeFunc(torch.autograd.Function):
         dcache_k = torch.zeros_like(cache_k.float())
         dcache_v = torch.zeros_like(cache_v.float())
 
-        merged_lse_kernel = merged_lse.reshape(bsz, q_len, num_heads).transpose(1, 2).contiguous()
+        merged_lse_kernel = _USPFlashCachedMergeFunc._kernel_lse(
+            merged_lse, bsz, q_len, num_heads
+        )
         dq0 = torch.empty_like(q)
         dk0 = torch.empty_like(cache_k[:, 0])
         dv0 = torch.empty_like(cache_v[:, 0])
@@ -2000,6 +2012,120 @@ class _USPFlashCachedMergeFunc(torch.autograd.Function):
             dcache_v[:, i] += d_out_i.sum(dim=3)
 
         return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None
+
+
+def _update_ring_out_and_lse(
+    out: torch.Tensor | None,
+    lse: torch.Tensor | None,
+    block_out: torch.Tensor,
+    block_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    block_out = block_out.float()
+    block_lse = block_lse.float()
+    if out is None or lse is None:
+        return block_out, block_lse
+    new_lse = torch.logaddexp(lse, block_lse)
+    out = out * torch.exp(lse - new_lse).unsqueeze(-1) + block_out * torch.exp(
+        block_lse - new_lse
+    ).unsqueeze(-1)
+    return out, new_lse
+
+
+class _USPRingFlashCachedMergeFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, cache_k, cache_v, ring_group: dist.ProcessGroup, softmax_scale: float):
+        from yunchang.ring.ring_flash_attn import ring_flash_attn_forward
+
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _USPFlashCachedMergeFunc._merge_dims(q, cache_k)
+        )
+        q_expanded = q.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+
+        out_ring, lse_ring = ring_flash_attn_forward(
+            ring_group,
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            softmax_scale=softmax_scale,
+            dropout_p=0.0,
+            causal=True,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            deterministic=False,
+        )
+        if lse_ring.dim() == 3 and lse_ring.shape[1] == num_heads:
+            lse_ring = lse_ring.transpose(1, 2)
+        acc_out = out_ring.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        acc_lse = lse_ring.reshape(bsz, q_len, num_kv_heads, num_groups)
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].unsqueeze(-2).float()
+            vi = cache_v[:, i].unsqueeze(-2).float()
+            lse_i = (q_expanded.float() * ki).sum(-1) * softmax_scale
+            out_i = vi.expand(bsz, q_len, num_kv_heads, num_groups, head_dim)
+            acc_out, acc_lse = _update_ring_out_and_lse(acc_out, acc_lse, out_i, lse_i)
+
+        ctx.save_for_backward(q, cache_k, cache_v, acc_out, acc_lse)
+        ctx.ring_group = ring_group
+        ctx.softmax_scale = softmax_scale
+        return acc_out.to(q.dtype).reshape_as(q)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from yunchang.ring.ring_flash_attn import ring_flash_attn_backward
+
+        q, cache_k, cache_v, out, merged_lse = ctx.saved_tensors
+        bsz, q_len, num_heads, head_dim, num_blocks, num_kv_heads, num_groups = (
+            _USPFlashCachedMergeFunc._merge_dims(q, cache_k)
+        )
+        scale = ctx.softmax_scale
+
+        if grad_out.ndim == 3:
+            grad_out = grad_out.view(bsz, q_len, num_heads, head_dim)
+
+        grad_out_f = grad_out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        q_f = q.float()
+        q_expanded = q_f.view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+        out_expanded = out.float().view(bsz, q_len, num_kv_heads, num_groups, head_dim)
+
+        dcache_k = torch.zeros_like(cache_k.float())
+        dcache_v = torch.zeros_like(cache_v.float())
+        out_q = out.to(q.dtype).reshape_as(q)
+        merged_lse_kernel = _USPFlashCachedMergeFunc._kernel_lse(
+            merged_lse, bsz, q_len, num_heads
+        )
+
+        dq, dk0, dv0 = ring_flash_attn_backward(
+            ctx.ring_group,
+            grad_out.contiguous(),
+            q.contiguous(),
+            cache_k[:, 0].contiguous(),
+            cache_v[:, 0].contiguous(),
+            out_q.contiguous(),
+            merged_lse_kernel,
+            softmax_scale=scale,
+            dropout_p=0.0,
+            causal=True,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            deterministic=False,
+        )
+        dq = dq.float()
+        dcache_k[:, 0] = dk0.float()
+        dcache_v[:, 0] = dv0.float()
+
+        for i in range(1, num_blocks):
+            ki = cache_k[:, i].float().unsqueeze(-2)
+            vi = cache_v[:, i].float().unsqueeze(-2)
+            lse_i = (q_expanded * ki).sum(-1) * scale
+            wi = torch.exp(lse_i - merged_lse)
+            d_out_i = grad_out_f * wi.unsqueeze(-1)
+            d_lse_i = wi * (grad_out_f * (vi.expand_as(out_expanded) - out_expanded)).sum(-1)
+            dq += (d_lse_i.unsqueeze(-1) * scale * ki).reshape_as(q)
+            dcache_k[:, i] += (d_lse_i.unsqueeze(-1) * scale * q_expanded).sum(dim=3)
+            dcache_v[:, i] += d_out_i.sum(dim=3)
+
+        return dq.to(q.dtype), dcache_k.to(cache_k.dtype), dcache_v.to(cache_v.dtype), None, None
 
 
 class LlamaUSPFlashAttention(LlamaAttention):
@@ -2090,12 +2216,22 @@ class LlamaUSPFlashAttention(LlamaAttention):
             cache_keys = key_states.unsqueeze(1)
             cache_values = value_states.unsqueeze(1)
 
-        attn_output = _USPFlashCachedMergeFunc.apply(
-            query_states,
-            cache_keys,
-            cache_values,
-            1.0 / math.sqrt(self.head_dim),
-        )
+        softmax_scale = 1.0 / math.sqrt(self.head_dim)
+        if self.sp_ring_degree > 1:
+            attn_output = _USPRingFlashCachedMergeFunc.apply(
+                query_states,
+                cache_keys,
+                cache_values,
+                self.ring_pg,
+                softmax_scale,
+            )
+        else:
+            attn_output = _USPFlashCachedMergeFunc.apply(
+                query_states,
+                cache_keys,
+                cache_values,
+                softmax_scale,
+            )
 
         attn_output = self._SeqAllToAll4D.apply(
             self.ulysses_pg,

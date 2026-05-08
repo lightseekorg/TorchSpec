@@ -73,12 +73,18 @@ def _broadcast_state_dict(rank: int, module: torch.nn.Module) -> dict[str, torch
     return obj[0]
 
 
-def _run_usp_vs_flex_worker(rank: int, world_size: int, port: int) -> None:
+def _run_usp_vs_flex_worker(
+    rank: int,
+    world_size: int,
+    port: int,
+    sp_ulysses_size: int,
+    sp_ring_size: int,
+) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    init_usp_groups(sp_ulysses_size=2, sp_ring_size=1)
+    init_usp_groups(sp_ulysses_size=sp_ulysses_size, sp_ring_size=sp_ring_size)
 
     device = torch.device(f"cuda:{rank}")
     dtype = torch.bfloat16
@@ -88,7 +94,17 @@ def _run_usp_vs_flex_worker(rank: int, world_size: int, port: int) -> None:
     local_seq_len = global_seq_len // world_size
     config = _build_config()
     hidden_size = config.hidden_size * 2
-    position_ids = torch.arange(global_seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    flex_position_ids = torch.arange(global_seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    if sp_ulysses_size == world_size:
+        usp_position_ids = flex_position_ids
+    else:
+        start = get_sp_rank() * local_seq_len
+        usp_position_ids = torch.arange(
+            start,
+            start + local_seq_len,
+            device=device,
+            dtype=torch.long,
+        ).unsqueeze(0)
     attention_mask = torch.ones(batch_size, global_seq_len, device=device, dtype=torch.bool)
 
     flex_attention = LlamaFlexAttention(config).to(device).to(dtype) if rank == 0 else None
@@ -137,7 +153,7 @@ def _run_usp_vs_flex_worker(rank: int, world_size: int, port: int) -> None:
             cache_keys=usp_cache_keys,
             cache_values=usp_cache_values,
             attention_mask=None,
-            position_ids=position_ids,
+            position_ids=usp_position_ids,
             use_cache=True,
         )
         usp_loss = usp_loss + usp_out.float().square().sum() * loss_scale
@@ -151,7 +167,7 @@ def _run_usp_vs_flex_worker(rank: int, world_size: int, port: int) -> None:
                 cache_keys=flex_cache_keys,
                 cache_values=flex_cache_values,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=flex_position_ids,
                 use_cache=True,
             )
             flex_loss = flex_loss + flex_out.float().square().sum() * loss_scale
@@ -219,7 +235,19 @@ class TestUSPAttention(unittest.TestCase):
         port = _find_free_port()
         mp.spawn(
             _run_usp_vs_flex_worker,
-            args=(2, port),
+            args=(2, port, 2, 1),
+            nprocs=2,
+            join=True,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "Requires at least 2 CUDA devices")
+    @unittest.skipUnless(_has_usp_runtime(), "USP test requires flash_attn and yunchang")
+    def test_usp_ring_matches_flex_loss_and_gradients(self):
+        port = _find_free_port()
+        mp.spawn(
+            _run_usp_vs_flex_worker,
+            args=(2, port, 1, 2),
             nprocs=2,
             join=True,
         )
