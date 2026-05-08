@@ -100,6 +100,7 @@ class Trainer(abc.ABC):
     def _setup_device_mesh(self) -> None:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
+        self.cache_rank = rank
 
         usp_mesh = None
         if getattr(self.args, "attention_backend", None) == "usp":
@@ -279,7 +280,7 @@ class Trainer(abc.ABC):
         self._wait_for_eval_cache_save()
 
         cache_snapshot = list(self._eval_cache)
-        rank = self.dp_rank
+        rank = self.cache_rank
 
         def _save() -> None:
             os.makedirs(cache_dir, exist_ok=True)
@@ -300,7 +301,7 @@ class Trainer(abc.ABC):
     def load_eval_cache(self, cache_dir: str) -> int:
         # Safe guard to wait for eval cache save to complete.
         self._wait_for_eval_cache_save()
-        path = os.path.join(cache_dir, f"eval_rank_{self.dp_rank}.pt")
+        path = os.path.join(cache_dir, f"eval_rank_{self.cache_rank}.pt")
         if not os.path.exists(path):
             return 0
         try:
