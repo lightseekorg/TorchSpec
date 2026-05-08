@@ -219,7 +219,7 @@ class Eagle3Model(nn.Module):
             step_seq_length = seq_length
 
             if self.attention_backend == "usp":
-                step_seq_length = seq_length - self.length
+                step_seq_length = usp_chunk_size
                 step_input_ids = input_ids[:, :step_seq_length]
                 step_hidden_states = hidden_states[:, :step_seq_length, :]
                 step_mask = mask[:, :step_seq_length]

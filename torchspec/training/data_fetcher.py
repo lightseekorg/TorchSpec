@@ -286,7 +286,9 @@ class MooncakeDataset(IterableDataset):
         return global_len
 
     def _usp_chunk_size(self, global_len: int) -> int:
-        return (global_len + self._sp_world_size - 1) // self._sp_world_size
+        bucket = 256
+        padded_global_len = ((global_len + bucket - 1) // bucket) * bucket
+        return (padded_global_len + self._sp_world_size - 1) // self._sp_world_size
 
     def _usp_loss_mask(self, sample: TrainSample, global_len: int) -> torch.Tensor:
         if sample.packed_loss_mask is None:

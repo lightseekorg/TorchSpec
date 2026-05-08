@@ -88,15 +88,15 @@ class DataCollatorWithPadding:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         max_length = max(item["input_ids"].shape[1] for item in features)
         max_length = ((max_length + self.sp_degree - 1) // self.sp_degree) * self.sp_degree
-        # Round up to nearest bucket to reduce unique shapes for torch.compile.
-        # Without this, every batch gets a different padded length, causing
-        # FlexAttention recompilation (~1s overhead per new shape).
-        _BUCKET = 256
-        max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
 
         if self.usp_enabled:
             attention_masks = [item["attention_mask"].long() for item in features]
         else:
+            # Round up to nearest bucket to reduce unique shapes for torch.compile.
+            # Without this, every batch gets a different padded length, causing
+            # FlexAttention recompilation (~1s overhead per new shape).
+            _BUCKET = 256
+            max_length = ((max_length + _BUCKET - 1) // _BUCKET) * _BUCKET
             attention_masks = [torch.ones_like(item["input_ids"]).long() for item in features]
 
         batch_input_ids = torch.cat(
@@ -116,6 +116,14 @@ class DataCollatorWithPadding:
             "target": None,
             "last_hidden_states": None,
         }
+        if self.usp_enabled:
+            max_position_length = max(item["position_ids"].shape[1] for item in features)
+            batch["position_ids"] = torch.cat(
+                [
+                    self.paddingtensor2D(item["position_ids"], max_position_length)
+                    for item in features
+                ]
+            )
         if all("hidden_states" in item for item in features):
             batch["hidden_states"] = torch.cat(
                 [self.paddingtensor(item["hidden_states"], max_length) for item in features]
