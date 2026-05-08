@@ -34,6 +34,7 @@ from torchspec.models.ops.loss import (
 )
 from torchspec.utils.distributed import (
     get_draft_sp_group,
+    get_sp_ring_rank,
     get_sp_ulysses_group,
 )
 from torchspec.utils.tensor import padding
@@ -164,9 +165,11 @@ class Eagle3Model(nn.Module):
                 )
             if position_ids is None:
                 device = hidden_states.device
+                ring_chunk_size = usp_chunk_size * self._usp_ulysses_world_size
+                position_start = get_sp_ring_rank() * ring_chunk_size + past_key_values_length
                 position_ids = torch.arange(
-                    past_key_values_length,
-                    usp_chunk_size * self._usp_ulysses_world_size + past_key_values_length,
+                    position_start,
+                    position_start + ring_chunk_size,
                     dtype=torch.long,
                     device=device,
                 ).unsqueeze(0)
