@@ -286,12 +286,7 @@ class MooncakeDataset(IterableDataset):
         return global_len
 
     def _usp_chunk_size(self, global_len: int) -> int:
-        if global_len % self._sp_world_size != 0:
-            raise ValueError(
-                f"USP global_len ({global_len}) must be divisible by sp_size "
-                f"({self._sp_world_size})"
-            )
-        return global_len // self._sp_world_size
+        return (global_len + self._sp_world_size - 1) // self._sp_world_size
 
     def _usp_loss_mask(self, sample: TrainSample, global_len: int) -> torch.Tensor:
         if sample.packed_loss_mask is None:

@@ -26,11 +26,7 @@ def split_usp_batch(
 
     batch_size, input_len = input_ids.shape
     global_len = min(max_len, input_len) if max_len is not None else input_len
-    if global_len % sp_size != 0:
-        raise ValueError(
-            f"USP global_len ({global_len}) must be divisible by sp_size ({sp_size})"
-        )
-    chunk_size = global_len // sp_size
+    chunk_size = (global_len + sp_size - 1) // sp_size
     sp_ulysses_size = max(1, sp_size // sp_ring_size)
     start = sp_rank * chunk_size
     local_len = chunk_size + ttt_length
