@@ -39,7 +39,10 @@ def get_rdma_devices() -> list[dict]:
     devices = []
 
     if not os.path.isdir(ib_root):
-        result = subprocess.run(["ibv_devinfo"], capture_output=True, text=True, timeout=10)
+        try:
+            result = subprocess.run(["ibv_devinfo"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return devices
         if result.returncode != 0:
             return devices
         current: dict | None = None
