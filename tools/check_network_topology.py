@@ -11,6 +11,13 @@ Usage (local node only):
 
 Usage (full Ray cluster):
     RAY_ADDRESS=<head-node-ip>:<port> python tools/check_network_topology.py
+
+Environment variables:
+    RAY_ADDRESS               Ray cluster address (e.g. 10.0.0.1:6379).
+                              If unset, only the local node is checked.
+    TORCHSPEC_PROBE_TIMEOUT   TCP connect timeout in seconds for the
+                              pairwise connectivity test. Default: 5.0.
+                              Increase this for high-latency networks.
 """
 
 import os
@@ -182,22 +189,23 @@ def _local_probe_info() -> dict:
     }
 
 
-PROBE_PORT = 29500
-CONNECT_TIMEOUT = 5.0
+def _connect_timeout() -> float:
+    return float(os.environ.get("TORCHSPEC_PROBE_TIMEOUT", "5.0"))
 
 
-def _tcp_server_listen(port: int) -> socket.socket:
+def _tcp_server_listen() -> tuple[socket.socket, int]:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("0.0.0.0", port))
+    s.bind(("0.0.0.0", 0))
+    port = s.getsockname()[1]
     s.listen(64)
-    s.settimeout(CONNECT_TIMEOUT * 2)
-    return s
+    s.settimeout(_connect_timeout() * 2)
+    return s, port
 
 
 def _tcp_probe(target_ip: str, port: int) -> tuple[bool, float]:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(CONNECT_TIMEOUT)
+    s.settimeout(_connect_timeout())
     t0 = time.monotonic()
     try:
         s.connect((target_ip, port))
@@ -229,14 +237,16 @@ def run_cluster() -> None:
 
     print(f"Ray cluster: {len(live_nodes)} live node(s)")
 
-    @ray.remote(num_cpus=0)
+    max_concurrency = len(live_nodes) + 2
+
+    @ray.remote(num_cpus=0, max_concurrency=max_concurrency)
     class NetworkProbeActor:
         def gather_info(self) -> dict:
             return _local_probe_info()
 
-        def open_server(self, port: int) -> str:
-            self._server = _tcp_server_listen(port)
-            return socket.gethostbyname(socket.gethostname())
+        def open_server(self) -> int:
+            self._server, port = _tcp_server_listen()
+            return port
 
         def accept_all(self, count: int) -> None:
             for _ in range(count):
@@ -267,19 +277,20 @@ def run_cluster() -> None:
     n = len(actors)
     node_ips_list = [ip for ip, _ in actors]
 
-    server_ips = ray.get([a.open_server.remote(PROBE_PORT) for _, a in actors])
+    server_ports = ray.get([a.open_server.remote() for _, a in actors])
 
     accept_futures = [a.accept_all.remote(n - 1) for _, a in actors]
 
     probe_futures = {}
     for i, (_, src_actor) in enumerate(actors):
-        for j, tgt_ip in enumerate(server_ips):
+        for j, (tgt_ip, tgt_port) in enumerate(zip(node_ips_list, server_ports)):
             if i == j:
                 continue
-            fut = src_actor.probe.remote(tgt_ip, PROBE_PORT)
+            fut = src_actor.probe.remote(tgt_ip, tgt_port)
             probe_futures[(i, j)] = fut
 
-    probe_results = {k: ray.get(v) for k, v in probe_futures.items()}
+    keys = list(probe_futures.keys())
+    probe_results = dict(zip(keys, ray.get([probe_futures[k] for k in keys])))
     ray.get(accept_futures)
 
     header = "{:<18}".format("src \\ dst")
