@@ -937,9 +937,7 @@ def _build_eagle3_mask_pair(
         raise ValueError(f"Unknown eagle3 mask mode {mode!r}")
 
     # Always build a flex-compatible mask_mod for block-sparse iteration.
-    seq_lengths = torch.full((bsz,), q_len, dtype=torch.long, device=device)
     mask_mod_flex = generate_eagle3_mask(
-        seq_lengths=seq_lengths,
         Q_LEN=q_len,
         KV_LEN=kv_len,
         lck=lck,
@@ -1406,10 +1404,6 @@ class LlamaFlexAttention(LlamaAttention):
             key_cache = key_states
             value_cache = value_states
 
-        seq_lengths = attention_mask.sum(dim=-1)
-        # Shrink the attention mask to align with the padding to the right.
-        # This is equivalent to the shrinking logic in eagle3.py
-        seq_lengths -= lck
         flex_attention_func = flex_attention if q_len <= 128 else compile_friendly_flex_attention
 
         block_mask = eagle3_block_mask(
@@ -1418,7 +1412,6 @@ class LlamaFlexAttention(LlamaAttention):
             B=bsz,
             H=1,  # Rely on broadcast
             device=query_states.device,
-            seq_lengths=seq_lengths,
             lck=lck,
         )
         attn_output = flex_attention_func(

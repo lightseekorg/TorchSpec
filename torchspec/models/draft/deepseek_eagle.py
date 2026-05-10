@@ -419,10 +419,6 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
             key_cache = key_states
             value_cache = value_states
 
-        # Build EAGLE3 block mask from attention_mask (seq_lengths)
-        seq_lengths = attention_mask.sum(dim=-1)
-        seq_lengths -= lck
-
         flex_attention_func = flex_attention if q_len <= 128 else compile_friendly_flex_attention
 
         block_mask = eagle3_block_mask(
@@ -431,7 +427,6 @@ class DeepSeekMLAFlexAttention(DeepSeekMLAAttention):
             B=bsz,
             H=1,  # Rely on broadcast
             device=query_states.device,
-            seq_lengths=seq_lengths,
             lck=lck,
         )
 

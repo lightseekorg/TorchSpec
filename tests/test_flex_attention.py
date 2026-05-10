@@ -252,18 +252,16 @@ class TestEagle3FlexMask(unittest.TestCase):
         query = norm_tensor((B, H, S, D), device="cuda", dtype=data_type)
         key_cache = norm_tensor((B, H, KV_LEN, D), device="cuda", dtype=data_type)
         value_cache = norm_tensor((B, H, KV_LEN, D), device="cuda", dtype=data_type)
-        seq_lengths = torch.tensor([S], device="cuda", dtype=torch.int32)
-        seq_lengths -= lck
         block_mask = compile_friendly_create_block_mask(
-            mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths, Q_LEN=Q_LEN, KV_LEN=KV_LEN, lck=lck
-            ),
+            mask_mod=generate_eagle3_mask(Q_LEN=Q_LEN, KV_LEN=KV_LEN, lck=lck),
             B=1,
             H=1,
             Q_LEN=Q_LEN,
             KV_LEN=KV_LEN,
             device=query.device,
         )
+        # PR #91 simplified generate_eagle3_mask to drop seq_lengths-aware shrinking;
+        # the mask is now the full causal+suffix pattern at every q row.
         # fmt: off
         expected_mask = torch.tensor([[[
             [1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
@@ -272,8 +270,8 @@ class TestEagle3FlexMask(unittest.TestCase):
             [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
             [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
             [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+            [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
         ]]], dtype=torch.int32).to(query.device)
         # fmt: on
         dense_mask = block_mask.to_dense()

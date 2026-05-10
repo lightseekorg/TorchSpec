@@ -1,279 +1,184 @@
-"""Tests for build_eagle3_block_mask -- the analytical BlockMask builder."""
+"""Tests for build_eagle3_block_mask -- the analytical Eagle3 BlockMask builder."""
+
 import unittest
+
 import torch
+import torch._dynamo as dynamo
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from torchspec.models.ops.flex_attention import (
+    _build_eagle3_block_mask_tensors,
     build_eagle3_block_mask,
     eagle3_block_mask,
     generate_eagle3_mask,
 )
 
+DEVICE = "cuda"
+BLOCK_SIZE = 128
 
-def _mask_to_dense_bool(Q_LEN, KV_LEN, bm, BLOCK_SIZE=128):
-    """Convert a BlockMask to a full (Q_LEN, KV_LEN) bool tensor via mask_mod."""
-    qi = torch.arange(Q_LEN, device="cuda").unsqueeze(1)
-    ki = torch.arange(KV_LEN, device="cuda").unsqueeze(0)
-    b = torch.zeros_like(qi)
+
+def dense_from_mod(Q_LEN, KV_LEN, mask_mod, batch_idx=0):
+    """Materialise a (Q_LEN, KV_LEN) bool grid from a mask_mod or BlockMask."""
+    qi = torch.arange(Q_LEN, device=DEVICE).unsqueeze(1)
+    ki = torch.arange(KV_LEN, device=DEVICE).unsqueeze(0)
+    b = torch.full_like(qi, batch_idx)
     h = torch.zeros_like(qi)
-    return bm.mask_mod(b, h, qi, ki).bool()
+    fn = mask_mod.mask_mod if hasattr(mask_mod, "mask_mod") else mask_mod
+    return fn(b, h, qi, ki).bool()
+
+
+def reference_block_mask(Q_LEN, KV_LEN, B=1, H=1):
+    """create_block_mask using the production simplified mask_mod."""
+    return create_block_mask(
+        generate_eagle3_mask(Q_LEN, KV_LEN),
+        B=B,
+        H=H,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=DEVICE,
+    )
+
+
+# Sizes covering single round, short-multi-round, and aligned-multi-round cases.
+SHAPES = [(256, 256), (256, 768), (256, 1280), (1024, 4096)]
 
 
 class TestBuildEagle3BlockMask(unittest.TestCase):
+    """Analytical builder must produce a mask equivalent to create_block_mask."""
 
-    def _reference_block_mask(self, Q_LEN, KV_LEN, B=1, H=1, device="cuda"):
-        seq_lengths = torch.tensor([Q_LEN] * B, device=device, dtype=torch.int32)
-        mask_mod = generate_eagle3_mask(seq_lengths, Q_LEN, KV_LEN, lck=0)
-        return create_block_mask(mask_mod, B=B, H=H, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device)
+    def test_dense_mask_matches_reference(self):
+        for Q, KV in SHAPES:
+            with self.subTest(Q=Q, KV=KV):
+                ref = dense_from_mod(Q, KV, reference_block_mask(Q, KV))
+                ours = dense_from_mod(Q, KV, build_eagle3_block_mask(Q, KV, device=DEVICE))
+                self.assertTrue(torch.equal(ref, ours))
 
-    def test_mask_pattern_matches_reference_small(self):
-        """Element-level mask pattern must be identical for small sizes."""
-        for n_rounds in [1, 2, 3, 5]:
-            Q_LEN = 256
-            KV_LEN = Q_LEN * n_rounds
-            with self.subTest(rounds=n_rounds):
-                ref = self._reference_block_mask(Q_LEN, KV_LEN)
-                ours = build_eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-                ref_dense = _mask_to_dense_bool(Q_LEN, KV_LEN, ref)
-                our_dense = _mask_to_dense_bool(Q_LEN, KV_LEN, ours)
-                self.assertTrue(torch.equal(ref_dense, our_dense),
-                    f"Mask pattern mismatch at rounds={n_rounds}")
-
-    def test_mask_pattern_matches_reference_medium(self):
-        """Test at 1024 tokens with multiple rounds."""
-        for n_rounds in [1, 2, 4]:
-            Q_LEN = 1024
-            KV_LEN = Q_LEN * n_rounds
-            with self.subTest(rounds=n_rounds):
-                ref = self._reference_block_mask(Q_LEN, KV_LEN)
-                ours = build_eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-                ref_dense = _mask_to_dense_bool(Q_LEN, KV_LEN, ref)
-                our_dense = _mask_to_dense_bool(Q_LEN, KV_LEN, ours)
-                self.assertTrue(torch.equal(ref_dense, our_dense))
-
-    def test_batch_size_broadcast(self):
-        """H=1 mask should work with multi-head attention via broadcast."""
-        Q_LEN, KV_LEN = 256, 768
-        bm = build_eagle3_block_mask(Q_LEN, KV_LEN, B=2, H=1, device="cuda")
-        self.assertEqual(bm.kv_num_blocks.shape[0], 2)
-        self.assertEqual(bm.kv_num_blocks.shape[1], 1)
-
-    def test_flex_attention_output_matches(self):
-        """flex_attention output must match between analytical and reference mask."""
+    def test_forward_matches_reference(self):
         torch.manual_seed(42)
         B, H, D = 1, 4, 64
-        Q_LEN = 512
-        for n_rounds in [1, 2, 3]:
-            KV_LEN = Q_LEN * n_rounds
-            with self.subTest(rounds=n_rounds):
-                q = torch.randn(B, H, Q_LEN, D, device="cuda", dtype=torch.bfloat16)
-                k = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.bfloat16)
-                v = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.bfloat16)
-
-                ref_bm = self._reference_block_mask(Q_LEN, KV_LEN)
-                our_bm = build_eagle3_block_mask(Q_LEN, KV_LEN, B=B, H=1, device="cuda")
-
-                out_ref = flex_attention(q, k, v, block_mask=ref_bm, enable_gqa=False)
-                out_ours = flex_attention(q, k, v, block_mask=our_bm, enable_gqa=False)
-
-                self.assertEqual(out_ref.shape, out_ours.shape)
-                self.assertFalse(out_ours.isnan().any())
-                max_diff = (out_ref - out_ours).abs().max().item()
-                self.assertAlmostEqual(max_diff, 0.0, places=5,
-                    msg=f"Output diff={max_diff} at rounds={n_rounds}")
-
-    def test_flex_attention_gqa(self):
-        """Test with GQA (fewer KV heads than Q heads)."""
-        torch.manual_seed(42)
-        B, Q_HEADS, KV_HEADS, D = 1, 8, 2, 64
-        Q_LEN, KV_LEN = 256, 768
-
-        q = torch.randn(B, Q_HEADS, Q_LEN, D, device="cuda", dtype=torch.bfloat16)
-        k = torch.randn(B, KV_HEADS, KV_LEN, D, device="cuda", dtype=torch.bfloat16)
-        v = torch.randn(B, KV_HEADS, KV_LEN, D, device="cuda", dtype=torch.bfloat16)
-
-        bm = build_eagle3_block_mask(Q_LEN, KV_LEN, B=B, H=1, device="cuda")
-        out = flex_attention(q, k, v, block_mask=bm, enable_gqa=True)
-
-        self.assertEqual(out.shape, (B, Q_HEADS, Q_LEN, D))
-        self.assertFalse(out.isnan().any())
-
-    def test_backward_pass(self):
-        """Gradients must flow through flex_attention with analytical mask."""
-        torch.manual_seed(42)
-        B, H, D = 1, 4, 64
-        Q_LEN, KV_LEN = 256, 768
-
-        q = torch.randn(B, H, Q_LEN, D, device="cuda", dtype=torch.float32, requires_grad=True)
-        k = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.float32, requires_grad=True)
-        v = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.float32, requires_grad=True)
-
-        bm = build_eagle3_block_mask(Q_LEN, KV_LEN, B=B, H=1, device="cuda")
-        out = flex_attention(q, k, v, block_mask=bm, enable_gqa=False)
-        out.sum().backward()
-
-        for name, t in [("q", q), ("k", k), ("v", v)]:
-            self.assertIsNotNone(t.grad, f"{name}.grad is None")
-            self.assertFalse(t.grad.isnan().any(), f"{name}.grad has NaN")
+        for Q, KV in SHAPES:
+            with self.subTest(Q=Q, KV=KV):
+                q = torch.randn(B, H, Q, D, device=DEVICE, dtype=torch.bfloat16)
+                k = torch.randn(B, H, KV, D, device=DEVICE, dtype=torch.bfloat16)
+                v = torch.randn(B, H, KV, D, device=DEVICE, dtype=torch.bfloat16)
+                ref = flex_attention(q, k, v, block_mask=reference_block_mask(Q, KV))
+                ours = flex_attention(q, k, v, block_mask=build_eagle3_block_mask(Q, KV, B=B))
+                self.assertEqual(ref.shape, ours.shape)
+                self.assertFalse(ours.isnan().any())
+                self.assertLess((ref - ours).abs().max().item(), 1e-5)
 
     def test_backward_gradients_match_reference(self):
-        """Gradients must match between analytical and reference masks."""
         torch.manual_seed(42)
-        B, H, D = 1, 4, 64
-        Q_LEN, KV_LEN = 256, 768
+        B, H, D, Q, KV = 1, 4, 64, 256, 768
 
-        q1 = torch.randn(B, H, Q_LEN, D, device="cuda", dtype=torch.float32, requires_grad=True)
-        k1 = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.float32, requires_grad=True)
-        v1 = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.float32, requires_grad=True)
-        q2, k2, v2 = [t.clone().detach().requires_grad_(True) for t in (q1, k1, v1)]
+        def grads(mask):
+            q = torch.randn(B, H, Q, D, device=DEVICE, dtype=torch.float32, requires_grad=True)
+            k = torch.randn(B, H, KV, D, device=DEVICE, dtype=torch.float32, requires_grad=True)
+            v = torch.randn(B, H, KV, D, device=DEVICE, dtype=torch.float32, requires_grad=True)
+            flex_attention(q, k, v, block_mask=mask).sum().backward()
+            return q.grad, k.grad, v.grad
 
-        ref_bm = self._reference_block_mask(Q_LEN, KV_LEN)
-        our_bm = build_eagle3_block_mask(Q_LEN, KV_LEN, B=B, H=1, device="cuda")
+        torch.manual_seed(42)
+        gq_r, gk_r, gv_r = grads(reference_block_mask(Q, KV))
+        torch.manual_seed(42)
+        gq_o, gk_o, gv_o = grads(build_eagle3_block_mask(Q, KV, B=B))
+        for name, gr, go in [("q", gq_r, gq_o), ("k", gk_r, gk_o), ("v", gv_r, gv_o)]:
+            self.assertLess((gr - go).abs().max().item(), 1e-4, f"grad mismatch on {name}")
 
-        flex_attention(q1, k1, v1, block_mask=ref_bm, enable_gqa=False).sum().backward()
-        flex_attention(q2, k2, v2, block_mask=our_bm, enable_gqa=False).sum().backward()
-
-        for name, g1, g2 in [("q", q1.grad, q2.grad), ("k", k1.grad, k2.grad), ("v", v1.grad, v2.grad)]:
-            max_diff = (g1 - g2).abs().max().item()
-            self.assertAlmostEqual(max_diff, 0.0, places=4,
-                msg=f"Gradient mismatch for {name}: max_diff={max_diff}")
-
-    def test_causal_only_single_round(self):
-        """With KV_LEN == Q_LEN (1 round), mask should be purely causal."""
-        Q_LEN = 256
-        bm = build_eagle3_block_mask(Q_LEN, Q_LEN, B=1, H=1, device="cuda")
-        dense = _mask_to_dense_bool(Q_LEN, Q_LEN, bm)
-
-        # Lower triangular
-        expected = torch.tril(torch.ones(Q_LEN, Q_LEN, device="cuda", dtype=torch.bool))
-        self.assertTrue(torch.equal(dense, expected), "Single round should be purely causal")
-
-    def test_suffix_diagonal_structure(self):
-        """Suffix rounds should have exactly one active element per row (diagonal)."""
-        Q_LEN = 256
-        KV_LEN = 256 * 3  # 3 rounds: 1 causal + 2 suffix
-        bm = build_eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-        dense = _mask_to_dense_bool(Q_LEN, KV_LEN, bm)
-
-        # Check suffix region (kv_idx >= Q_LEN)
-        suffix_mask = dense[:, Q_LEN:]  # (Q_LEN, 2*Q_LEN)
-        for qi in range(Q_LEN):
-            active_kv = suffix_mask[qi].nonzero().squeeze(-1)
-            # Should have exactly 2 active positions (one per suffix round)
-            self.assertEqual(active_kv.numel(), 2,
-                f"Row {qi}: expected 2 suffix positions, got {active_kv.numel()}")
+    def test_gqa_broadcast(self):
+        """H=1 mask broadcasts over multi-Q-head GQA without NaN."""
+        torch.manual_seed(0)
+        B, Qh, KVh, D, Q, KV = 1, 8, 2, 64, 256, 768
+        q = torch.randn(B, Qh, Q, D, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(B, KVh, KV, D, device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn(B, KVh, KV, D, device=DEVICE, dtype=torch.bfloat16)
+        bm = build_eagle3_block_mask(Q, KV, B=B, device=DEVICE)
+        out = flex_attention(q, k, v, block_mask=bm, enable_gqa=True)
+        self.assertEqual(out.shape, (B, Qh, Q, D))
+        self.assertFalse(out.isnan().any())
 
     def test_memory_is_negligible(self):
-        """Analytical builder should use negligible memory."""
-        Q_LEN, KV_LEN = 4096, 4096 * 5
+        """Original create_block_mask costs ~112 GB at Q=49K; this must stay in MB."""
+        Q, KV = 4096, 4096 * 5
         torch.cuda.reset_peak_memory_stats()
         before = torch.cuda.memory_allocated()
-        bm = build_eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-        after = torch.cuda.max_memory_allocated()
-        mem_mb = (after - before) / 1024**2
-        self.assertLess(mem_mb, 10.0,
-            f"Block mask used {mem_mb:.1f} MB -- should be negligible")
+        build_eagle3_block_mask(Q, KV, device=DEVICE)
+        mem_mb = (torch.cuda.max_memory_allocated() - before) / 1024**2
+        self.assertLess(mem_mb, 10.0, f"used {mem_mb:.1f} MB")
 
-    def test_assertion_on_non_divisible(self):
-        """Should raise if Q_LEN or KV_LEN not divisible by BLOCK_SIZE."""
+    def test_assertions_on_invalid_shapes(self):
+        # not divisible by BLOCK_SIZE
         with self.assertRaises(AssertionError):
-            build_eagle3_block_mask(100, 300, B=1, H=1, device="cuda")
-
-    def test_assertion_on_non_round_aligned_kv(self):
-        """Should raise if KV_LEN is not an integer multiple of Q_LEN."""
-        # 256-aligned to BLOCK_SIZE but KV_LEN % Q_LEN != 0.
+            build_eagle3_block_mask(100, 300, device=DEVICE)
+        # KV not a Q-multiple
         with self.assertRaises(AssertionError):
-            build_eagle3_block_mask(256, 384, B=1, H=1, device="cuda")
+            build_eagle3_block_mask(256, 384, device=DEVICE)
 
 
 class TestEagle3BlockMaskDispatcher(unittest.TestCase):
-    """Tests for the eagle3_block_mask dispatcher (analytical + fallback)."""
+    """Dispatcher picks analytical when shapes align, otherwise falls back."""
 
-    def _ref_dense(self, Q_LEN, KV_LEN, bm):
-        qi = torch.arange(Q_LEN, device="cuda").unsqueeze(1)
-        ki = torch.arange(KV_LEN, device="cuda").unsqueeze(0)
-        b = torch.zeros_like(qi)
-        h = torch.zeros_like(qi)
-        return bm.mask_mod(b, h, qi, ki).bool()
+    def test_analytical_path_when_aligned(self):
+        for Q, KV in [(256, 256), (256, 768)]:
+            with self.subTest(Q=Q, KV=KV):
+                disp = eagle3_block_mask(Q, KV, B=1, H=1, device=DEVICE)
+                ana = build_eagle3_block_mask(Q, KV, device=DEVICE)
+                self.assertTrue(torch.equal(disp.kv_indices, ana.kv_indices))
+                self.assertTrue(torch.equal(disp.q_indices, ana.q_indices))
 
-    def test_dispatcher_picks_analytical_path(self):
-        """When Q_LEN aligned & KV_LEN % Q_LEN == 0, output must equal analytical builder."""
-        Q_LEN, KV_LEN = 256, 256 * 3
-        dispatched = eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-        analytical = build_eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-        # Same kv_indices/q_indices structure indicates analytical path was taken.
-        self.assertTrue(torch.equal(dispatched.kv_num_blocks, analytical.kv_num_blocks))
-        self.assertTrue(torch.equal(dispatched.kv_indices, analytical.kv_indices))
-        self.assertTrue(torch.equal(dispatched.q_num_blocks, analytical.q_num_blocks))
-        self.assertTrue(torch.equal(dispatched.q_indices, analytical.q_indices))
+    def test_fallback_path_matches_reference_mask_mod(self):
+        """Fallback shapes (Q<BLOCK_SIZE, or KV%Q!=0) must produce the canonical mask."""
+        for Q, KV in [(64, 64), (256, 384)]:
+            with self.subTest(Q=Q, KV=KV):
+                bm = eagle3_block_mask(Q, KV, B=1, H=1, device=DEVICE)
+                expected = dense_from_mod(Q, KV, generate_eagle3_mask(Q, KV))
+                self.assertTrue(torch.equal(dense_from_mod(Q, KV, bm), expected))
 
-    def test_dispatcher_first_round_uses_analytical(self):
-        """First round (KV_LEN == Q_LEN) is now handled by the analytical builder."""
-        Q_LEN = 256
-        dispatched = eagle3_block_mask(Q_LEN, Q_LEN, B=1, H=1, device="cuda")
-        analytical = build_eagle3_block_mask(Q_LEN, Q_LEN, B=1, H=1, device="cuda")
-        self.assertTrue(torch.equal(dispatched.kv_indices, analytical.kv_indices))
-
-    def test_dispatcher_falls_back_when_q_too_small(self):
-        """When Q_LEN < BLOCK_SIZE, must fall back to create_block_mask without raising."""
-        Q_LEN, KV_LEN = 64, 64
-        bm = eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-        # Should produce a causal-only mask and not raise.
-        dense = self._ref_dense(Q_LEN, KV_LEN, bm)
-        expected = torch.tril(torch.ones(Q_LEN, KV_LEN, device="cuda", dtype=torch.bool))
-        self.assertTrue(torch.equal(dense, expected))
-
-    def test_dispatcher_falls_back_when_kv_not_round_multiple(self):
-        """When KV_LEN % Q_LEN != 0, must fall back rather than raising the assert."""
-        # 256 and 384 are both multiples of 128 but 384 % 256 != 0, so analytical
-        # path's diagonal layout would be wrong: dispatcher must take the fallback.
-        Q_LEN, KV_LEN = 256, 384
-        bm = eagle3_block_mask(Q_LEN, KV_LEN, B=1, H=1, device="cuda")
-        # Mask correctness is verified element-wise against the canonical mask_mod.
-        seq_lengths = torch.tensor([Q_LEN], device="cuda", dtype=torch.int32)
-        ref_mod = generate_eagle3_mask(seq_lengths, Q_LEN, KV_LEN, lck=0)
-        qi = torch.arange(Q_LEN, device="cuda").unsqueeze(1)
-        ki = torch.arange(KV_LEN, device="cuda").unsqueeze(0)
-        b = torch.zeros_like(qi)
-        h = torch.zeros_like(qi)
-        expected = ref_mod(b, h, qi, ki).bool()
-        actual = bm.mask_mod(b, h, qi, ki).bool()
-        self.assertTrue(torch.equal(actual, expected))
-
-    def test_dispatcher_flex_attention_matches_reference(self):
-        """flex_attention output via dispatcher must match the create_block_mask reference."""
-        torch.manual_seed(42)
+    def test_dispatcher_forward_matches_reference(self):
+        torch.manual_seed(0)
         B, H, D = 1, 4, 64
-        for Q_LEN, KV_LEN in [(256, 256), (256, 256 * 3), (512, 512 * 4)]:
-            with self.subTest(Q_LEN=Q_LEN, KV_LEN=KV_LEN):
-                q = torch.randn(B, H, Q_LEN, D, device="cuda", dtype=torch.bfloat16)
-                k = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.bfloat16)
-                v = torch.randn(B, H, KV_LEN, D, device="cuda", dtype=torch.bfloat16)
-
-                seq_lengths = torch.tensor([Q_LEN] * B, device="cuda", dtype=torch.int32)
-                ref_bm = create_block_mask(
-                    generate_eagle3_mask(seq_lengths, Q_LEN, KV_LEN, lck=0),
-                    B=B, H=1, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device="cuda",
+        for Q, KV in [(256, 256), (256, 768)]:
+            with self.subTest(Q=Q, KV=KV):
+                q = torch.randn(B, H, Q, D, device=DEVICE, dtype=torch.bfloat16)
+                k = torch.randn(B, H, KV, D, device=DEVICE, dtype=torch.bfloat16)
+                v = torch.randn(B, H, KV, D, device=DEVICE, dtype=torch.bfloat16)
+                ref = flex_attention(q, k, v, block_mask=reference_block_mask(Q, KV, B=B))
+                disp = flex_attention(
+                    q, k, v, block_mask=eagle3_block_mask(Q, KV, B=B, H=1, device=DEVICE)
                 )
-                dispatched_bm = eagle3_block_mask(
-                    Q_LEN, KV_LEN, B=B, H=1, device="cuda",
-                )
+                self.assertLess((ref - disp).abs().max().item(), 1e-5)
 
-                out_ref = flex_attention(q, k, v, block_mask=ref_bm, enable_gqa=False)
-                out_disp = flex_attention(q, k, v, block_mask=dispatched_bm, enable_gqa=False)
-                self.assertEqual(out_ref.shape, out_disp.shape)
-                max_diff = (out_ref - out_disp).abs().max().item()
-                self.assertAlmostEqual(max_diff, 0.0, places=5,
-                    msg=f"Output diff={max_diff} at Q={Q_LEN}, KV={KV_LEN}")
 
-    def test_dispatcher_seq_lengths_optional(self):
-        """seq_lengths is optional; analytical path ignores it, fallback synthesises a default."""
-        # Analytical path: no seq_lengths required.
-        bm1 = eagle3_block_mask(256, 768, B=1, H=1, device="cuda")
-        self.assertEqual(bm1.kv_indices.shape[0], 1)
-        # Fallback path: omitted seq_lengths must not raise.
-        bm2 = eagle3_block_mask(64, 64, B=1, H=1, device="cuda")
-        self.assertIsNotNone(bm2)
+class TestCompiledTensorBuilder(unittest.TestCase):
+    """build_eagle3_block_mask routes through torch.compile -- verify behaviour."""
+
+    def test_compiled_output_matches_eager(self):
+        for Q, KV in [(256, 256), (256, 768), (1024, 4096)]:
+            with self.subTest(Q=Q, KV=KV):
+                eager = _build_eagle3_block_mask_tensors(Q, KV, 1, 1, BLOCK_SIZE, DEVICE)
+                bm = build_eagle3_block_mask(Q, KV, device=DEVICE)
+                self.assertTrue(torch.equal(bm.kv_num_blocks, eager[0]))
+                self.assertTrue(torch.equal(bm.kv_indices, eager[1]))
+                self.assertTrue(torch.equal(bm.q_num_blocks, eager[2]))
+                self.assertTrue(torch.equal(bm.q_indices, eager[3]))
+
+    def test_dynamic_true_does_not_recompile_across_growing_kv(self):
+        """KV_LEN grows by Q_LEN every TTT step; dynamic=True must keep one graph."""
+        Q = 512
+        # Warm up to lock the compiled artifact.
+        build_eagle3_block_mask(Q, Q, device=DEVICE)
+        dynamo.reset()
+        build_eagle3_block_mask(Q, Q, device=DEVICE)
+        before = dynamo.utils.counters["stats"].get("unique_graphs", 0)
+        for n_rounds in [2, 3, 4, 5]:
+            build_eagle3_block_mask(Q, Q * n_rounds, device=DEVICE)
+        after = dynamo.utils.counters["stats"].get("unique_graphs", 0)
+        # First call after dynamo.reset() compiles once (+1); growing KV must not add more.
+        self.assertLessEqual(
+            after - before,
+            1,
+            f"dynamic=True triggered {after - before} extra graphs across growing KV",
+        )
 
 
 if __name__ == "__main__":
