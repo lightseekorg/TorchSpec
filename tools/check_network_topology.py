@@ -252,12 +252,19 @@ def run_cluster() -> None:
             return port
 
         def accept_all(self, count: int) -> None:
-            for _ in range(count):
+            deadline = time.monotonic() + _connect_timeout() * 2
+            accepted = 0
+            while accepted < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._server.settimeout(remaining)
                 try:
                     conn, _ = self._server.accept()
                     conn.close()
+                    accepted += 1
                 except OSError:
-                    pass
+                    break
             self._server.close()
 
         def probe(self, target_ip: str, port: int) -> tuple[bool, float]:
