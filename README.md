@@ -54,8 +54,8 @@ TorchSpec streams hidden states from inference engines into training workers.
 
 | Backend | Support Tier | Status |
 |---------|--------------|--------|
-| [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | First-class | In progress |
 | [vLLM](https://github.com/vllm-project/vllm) | First-class | Available |
+| [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | First-class | In progress |
 | [SGLang](https://github.com/sgl-project/sglang) | Best community effort | Available |
 | [HuggingFace Transformers](https://github.com/huggingface/transformers) | Best community effort | Available |
 
