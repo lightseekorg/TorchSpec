@@ -8,15 +8,24 @@ TorchSpec currently includes training flows and examples for:
 - MiniMax-M2.5
 - Qwen3-Coder-Next
 
+## 🤗 Released Models
+
+Draft models trained with TorchSpec, available on the [LightSeek Foundation](https://huggingface.co/lightseekorg) Hugging Face organization:
+
+- [lightseekorg/kimi-k2.5-eagle3](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3)
+- [lightseekorg/kimi-k2.5-eagle3-mla](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3-mla)
+- [lightseekorg/kimi-k2.6-eagle3](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3)
+- [lightseekorg/kimi-k2.6-eagle3-mla](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3-mla)
+
 ## 🚀 Blogs
 
 - PyTorch blog: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/)
 - Release blog: [TorchSpec: Speculative Decoding Training at Scale](https://lightseek.org/blog/torchspec-speculative-decoding-training-at-scale.html)
-- Released draft model: [lightseekorg/kimi-k2.5-eagle3](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3)
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
+- [Inference Backend Support](#inference-backend-support)
 - [Quick Start](#quick-start)
 - [Setup](#setup)
 - [Examples](#examples)
@@ -33,11 +42,22 @@ TorchSpec currently includes training flows and examples for:
 
 TorchSpec is built around a disaggregated training pipeline:
 
-- **Inference engines** generate target-model hidden states with either vLLM or SGLang.
+- **Inference engines** generate target-model hidden states with inference engines.
 - **Mooncake store** transfers tensors between inference and training without materializing them on disk.
 - **Training workers** consume streamed hidden states to train speculative decoding draft models.
 
 This separation keeps the training side focused on optimization while letting the inference side scale for hidden-state generation throughput.
+
+## Inference Backend Support
+
+TorchSpec streams hidden states from inference engines into training workers.
+
+| Backend | Support Tier | Status |
+|---------|--------------|--------|
+| [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | First-class | In progress |
+| [vLLM](https://github.com/vllm-project/vllm) | First-class | Available |
+| [SGLang](https://github.com/sgl-project/sglang) | Best community effort | Available |
+| [HuggingFace Transformers](https://github.com/huggingface/transformers) | Best community effort | Available |
 
 ## Quick Start
 
