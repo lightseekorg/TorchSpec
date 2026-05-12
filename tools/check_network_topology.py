@@ -252,7 +252,18 @@ def measure_rdma_bandwidth(devices: list[dict]) -> list[dict]:
         server = None
         try:
             server = subprocess.Popen(
-                ["ib_write_bw", "-d", dev_name, "--port", str(port), "-D", "3", "--report_gbits"],
+                [
+                    "ib_write_bw",
+                    "-d",
+                    dev_name,
+                    "-i",
+                    str(active_port["port"]),
+                    "--port",
+                    str(port),
+                    "-D",
+                    "3",
+                    "--report_gbits",
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -262,6 +273,8 @@ def measure_rdma_bandwidth(devices: list[dict]) -> list[dict]:
                     "ib_write_bw",
                     "-d",
                     dev_name,
+                    "-i",
+                    str(active_port["port"]),
                     "--port",
                     str(port),
                     target_ip,
