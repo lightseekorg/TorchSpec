@@ -223,24 +223,23 @@ def _parse_ib_write_bw(stdout: str) -> float | None:
 
 
 def measure_rdma_bandwidth(devices: list[dict]) -> list[dict]:
+    by_device: dict[str, list[dict]] = {}
+    for dev in devices:
+        by_device.setdefault(dev["name"], []).append(dev)
+
     results = []
-    seen: set[str] = set()
     tool_missing = False
 
-    for dev in devices:
-        dev_name = dev["name"]
-        if dev_name in seen:
-            continue
-        seen.add(dev_name)
-
+    for dev_name, ports in by_device.items():
         if tool_missing:
             results.append(
                 {"device": dev_name, "bw_gbps": None, "note": "ib_write_bw not installed"}
             )
             continue
 
-        if "ACTIVE" not in dev.get("state", "").upper():
-            results.append({"device": dev_name, "bw_gbps": None, "note": "port not active"})
+        active_port = next((p for p in ports if "ACTIVE" in p.get("state", "").upper()), None)
+        if active_port is None:
+            results.append({"device": dev_name, "bw_gbps": None, "note": "no active port found"})
             continue
 
         port = _find_free_port(18500)
