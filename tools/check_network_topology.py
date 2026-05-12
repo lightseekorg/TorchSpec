@@ -4,7 +4,8 @@
 Checks:
   1. Available RDMA devices and their link rate/state/layer on each node.
   2. Network interfaces suitable for NCCL_SOCKET_IFNAME on each node.
-  3. Pairwise TCP connectivity between all nodes in the Ray cluster.
+  3. RDMA data-plane bandwidth per HCA via ib_write_bw loopback (requires perftest).
+  4. Pairwise TCP connectivity between all nodes in the Ray cluster.
 
 Usage (local node only):
     python tools/check_network_topology.py
@@ -18,6 +19,10 @@ Environment variables:
     TORCHSPEC_PROBE_TIMEOUT   TCP connect timeout in seconds for the
                               pairwise connectivity test. Default: 5.0.
                               Increase this for high-latency networks.
+
+Dependencies for bandwidth test:
+    ib_write_bw from the perftest package (apt install perftest).
+    If not installed, the bandwidth section is skipped gracefully.
 """
 
 import os
@@ -63,8 +68,8 @@ def get_rdma_devices() -> list[dict]:
                 current["link_layer"] = line.split()[-1]
             elif current and line.startswith("state:"):
                 current["state"] = line.split(":", 1)[-1].strip()
-            elif current and line.startswith("active_width"):
-                pass
+            elif current and line.startswith("active_speed:"):
+                current["rate"] = line.split(":", 1)[-1].strip()
         if current:
             devices.append(current)
         return devices
@@ -185,10 +190,136 @@ def print_nccl_report(ifaces: list[dict], node_label: str = "local") -> None:
         print(f"\n  Recommended: export NCCL_SOCKET_IFNAME={candidates[0]}")
 
 
+def _find_free_port(start: int = 18500) -> int:
+    port = start
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+                return port
+            except OSError:
+                port += 1
+
+
+def _rdma_device_ip(dev_name: str) -> str | None:
+    net_path = f"/sys/class/infiniband/{dev_name}/device/net"
+    if os.path.isdir(net_path):
+        for iface in os.listdir(net_path):
+            ip = _iface_ipv4(iface)
+            if ip:
+                return ip
+    return None
+
+
+def _parse_ib_write_bw(stdout: str) -> float | None:
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0].isdigit():
+            try:
+                return float(parts[3])
+            except ValueError:
+                pass
+    return None
+
+
+def measure_rdma_bandwidth(devices: list[dict]) -> list[dict]:
+    results = []
+    seen: set[str] = set()
+    tool_missing = False
+
+    for dev in devices:
+        dev_name = dev["name"]
+        if dev_name in seen:
+            continue
+        seen.add(dev_name)
+
+        if tool_missing:
+            results.append(
+                {"device": dev_name, "bw_gbps": None, "note": "ib_write_bw not installed"}
+            )
+            continue
+
+        if "ACTIVE" not in dev.get("state", "").upper():
+            results.append({"device": dev_name, "bw_gbps": None, "note": "port not active"})
+            continue
+
+        port = _find_free_port(18500)
+        target_ip = _rdma_device_ip(dev_name)
+        if target_ip is None:
+            results.append(
+                {"device": dev_name, "bw_gbps": None, "note": "could not resolve device IP"}
+            )
+            continue
+        server = None
+        try:
+            server = subprocess.Popen(
+                ["ib_write_bw", "-d", dev_name, "--port", str(port), "-D", "3", "--report_gbits"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.5)
+            client_result = subprocess.run(
+                [
+                    "ib_write_bw",
+                    "-d",
+                    dev_name,
+                    "--port",
+                    str(port),
+                    target_ip,
+                    "-D",
+                    "3",
+                    "--report_gbits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            bw = _parse_ib_write_bw(client_result.stdout)
+            results.append(
+                {
+                    "device": dev_name,
+                    "bw_gbps": bw,
+                    "note": "" if bw is not None else "parse failed",
+                }
+            )
+        except FileNotFoundError:
+            tool_missing = True
+            print("  ib_write_bw not found. Install it with: apt install perftest")
+            results.append(
+                {"device": dev_name, "bw_gbps": None, "note": "ib_write_bw not installed"}
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            results.append({"device": dev_name, "bw_gbps": None, "note": str(e)})
+        finally:
+            if server is not None:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+
+    return results
+
+
+def print_rdma_bw_report(bw_results: list[dict], node_label: str = "local") -> None:
+    print(f"\nRDMA Bandwidth (ib_write_bw loopback) on {node_label}:")
+    if not bw_results:
+        print("  No active RDMA devices to test.")
+        return
+    col = "{:<16} {:<18} {}"
+    print("  " + col.format("Device", "BW average", "Note"))
+    print("  " + "-" * 55)
+    for r in bw_results:
+        bw_str = f"{r['bw_gbps']:.2f} Gb/s" if r["bw_gbps"] is not None else "n/a"
+        print("  " + col.format(r["device"], bw_str, r.get("note", "")))
+
+
 def _local_probe_info() -> dict:
+    rdma = get_rdma_devices()
     return {
-        "rdma_devices": get_rdma_devices(),
+        "rdma_devices": rdma,
         "nccl_interfaces": get_nccl_interfaces(),
+        "rdma_bandwidth": measure_rdma_bandwidth(rdma),
     }
 
 
@@ -213,17 +344,20 @@ def _tcp_probe(target_ip: str, port: int) -> tuple[bool, float]:
     try:
         s.connect((target_ip, port))
         rtt = (time.monotonic() - t0) * 1000
-        s.close()
         return True, rtt
     except OSError:
         return False, -1.0
+    finally:
+        s.close()
 
 
 def run_local() -> None:
     rdma = get_rdma_devices()
     ifaces = get_nccl_interfaces()
+    bw = measure_rdma_bandwidth(rdma)
     print_rdma_report(rdma)
     print_nccl_report(ifaces)
+    print_rdma_bw_report(bw)
 
 
 def run_cluster() -> None:
@@ -282,6 +416,7 @@ def run_cluster() -> None:
     for (node_ip, _), info in zip(actors, infos):
         print_rdma_report(info["rdma_devices"], node_label=node_ip)
         print_nccl_report(info["nccl_interfaces"], node_label=node_ip)
+        print_rdma_bw_report(info["rdma_bandwidth"], node_label=node_ip)
 
     print("\nPairwise TCP Connectivity Matrix:")
     n = len(actors)
