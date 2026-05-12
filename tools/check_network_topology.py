@@ -50,15 +50,21 @@ def get_rdma_devices() -> list[dict]:
             return devices
         if result.returncode != 0:
             return devices
+        current_hca: str | None = None
         current: dict | None = None
         for line in result.stdout.splitlines():
             line = line.strip()
             if line.startswith("hca_id:"):
                 if current:
                     devices.append(current)
+                    current = None
+                current_hca = line.split()[-1]
+            elif current_hca and line.startswith("port:"):
+                if current:
+                    devices.append(current)
                 current = {
-                    "name": line.split()[-1],
-                    "port": 1,
+                    "name": current_hca,
+                    "port": int(line.split()[-1]),
                     "state": "unknown",
                     "rate": "unknown",
                     "link_layer": "unknown",
@@ -68,6 +74,8 @@ def get_rdma_devices() -> list[dict]:
                 current["link_layer"] = line.split()[-1]
             elif current and line.startswith("state:"):
                 current["state"] = line.split(":", 1)[-1].strip()
+            elif current and line.startswith("phys_state:"):
+                current["phys_state"] = line.split(":", 1)[-1].strip()
             elif current and line.startswith("active_speed:"):
                 current["rate"] = line.split(":", 1)[-1].strip()
         if current:
