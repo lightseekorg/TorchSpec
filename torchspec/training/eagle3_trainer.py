@@ -36,6 +36,11 @@ from torchspec.utils.tensor import padding
 from torchspec.utils.train_dump import dump_eagle3_batch
 
 
+def _position_decay_weights(n: int) -> list[float]:
+    """Per-position TTT loss weights: ``0.8**i`` for ``i`` in ``range(n)``."""
+    return [0.8**i for i in range(n)]
+
+
 class Eagle3Trainer(Trainer):
     """Eagle3-specific trainer.
 
@@ -301,7 +306,7 @@ class Eagle3Trainer(Trainer):
         return plosses, vlosses, acces, acc_counts
 
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
-        ploss_weight = [0.8**i for i in range(len(plosses))]
+        ploss_weight = _position_decay_weights(len(plosses))
         ploss = sum(ploss_weight[i] * plosses[i] for i in range(len(plosses))) / accumulation_steps
         ploss.backward()
         return ploss
@@ -366,7 +371,7 @@ class Eagle3Trainer(Trainer):
             simulated_acc_len += cumulative
 
         ploss_weights = torch.tensor(
-            [0.8**i for i in range(avg_vlosses.shape[0])], device=avg_vlosses.device
+            _position_decay_weights(avg_vlosses.shape[0]), device=avg_vlosses.device
         )
         weighted_avg_loss = (avg_vlosses * ploss_weights).sum().item() / ploss_weights.sum().item()
 
@@ -457,9 +462,8 @@ class Eagle3Trainer(Trainer):
             cumulative *= avg_acces[i].item()
             simulated_acc_len += cumulative
 
-        # Compute weighted loss matching _backward's 0.8^i weighting
         ploss_weights = torch.tensor(
-            [0.8**i for i in range(avg_vlosses.shape[0])], device=avg_vlosses.device
+            _position_decay_weights(avg_vlosses.shape[0]), device=avg_vlosses.device
         )
         weighted_avg_loss = (avg_vlosses * ploss_weights).sum().item() / ploss_weights.sum().item()
 
