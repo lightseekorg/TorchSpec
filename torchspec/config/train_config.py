@@ -135,6 +135,9 @@ class TrainingConfig:
     training_num_gpus_per_node: int = 1
     training_num_nodes: int = 1
     ttt_length: int = 7
+    # Per-position TTT loss weights. If unset, defaults to [0.8**i for i in range(ttt_length)].
+    # Length must equal ttt_length when supplied.
+    ploss_weights: Optional[list[float]] = None
     warmup_ratio: float = 0.015
 
     # WSD LR schedule parameters (used by DFlash trainer only)

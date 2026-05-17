@@ -36,8 +36,16 @@ from torchspec.utils.tensor import padding
 from torchspec.utils.train_dump import dump_eagle3_batch
 
 
-def _position_decay_weights(n: int) -> list[float]:
-    """Per-position TTT loss weights: ``0.8**i`` for ``i`` in ``range(n)``."""
+def _position_decay_weights(n: int, weights: Optional[list[float]] = None) -> list[float]:
+    """Per-position TTT loss weights.
+
+    If ``weights`` is supplied, it is used as-is (after coercion to ``list[float]``).
+    Otherwise defaults to ``[0.8**i for i in range(n)]``.
+    """
+    if weights is not None:
+        if len(weights) != n:
+            raise ValueError(f"ploss_weights length {len(weights)} does not match ttt_length {n}")
+        return [float(w) for w in weights]
     return [0.8**i for i in range(n)]
 
 
@@ -306,7 +314,9 @@ class Eagle3Trainer(Trainer):
         return plosses, vlosses, acces, acc_counts
 
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
-        ploss_weight = _position_decay_weights(len(plosses))
+        ploss_weight = _position_decay_weights(
+            len(plosses), getattr(self.args, "ploss_weights", None)
+        )
         ploss = sum(ploss_weight[i] * plosses[i] for i in range(len(plosses))) / accumulation_steps
         ploss.backward()
         return ploss
@@ -371,7 +381,10 @@ class Eagle3Trainer(Trainer):
             simulated_acc_len += cumulative
 
         ploss_weights = torch.tensor(
-            _position_decay_weights(avg_vlosses.shape[0]), device=avg_vlosses.device
+            _position_decay_weights(
+                avg_vlosses.shape[0], getattr(self.args, "ploss_weights", None)
+            ),
+            device=avg_vlosses.device,
         )
         weighted_avg_loss = (avg_vlosses * ploss_weights).sum().item() / ploss_weights.sum().item()
 
@@ -463,7 +476,10 @@ class Eagle3Trainer(Trainer):
             simulated_acc_len += cumulative
 
         ploss_weights = torch.tensor(
-            _position_decay_weights(avg_vlosses.shape[0]), device=avg_vlosses.device
+            _position_decay_weights(
+                avg_vlosses.shape[0], getattr(self.args, "ploss_weights", None)
+            ),
+            device=avg_vlosses.device,
         )
         weighted_avg_loss = (avg_vlosses * ploss_weights).sum().item() / ploss_weights.sum().item()
 
