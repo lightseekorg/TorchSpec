@@ -77,6 +77,10 @@ class Eagle3Trainer(Trainer):
 
         init_context = self._get_init_weight_context_manager()
 
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: BEFORE AutoEagle3DraftModel.from_config"
+        )
         with init_context():
             draft_model = AutoEagle3DraftModel.from_config(
                 draft_model_config,
@@ -84,6 +88,10 @@ class Eagle3Trainer(Trainer):
                 torch_dtype=torch.bfloat16,
             )
 
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: BEFORE draft_model.load_embedding (rank-0 only)"
+        )
         if dist.get_rank() == 0:
             draft_model.load_embedding(
                 target_model_path,
@@ -92,7 +100,16 @@ class Eagle3Trainer(Trainer):
 
         draft_model.freeze_embedding()
 
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: BEFORE dist.barrier(get_gloo_group()) "
+            "-- gloo_group should be trainer-only, not union meta_group"
+        )
         dist.barrier(group=get_gloo_group())
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: AFTER dist.barrier(get_gloo_group()) -- barrier RETURNED"
+        )
 
         frozen_count = sum(p.numel() for p in draft_model.parameters() if not p.requires_grad)
         trainable_count = sum(p.numel() for p in draft_model.parameters() if p.requires_grad)
@@ -115,6 +132,9 @@ class Eagle3Trainer(Trainer):
             for name, m in eagle3_model.named_modules()
             if isinstance(m, torch.nn.Linear) and "midlayer" in name
         ]
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] eagle3.init_model: BEFORE apply_fsdp2"
+        )
         eagle3_model = apply_fsdp2(
             eagle3_model,
             mesh=self.grad_sync_mesh,
@@ -122,12 +142,20 @@ class Eagle3Trainer(Trainer):
             args=self.args,
             modules_to_shard=midlayer_modules,
         )
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: AFTER apply_fsdp2 -- BEFORE fsdp2_load_full_state_dict"
+        )
 
         eagle3_model = fsdp2_load_full_state_dict(
             eagle3_model,
             full_state,
             self.grad_sync_mesh,
             cpu_offload=True if self.fsdp_cpu_offload else None,
+        )
+        logger.warning(
+            f"[Rank {self.dp_rank}] [TS-COLOCATE-TRACE-T] "
+            "eagle3.init_model: AFTER fsdp2_load_full_state_dict"
         )
 
         self.model = eagle3_model
@@ -239,10 +267,20 @@ class Eagle3Trainer(Trainer):
         # Sync norm status from rank 0 so all ranks have the same parameter count
         # before the broadcast loop (prevents NCCL deadlock if norm loading
         # silently failed on rank 0 but structure creation succeeded elsewhere).
+        #
+        # All dist.* collectives in this method are scoped to
+        # get_gloo_group() — the trainer-only group (see
+        # trainer_actor.py). Without the explicit group they default to
+        # the union-world PG in colocate mode, and the engine never
+        # enters this code path, so the trainer hangs. On the 1-trainer
+        # tiny config the trainer group has a single rank, so every
+        # collective here is a no-op; on >=2 trainers it syncs only
+        # the trainer replicas.
+        _trainer_grp = get_gloo_group()
         has_norm = torch.tensor(
             [self.target_lm_head.norm is not None], dtype=torch.int32, device="cuda"
         )
-        dist.broadcast(has_norm, src=0)
+        dist.broadcast(has_norm, src=0, group=_trainer_grp)
         if has_norm.item():
             if self.target_lm_head.norm is None:
                 logger.warning(
@@ -261,10 +299,10 @@ class Eagle3Trainer(Trainer):
                 )
                 self.target_lm_head.norm = None
 
-        dist.barrier()
+        dist.barrier(group=_trainer_grp)
 
         for param in self.target_lm_head.parameters():
-            dist.broadcast(param.data, src=0)
+            dist.broadcast(param.data, src=0, group=_trainer_grp)
 
         logger.info(f"[Rank {self.dp_rank}] TargetLMHead initialized and synced")
 
@@ -369,8 +407,13 @@ class Eagle3Trainer(Trainer):
         avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
         avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
 
-        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
-        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        # Scoped to the trainer-only group (get_gloo_group()) so the
+        # metric all-reduce doesn't deadlock on the union-world default
+        # PG in colocate mode. 1-trainer => no-op; >=2 trainers => real
+        # AVG across trainer replicas.
+        _metric_grp = get_gloo_group()
+        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG, group=_metric_grp)
+        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG, group=_metric_grp)
 
         avg_acc_scalar = avg_acces.mean().item()
 
@@ -461,8 +504,13 @@ class Eagle3Trainer(Trainer):
         avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
         avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
 
-        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
-        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        # Scoped to the trainer-only group (get_gloo_group()) so the
+        # metric all-reduce doesn't deadlock on the union-world default
+        # PG in colocate mode. 1-trainer => no-op; >=2 trainers => real
+        # AVG across trainer replicas.
+        _metric_grp = get_gloo_group()
+        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG, group=_metric_grp)
+        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG, group=_metric_grp)
 
         avg_acc_scalar = avg_acces.mean().item()
 

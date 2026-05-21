@@ -55,6 +55,43 @@ class TrainSample:
     metadata: Optional[Dict[str, Any]] = None
 
 
+@dataclass
+class ColocateTrainSample:
+    """Trainer-side metadata for one colocate (NCCL P2P) step.
+
+    The disaggregated path uses :class:`TrainSample` to hand the trainer
+    a Mooncake key and shapes; the trainer then issues a Mooncake ``get``
+    to materialise the tensors. The colocate path skips Mooncake: tensors
+    arrive over NCCL P2P from the paired engine. The controller still
+    needs to ship CPU-side per-step metadata to the trainer (loss mask,
+    step id, the tensor key/shape/dtype set so the trainer can
+    pre-allocate recv buffers); that's what this struct carries.
+
+    Both variants pass through the same Ray queue, so call sites that
+    only forward samples can stay polymorphic. Components that do
+    something tensor-shaped (``MooncakeDataset`` vs ``ColocateDataset``)
+    branch on the dataclass type.
+
+    Fields:
+      step_id: Monotonic per-batch id from the controller. Used for
+        debug logs and as a sanity gate (engine and trainer should agree
+        on step ordering; mismatch is a bug).
+      tensor_specs: ``{name: (shape, dtype)}`` map. Feeds directly into
+        :meth:`NcclMultiTensorFetcher.recv_step`. ``dtype`` may be a
+        ``torch.dtype`` or a string (`"bfloat16"` / `"torch.bfloat16"`)
+        for symmetry with the Mooncake metadata path.
+      packed_loss_mask, last_turn_loss_only, metadata: identical
+        semantics to ``TrainSample`` — passed through into the batch
+        dict by the dataset.
+    """
+
+    step_id: int
+    tensor_specs: Dict[str, Tuple[Tuple[int, ...], Any]]
+    packed_loss_mask: Optional[str] = None
+    last_turn_loss_only: Optional[bool] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class MooncakeDataset(IterableDataset):
     """IterableDataset that loads from mooncake via queue.
 
@@ -538,6 +575,247 @@ class MooncakeDataFetcher:
             skip_after_header=skip_after_header,
             min_loss_tokens=min_loss_tokens,
             usp_enabled=usp_enabled,
+            ttt_length=ttt_length,
+            max_seq_length=max_seq_length,
+        )
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        return iter(self._dataloader)
+
+
+# ----------------------------------------------------------------------
+# Colocate (Phase 4) — NCCL P2P data plane.
+# ----------------------------------------------------------------------
+
+
+class ColocateDataset(IterableDataset):
+    """IterableDataset that recvs tensors via NCCL P2P from the paired engine.
+
+    Mirrors :class:`MooncakeDataset` but skips the Mooncake store: each
+    iteration pulls a :class:`ColocateTrainSample` from the controller's
+    Ray queue, then blocks on a single ``batch_isend_irecv`` to receive
+    the tensor dict from the paired engine. Output shape matches
+    ``MooncakeDataset.__iter__`` so downstream collator + trainer code
+    stays the same.
+
+    The fetcher is constructed once per trainer rank with a fixed
+    ``src_global_rank`` (the paired engine in the union world). Tensor
+    shapes change per step (variable seq_len) so we don't pre-allocate
+    buffers; each ``recv_step`` allocates fresh. Phase 6 revisits this
+    if memory churn shows up in the stability test.
+
+    Note on USP: the colocate path is **not** USP-aware in Phase 4 (the
+    plan punts USP+colocate to a follow-up). If ``usp_enabled`` we
+    raise; the caller (``Trainer.set_train_queue``) must guard against
+    this.
+    """
+
+    def __init__(
+        self,
+        ray_queue: RayQueue,
+        nccl_fetcher,  # NcclMultiTensorFetcher; type omitted to avoid import cycle
+        device: torch.device,
+        timeout: Optional[float] = None,
+        assistant_header_ids: Optional[List[int]] = None,
+        end_token_ids: Optional[List[int]] = None,
+        dynamic_loss_mask: bool = False,
+        last_turn_loss_only: bool = False,
+        skip_after_header: int = 0,
+        batch_size: int = 1,
+        min_loss_tokens: int = 0,
+        ttt_length: int = 1,
+        max_seq_length: Optional[int] = None,
+    ):
+        self.ray_queue = ray_queue
+        self.nccl_fetcher = nccl_fetcher
+        self.device = device
+        self.timeout = timeout
+        self.assistant_header_ids = assistant_header_ids
+        self.end_token_ids = end_token_ids
+        self.dynamic_loss_mask = dynamic_loss_mask
+        self.last_turn_loss_only = last_turn_loss_only
+        self.skip_after_header = skip_after_header
+        self._batch_size = batch_size
+        self._min_loss_tokens = min_loss_tokens
+        self.ttt_length = ttt_length
+        self.max_seq_length = max_seq_length
+
+    def _compute_loss_mask(self, data: Dict[str, Any]) -> Optional[torch.Tensor]:
+        return resolve_loss_mask(
+            data,
+            dynamic_loss_mask=self.dynamic_loss_mask,
+            assistant_header_ids=self.assistant_header_ids,
+            end_token_ids=self.end_token_ids,
+            last_turn_loss_only=self.last_turn_loss_only,
+            skip_after_header=self.skip_after_header,
+        )
+
+    def _should_skip_for_loss_mask(
+        self, data: Dict[str, Any], step_id: int, skip_count: int
+    ) -> tuple[bool, int]:
+        mask = self._compute_loss_mask(data)
+        if mask is None:
+            skip_count += 1
+            logger.warning(
+                f"[colocate] skipping sample with all-zero loss mask "
+                f"(step_id={step_id}, total_skipped={skip_count})"
+            )
+            return True, skip_count
+
+        if (
+            self._min_loss_tokens > 0
+            and isinstance(mask, torch.Tensor)
+            and mask.sum() < self._min_loss_tokens
+        ):
+            skip_count += 1
+            logger.warning(
+                f"[colocate] skipping sample with too few loss-masked tokens "
+                f"({int(mask.sum())} < {self._min_loss_tokens}, "
+                f"step_id={step_id}, total_skipped={skip_count})"
+            )
+            return True, skip_count
+
+        return False, skip_count
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        yield_count = 0
+        skip_count = 0
+        while True:
+            try:
+                item = self.ray_queue.get(block=True, timeout=self.timeout)
+            except Exception as e:
+                logger.warning(f"[colocate] queue get failed: {e}")
+                break
+
+            if item is None:
+                logger.debug("[colocate] received None sentinel, stopping iteration")
+                break
+
+            from torchspec.training.data_fetcher import ColocateTrainSample
+
+            if not isinstance(item, ColocateTrainSample):
+                raise TypeError(
+                    f"ColocateDataset expected ColocateTrainSample, got "
+                    f"{type(item).__name__}. The controller is shipping the "
+                    f"wrong sample type for colocate mode."
+                )
+
+            data = self.nccl_fetcher.recv_step(item.tensor_specs)
+
+            if item.packed_loss_mask is not None:
+                data["packed_loss_mask"] = item.packed_loss_mask
+            if item.last_turn_loss_only is not None:
+                data["last_turn_loss_only"] = item.last_turn_loss_only
+
+            should_skip, skip_count = self._should_skip_for_loss_mask(
+                data, item.step_id, skip_count
+            )
+            if should_skip:
+                continue
+
+            for key, tensor in data.items():
+                if isinstance(tensor, torch.Tensor):
+                    if tensor.dim() == 1:
+                        data[key] = tensor.unsqueeze(0)
+                    elif tensor.dim() == 2 and key in [
+                        "hidden_states",
+                        "last_hidden_states",
+                        "target",
+                    ]:
+                        data[key] = tensor.unsqueeze(0)
+
+            yield_count += 1
+            logger.debug(f"[colocate] yielding batch {yield_count}, keys={list(data.keys())}")
+            yield data
+
+
+def create_colocate_dataloader(
+    ray_queue: RayQueue,
+    nccl_fetcher,
+    collator: Callable[[List[Dict]], Dict[str, torch.Tensor]],
+    device: torch.device,
+    batch_size: int = 1,
+    timeout: Optional[float] = None,
+    assistant_header_ids: Optional[List[int]] = None,
+    end_token_ids: Optional[List[int]] = None,
+    dynamic_loss_mask: bool = False,
+    last_turn_loss_only: bool = False,
+    skip_after_header: int = 0,
+    min_loss_tokens: int = 0,
+    ttt_length: int = 1,
+    max_seq_length: Optional[int] = None,
+) -> DataLoader:
+    dataset = ColocateDataset(
+        ray_queue=ray_queue,
+        nccl_fetcher=nccl_fetcher,
+        device=device,
+        timeout=timeout,
+        assistant_header_ids=assistant_header_ids,
+        end_token_ids=end_token_ids,
+        dynamic_loss_mask=dynamic_loss_mask,
+        last_turn_loss_only=last_turn_loss_only,
+        skip_after_header=skip_after_header,
+        batch_size=batch_size,
+        min_loss_tokens=min_loss_tokens,
+        ttt_length=ttt_length,
+        max_seq_length=max_seq_length,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collator,
+        num_workers=0,
+    )
+
+
+class ColocateDataFetcher:
+    """Trainer-side colocate data fetcher (NCCL P2P sibling of MooncakeDataFetcher).
+
+    The DataLoader / collator surface is identical to
+    :class:`MooncakeDataFetcher` so the trainer's ``_train_step`` doesn't
+    have to know which backend produced the batch.
+
+    Args:
+        queue: Ray queue from the controller carrying
+            :class:`ColocateTrainSample` items.
+        nccl_fetcher: An :class:`NcclMultiTensorFetcher` configured with
+            the paired engine global rank and the union-world device.
+            Constructed by ``Trainer.set_train_queue`` after
+            ``init_union_world`` has run.
+        ... rest mirror MooncakeDataFetcher.
+    """
+
+    def __init__(
+        self,
+        queue: RayQueue,
+        nccl_fetcher,
+        collator: Callable[[List[Dict]], Dict[str, torch.Tensor]],
+        device: torch.device,
+        batch_size: int = 1,
+        timeout: Optional[float] = None,
+        assistant_header_ids: Optional[List[int]] = None,
+        end_token_ids: Optional[List[int]] = None,
+        dynamic_loss_mask: bool = False,
+        last_turn_loss_only: bool = False,
+        skip_after_header: int = 0,
+        min_loss_tokens: int = 0,
+        ttt_length: int = 1,
+        max_seq_length: Optional[int] = None,
+    ):
+        self.batch_size = batch_size
+        self._dataloader = create_colocate_dataloader(
+            ray_queue=queue,
+            nccl_fetcher=nccl_fetcher,
+            collator=collator,
+            device=device,
+            batch_size=batch_size,
+            timeout=timeout,
+            assistant_header_ids=assistant_header_ids,
+            end_token_ids=end_token_ids,
+            dynamic_loss_mask=dynamic_loss_mask,
+            last_turn_loss_only=last_turn_loss_only,
+            skip_after_header=skip_after_header,
+            min_loss_tokens=min_loss_tokens,
             ttt_length=ttt_length,
             max_seq_length=max_seq_length,
         )

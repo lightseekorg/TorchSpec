@@ -107,6 +107,28 @@ def init_empty_weights(include_buffers: bool = False):
         yield f
 
 
+@contextmanager
+def _default_pg_override(group):
+    """Temporarily install ``group`` as the process-wide default PG.
+
+    Several PyTorch distributed helpers (notably
+    ``set_model_state_dict(broadcast_from_rank0=True)``) issue
+    collectives with a hard-coded ``group=None`` and therefore always
+    land on the default process group. In colocate mode that default
+    PG is the 2N-rank union world, which deadlocks any trainer-only
+    collective. Swapping the default PG for the duration of such a
+    call redirects those ``group=None`` collectives onto ``group``.
+    """
+    from torch.distributed import distributed_c10d as c10d
+
+    prev = c10d._world.default_pg
+    c10d._world.default_pg = group
+    try:
+        yield
+    finally:
+        c10d._world.default_pg = prev
+
+
 def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload):
     """Load a full state dict into an FSDP2 model, broadcasting from rank 0.
 
@@ -121,20 +143,71 @@ def fsdp2_load_full_state_dict(model, full_state, device_mesh, cpu_offload):
         set_model_state_dict,
     )
 
+    # In colocate mode the default PG is the 2N-rank union world (N
+    # trainers + N engines). The engine never enters this code path,
+    # so any broadcast on the default group will hang waiting for
+    # engine participation. The FSDP DeviceMesh, by construction,
+    # contains only trainer ranks — use its group for any explicit
+    # `dist.broadcast`.
+    mesh_group = device_mesh.get_group() if device_mesh is not None else None
+    src_rank = dist.get_global_rank(mesh_group, 0) if mesh_group is not None else 0
+    logger.warning(
+        "[TS-COLOCATE-TRACE-T] fsdp2_load_full_state_dict: ENTER mesh_group=%s src_rank=%s",
+        mesh_group,
+        src_rank,
+    )
+
     if dist.get_rank() == 0:
         model = model.to(device=torch.cuda.current_device(), non_blocking=True)
     else:
         model = model.to_empty(device=torch.cuda.current_device())
 
     is_cpu_offload = cpu_offload is not None
+
+    # `broadcast_from_rank0=True` makes PyTorch's set_model_state_dict
+    # broadcast the rank-0 state dict across the *default* process
+    # group (PyTorch's `_broadcast_state_dict` hard-codes `group=None`
+    # — there is no public way to scope it). In colocate mode the
+    # default PG is the 2N-rank union world; the engine never enters
+    # this code path, so that broadcast hangs waiting for engine ranks.
+    #
+    #   * Single trainer rank (mesh_size == 1): nothing to broadcast —
+    #     rank 0 already holds the full state — so disable the
+    #     broadcast and let rank 0 load locally.
+    #   * Multi-trainer mesh (mesh_size >= 2): keep broadcast_from_rank0
+    #     but temporarily swap the process-wide default PG to the
+    #     trainer-only FSDP mesh group for the duration of the call, so
+    #     PyTorch's internal `group=None` broadcast lands on the
+    #     trainer sub-world instead of the 2N-rank union.
+    mesh_size = device_mesh.size() if device_mesh is not None else dist.get_world_size()
+    single_rank_mesh = mesh_size == 1
+    broadcast_from_rank0 = not single_rank_mesh
     options = StateDictOptions(
-        full_state_dict=True, cpu_offload=is_cpu_offload, broadcast_from_rank0=True
+        full_state_dict=True,
+        cpu_offload=is_cpu_offload,
+        broadcast_from_rank0=broadcast_from_rank0,
     )
 
-    set_model_state_dict(model, full_state, options=options)
+    logger.warning(
+        "[TS-COLOCATE-TRACE-T] fsdp2_load_full_state_dict: BEFORE "
+        "set_model_state_dict (mesh_size=%s, broadcast_from_rank0=%s)",
+        mesh_size,
+        broadcast_from_rank0,
+    )
+    if broadcast_from_rank0 and mesh_group is not None:
+        with _default_pg_override(mesh_group):
+            set_model_state_dict(model, full_state, options=options)
+    else:
+        set_model_state_dict(model, full_state, options=options)
+    logger.warning("[TS-COLOCATE-TRACE-T] fsdp2_load_full_state_dict: AFTER set_model_state_dict")
 
+    # CRITICAL: pass mesh_group to dist.broadcast so the broadcast
+    # only spans the trainer sub-mesh, not the 2N-rank default PG.
+    # Without this the trainer blocks forever waiting for engine
+    # participation in the buffer broadcast.
     for _name, buf in model.named_buffers():
-        dist.broadcast(buf, src=0)
+        dist.broadcast(buf, src=src_rank, group=mesh_group)
+    logger.warning("[TS-COLOCATE-TRACE-T] fsdp2_load_full_state_dict: AFTER buffer broadcasts")
 
     if is_cpu_offload:
         model.to("cpu", non_blocking=True)

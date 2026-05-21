@@ -37,14 +37,24 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 
+from torchspec.colocate.determinism import seed_everything
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.data.utils import DataCollatorWithPadding
 from torchspec.training import checkpoint
-from torchspec.training.data_fetcher import MooncakeDataFetcher, PrefetchedDataFetcher
+from torchspec.training.data_fetcher import (
+    ColocateDataFetcher,
+    MooncakeDataFetcher,
+    PrefetchedDataFetcher,
+)
 from torchspec.training.fsdp import init_empty_weights
+from torchspec.training.nccl_data_fetcher import NcclMultiTensorFetcher
 from torchspec.training.optimizer import BF16Optimizer
 from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
-from torchspec.utils.distributed import get_usp_device_mesh, get_usp_grad_sync_mesh
+from torchspec.utils.distributed import (
+    get_gloo_group,
+    get_usp_device_mesh,
+    get_usp_grad_sync_mesh,
+)
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import get_assistant_token_ids
 from torchspec.utils.profiling import TrainProfiler
@@ -63,7 +73,10 @@ class Trainer(abc.ABC):
         self.args = args
 
         self._setup_device_mesh()
-        torch.manual_seed(getattr(args, "seed", 42))
+        # Seeds torch/cuda/numpy/random; under TORCHSPEC_GRAD_PARITY also
+        # pins deterministic kernels so the Phase-7 grad-parity arms are
+        # bit-reproducible. No-op cost difference for production runs.
+        seed_everything(getattr(args, "seed", 42))
 
         self.fsdp_cpu_offload = getattr(args, "fsdp_cpu_offload", False)
 
@@ -72,10 +85,16 @@ class Trainer(abc.ABC):
         self.draft_model = None
         self.optimizer: Optional[BF16Optimizer] = None
         self.lr_scheduler = None
-        self.data_fetcher: Optional[MooncakeDataFetcher] = None
+        # In disaggregated mode this is a MooncakeDataFetcher; in
+        # colocate mode it's a ColocateDataFetcher (NCCL P2P). The
+        # trainer's _train_step consumes batches identically either way.
+        self.data_fetcher = None
         self.train_queue = None
         self.mooncake_store: Optional[EagleMooncakeStore] = None
         self._eval_cache: list[dict] = []
+        # Optional union-world handle, set by TrainerActor when
+        # transfer_mode == 'nccl'. None for disaggregated runs.
+        self._union_world = None
 
         self.prof = TrainProfiler(args)
 
@@ -98,8 +117,26 @@ class Trainer(abc.ABC):
     # ------------------------------------------------------------------
 
     def _setup_device_mesh(self) -> None:
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
+        # Under colocate (MPS + NCCL union world), `dist.get_world_size()`
+        # is the 2N-rank union world (N trainers + N engines), but the
+        # trainer's data-parallel mesh should only span the trainer half
+        # `[0, N)`. trainer_actor.py overrides args.world_size/args.rank
+        # to the trainer-subgroup values for exactly this reason; we
+        # prefer them over the dist-level values so the mesh doesn't
+        # accidentally include engine ranks (FSDP collectives on a mesh
+        # that contains a non-FSDP rank deadlock on the first
+        # all-reduce).
+        dist_world_size = dist.get_world_size()
+        args_world_size = getattr(self.args, "world_size", None)
+        if args_world_size is None or args_world_size == 0:
+            world_size = dist_world_size
+        else:
+            world_size = int(args_world_size)
+        args_rank = getattr(self.args, "rank", None)
+        if args_rank is None:
+            rank = dist.get_rank()
+        else:
+            rank = int(args_rank)
         self.cache_rank = rank
 
         usp_mesh = None
@@ -124,14 +161,58 @@ class Trainer(abc.ABC):
         self.dp_size = world_size
         self.dp_rank = rank
 
-        self.mesh = init_device_mesh("cuda", mesh_shape=(self.dp_size,), mesh_dim_names=("dp",))
-        self.dp_group = self.mesh.get_group("dp")
+        if world_size < dist_world_size:
+            # Colocate sub-world: build a trainer-only sub-group and an
+            # attached mesh so FSDP collectives stay within the trainer
+            # slice and never reach the engine ranks.
+            #
+            # use_local_synchronization=True so the engine subprocesses
+            # (non-members) don't need to participate in the call.
+            #
+            # Backend: NCCL for >=2 trainers (real GPU collectives).
+            # For the 1-trainer tiny case, we deliberately use GLOO
+            # because NCCL has a well-known eager-init / pynccl hang on
+            # 1-rank groups (the original world.py comment flagged this
+            # exact issue). FSDP on a 1-rank mesh does no actual
+            # cross-rank collectives — it just stores params unsharded
+            # — so the backend choice doesn't affect correctness; it
+            # just keeps the rendezvous side cheap and hang-free.
+            trainer_ranks = list(range(world_size))
+            if world_size >= 2:
+                trainer_backend = "nccl"
+            else:
+                trainer_backend = "gloo"
+            trainer_pg = dist.new_group(
+                ranks=trainer_ranks,
+                backend=trainer_backend,
+                use_local_synchronization=True,
+            )
+            from torch.distributed.device_mesh import DeviceMesh
+
+            self.mesh = DeviceMesh.from_group(trainer_pg, "cuda", mesh_dim_names=("dp",))
+            self.dp_group = trainer_pg
+            mesh_kind = f"1D-colocate-sub({trainer_backend})"
+        else:
+            self.mesh = init_device_mesh(
+                "cuda",
+                mesh_shape=(self.dp_size,),
+                mesh_dim_names=("dp",),
+            )
+            self.dp_group = self.mesh.get_group("dp")
+            mesh_kind = "1D"
         self.dp_mesh = self.mesh
         self.grad_sync_mesh = self.dp_mesh
 
         logger.info(
-            f"[Rank {rank}] Device mesh (1D): world_size={world_size}, dp_size={self.dp_size}"
+            f"[Rank {rank}] Device mesh ({mesh_kind}): "
+            f"world_size={world_size}, dp_size={self.dp_size}, "
+            f"dist_world_size={dist_world_size}"
         )
+        # Heavy instrumentation for post-mesh hang diagnosis: log at
+        # every transition between init phases. (See
+        # docs/colocate/implementation_log.md §"RunPod debug session
+        # #2" for why this is here.)
+        logger.warning(f"[Rank {rank}] [TS-COLOCATE-TRACE-T] _setup_device_mesh DONE")
 
     def _get_init_weight_context_manager(self):
         """Meta-device context for non-rank-0 processes to save memory."""
@@ -170,6 +251,36 @@ class Trainer(abc.ABC):
     # Data queue
     # ------------------------------------------------------------------
 
+    def set_union_world(self, union_world) -> None:
+        """Inject the colocate union-world handle from the actor.
+
+        Called by ``TrainerActor.init`` after ``init_union_world`` has
+        run. The handle is consumed in :meth:`set_train_queue` /
+        :meth:`set_eval_queue` to construct the colocate
+        :class:`NcclMultiTensorFetcher`. ``None`` (the default) means
+        we're on the disaggregated Mooncake path.
+        """
+        self._union_world = union_world
+
+    def _is_colocate_nccl(self) -> bool:
+        """True iff this trainer is running the colocate (NCCL P2P) path."""
+        return self._union_world is not None and (
+            getattr(self.args, "transfer_mode", None) == "nccl"
+        )
+
+    def _build_nccl_fetcher(self, gpu_device: torch.device) -> NcclMultiTensorFetcher:
+        """Construct the per-step multi-tensor receiver for the colocate path.
+
+        The paired engine global rank comes from ``self._union_world``;
+        this trainer rank is rank ``i`` in [0,N), the paired engine is
+        global rank ``N+i``.
+        """
+        return NcclMultiTensorFetcher(
+            src_global_rank=self._union_world.paired_global_rank,
+            device=gpu_device,
+            group=self._union_world.meta_group,
+        )
+
     def set_train_queue(
         self,
         queue,
@@ -181,13 +292,54 @@ class Trainer(abc.ABC):
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
         if usp_enabled and per_dp_rank_batch_size != 1:
             raise ValueError("USP requires per_dp_rank_batch_size=1")
+
+        gpu_device = torch.cuda.current_device()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
+
+        if self._is_colocate_nccl():
+            # Colocate path: tensors arrive over NCCL P2P from the
+            # paired engine. Mooncake store is unused.
+            if mooncake_config is not None:
+                logger.warning(
+                    "[Rank %s] set_train_queue received mooncake_config but "
+                    "transfer_mode=nccl is active; ignoring it. The "
+                    "controller should not be passing this in colocate mode.",
+                    self.dp_rank,
+                )
+            if usp_enabled:
+                # Defence in depth: TrainerActor.init also rejects this.
+                raise ValueError("USP + colocate (transfer_mode='nccl') is not supported.")
+
+            nccl_fetcher = self._build_nccl_fetcher(torch.device("cuda", gpu_device))
+            self.data_fetcher = ColocateDataFetcher(
+                queue=self.train_queue,
+                nccl_fetcher=nccl_fetcher,
+                collator=collator,
+                device=gpu_device,
+                batch_size=per_dp_rank_batch_size,
+                assistant_header_ids=self.assistant_header_ids,
+                end_token_ids=self.end_token_ids,
+                dynamic_loss_mask=self.dynamic_loss_mask,
+                last_turn_loss_only=self.last_turn_loss_only,
+                skip_after_header=self.skip_after_header,
+                min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
+                ttt_length=getattr(self.args, "ttt_length", 1),
+                max_seq_length=getattr(self.args, "max_seq_length", None),
+            )
+            logger.info(
+                "[Rank %s] Colocate (NCCL) data fetcher initialised "
+                "(batch_size=%s, paired_engine_rank=%s)",
+                self.dp_rank,
+                per_dp_rank_batch_size,
+                self._union_world.paired_global_rank,
+            )
+            return
+
+        # Disaggregated (Mooncake) path — unchanged.
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
 
-        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
-
         prefetch_depth = getattr(self.args, "prefetch_depth", 0)
-        gpu_device = torch.cuda.current_device()
 
         # When prefetching, stage data on CPU to avoid GPU contention between
         # background Mooncake TCP transfers and forward/backward compute.
@@ -238,16 +390,51 @@ class Trainer(abc.ABC):
         per_dp_rank_batch_size: int = 1,
     ) -> None:
         usp_enabled = getattr(self.args, "attention_backend", None) == "usp"
+        gpu_device = torch.cuda.current_device()
+        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
+
+        if self._is_colocate_nccl():
+            if mooncake_config is not None:
+                logger.warning(
+                    "[Rank %s] set_eval_queue received mooncake_config but "
+                    "transfer_mode=nccl is active; ignoring it.",
+                    self.dp_rank,
+                )
+            nccl_fetcher = self._build_nccl_fetcher(torch.device("cuda", gpu_device))
+            self._eval_data_fetcher = ColocateDataFetcher(
+                queue=queue,
+                nccl_fetcher=nccl_fetcher,
+                collator=collator,
+                device=gpu_device,
+                batch_size=per_dp_rank_batch_size,
+                assistant_header_ids=self.assistant_header_ids,
+                end_token_ids=self.end_token_ids,
+                dynamic_loss_mask=self.dynamic_loss_mask,
+                last_turn_loss_only=self.last_turn_loss_only,
+                skip_after_header=self.skip_after_header,
+                min_loss_tokens=getattr(self.args, "min_loss_tokens", 0),
+                ttt_length=getattr(self.args, "ttt_length", 1),
+                max_seq_length=getattr(self.args, "max_seq_length", None),
+            )
+            self._eval_collator = collator
+            self._eval_cache: list[dict] = []
+            logger.info(
+                "[Rank %s] Colocate (NCCL) eval data fetcher initialised "
+                "(batch_size=%s, paired_engine_rank=%s)",
+                self.dp_rank,
+                per_dp_rank_batch_size,
+                self._union_world.paired_global_rank,
+            )
+            return
+
         if mooncake_config is not None and self.mooncake_store is None:
             self.init_mooncake_store(mooncake_config)
-
-        collator = DataCollatorWithPadding(usp_enabled=usp_enabled)
 
         self._eval_data_fetcher = MooncakeDataFetcher(
             queue=queue,
             mooncake_store=self.mooncake_store,
             collator=collator,
-            device=torch.cuda.current_device(),
+            device=gpu_device,
             batch_size=per_dp_rank_batch_size,
             assistant_header_ids=self.assistant_header_ids,
             end_token_ids=self.end_token_ids,
@@ -419,6 +606,15 @@ class Trainer(abc.ABC):
                     opt_ms += m["_opt_events"][0].elapsed_time(m["_opt_events"][1])
             metrics["perf/optimizer_time"] = opt_ms / 1000.0
 
+        # Phase 6: peak GPU allocation since the previous step. Useful
+        # in colocate runs where engine + trainer share one pool — slow
+        # leaks on either side surface here as monotonic growth.
+        # Reset every step so the metric reflects the most recent
+        # window; the stability test windows over 100-step intervals.
+        peak = self.prof.peak_alloc_metrics(reset=True)
+        for k, v in peak.items():
+            metrics[f"perf/{k}"] = v
+
         return metrics
 
     def _iter_batches_from_queue(self, num_batches: int):
@@ -476,7 +672,10 @@ class Trainer(abc.ABC):
                     )
 
         if dist.is_initialized():
-            dist.barrier()
+            # Trainer-only group: in colocate mode the default PG is the
+            # union world and the engine never enters the checkpoint
+            # save path.
+            dist.barrier(group=get_gloo_group())
 
     def load_checkpoint(self) -> dict | None:
         return checkpoint.load(self)

@@ -32,6 +32,7 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
+from torchspec.utils.distributed import get_gloo_group
 from torchspec.utils.logging import logger
 
 
@@ -147,12 +148,15 @@ def load(actor: Any) -> dict[str, Any] | None:
         logger.info(f"Model checkpoint {model_dir} not found; skipping load.")
         return None
 
-    # Load model weights (always)
+    # Load model weights (always). dcp.load defaults to the world
+    # default PG; in colocate that's the 2N-rank union world and the
+    # N engine ranks never enter this code, so scope to
+    # actor.dp_group — same reasoning as the save side above.
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
 
     try:
-        dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir))
+        dcp.load(state_dict=state_dict, checkpoint_id=str(model_dir), process_group=actor.dp_group)
         logger.info(f"Loaded model from {model_dir}")
     except Exception as e:
         logger.error(f"Failed to load model from {model_dir}: {e}")
@@ -166,7 +170,11 @@ def load(actor: Any) -> dict[str, Any] | None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
         try:
-            dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir))
+            dcp.load(
+                state_dict=optim_state_dict,
+                checkpoint_id=str(optimizer_dir),
+                process_group=actor.dp_group,
+            )
             logger.info(f"Loaded optimizer from {optimizer_dir}")
         except Exception as e:
             logger.warning(f"Failed to load optimizer from {optimizer_dir}: {e}")
@@ -181,7 +189,11 @@ def load(actor: Any) -> dict[str, Any] | None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
         try:
-            dcp.load(state_dict=lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
+            dcp.load(
+                state_dict=lr_scheduler_state_dict,
+                checkpoint_id=str(lr_scheduler_dir),
+                process_group=actor.dp_group,
+            )
             logger.info(f"Loaded LR scheduler from {lr_scheduler_dir}")
         except Exception as e:
             logger.warning(f"Failed to load LR scheduler from {lr_scheduler_dir}: {e}")
@@ -230,7 +242,9 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
             ]
             optim_state = OptimizerState(actor.model, opt)
             optim_sd = {"optim_state": optim_state}
-            dcp.load(state_dict=optim_sd, checkpoint_id=str(optim_dir))
+            dcp.load(
+                state_dict=optim_sd, checkpoint_id=str(optim_dir), process_group=actor.dp_group
+            )
             for group, fresh_group in zip(opt.optimizer.param_groups, fresh_param_groups):
                 params = group["params"]
                 group.clear()
@@ -249,7 +263,7 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
 
 def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None:
     if checkpoint_payload is None:
-        dist.barrier()
+        dist.barrier(group=get_gloo_group())
         return
 
     continual_training = getattr(actor.args, "continual_training", False)
@@ -276,7 +290,7 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
         _restore_fp32_master_params(actor, checkpoint_payload["optimizer_dir"])
 
     torch.cuda.synchronize()
-    dist.barrier()
+    dist.barrier(group=get_gloo_group())
 
 
 def save(actor: Any, step: int) -> None:
@@ -299,22 +313,32 @@ def save(actor: Any, step: int) -> None:
         model_dir.mkdir(parents=True, exist_ok=True)
         optimizer_dir.mkdir(parents=True, exist_ok=True)
         lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+    dist.barrier(group=get_gloo_group())
 
-    # Save model weights
+    # Save model weights. dcp.save defaults to the world default PG; in
+    # colocate mode that's the 2N-rank union world and the N engine
+    # ranks never enter this code, so an unscoped dcp.save deadlocks
+    # the trainer-only collective. Same shape as the
+    # set_model_state_dict fix in fsdp.py — scope to actor.dp_group
+    # (the trainer-only sub-world in colocate, the regular trainer DP
+    # group in disagg).
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
-    dcp.save(state_dict, checkpoint_id=str(model_dir))
+    dcp.save(state_dict, checkpoint_id=str(model_dir), process_group=actor.dp_group)
 
     if hasattr(actor, "optimizer") and actor.optimizer is not None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
-        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir))
+        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir), process_group=actor.dp_group)
 
     if hasattr(actor, "lr_scheduler") and actor.lr_scheduler is not None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
-        dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
+        dcp.save(
+            lr_scheduler_state_dict,
+            checkpoint_id=str(lr_scheduler_dir),
+            process_group=actor.dp_group,
+        )
 
     if dist.get_rank() == 0:
         rng_state = {"torch": torch.get_rng_state()}
@@ -337,4 +361,4 @@ def save(actor: Any, step: int) -> None:
         tracker_file.write_text(str(step_id))
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
-    dist.barrier()
+    dist.barrier(group=get_gloo_group())
