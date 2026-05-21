@@ -1,0 +1,89 @@
+# Configuration for colocate (MPS+NCCL) training on 2 × 8-GPU nodes.
+#
+# Multi-node sibling of `configs/colocate_qwen3_8b.yaml`. The colocate
+# code is node-count-agnostic — the union-world rank math and the gloo
+# hidden-state transport are derived from the *global* world size
+# (training_num_nodes × training_num_gpus_per_node), not from a single
+# node — so the only differences from the 1-node config are the GPU
+# counts below.
+#
+# Topology: 2 nodes × 8 GPUs = world_size 16. 16 trainer ranks
+# (FSDP-16) + 16 engine ranks, paired 1:1 and MPS-shared per GPU.
+# Phase-2 invariant: engine_count (16) × engine_tp_size (1) == 16.
+#
+# Multi-node prerequisites (beyond the single-node ones):
+#   * The NVIDIA MPS control daemon must be up on BOTH nodes. The
+#     driver brings up its own node pre-Ray; train_entry then calls
+#     torchspec.colocate.mps.ensure_mps_on_all_nodes() to bootstrap the
+#     daemon on every other node. The host/container must allow MPS
+#     (--ipc=host etc.) on every node, not just the driver's.
+#   * The trainer rank-0 node's address (the union-world rendezvous
+#     master) must be routable from the second node.
+#
+# STATUS: the multi-node colocate path is implemented but has only been
+# exercised single-node. Treat this config as untested-at-scale — see
+# docs/colocate/usage.md.
+#
+# Run: launch on a 2-node Ray cluster, e.g.
+#   python -m torchspec.train_entry --config configs/colocate_qwen3_8b_2node.yaml
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 16384
+  num_epochs: 1
+  seed: 42
+  # 2 nodes × 8 GPUs → world_size 16.
+  training_num_gpus_per_node: 8
+  training_num_nodes: 2
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+
+  # ─── Colocate flags ─────────────────────────────────────────────
+  colocate_strategy: mps
+  transfer_mode: nccl
+  train_frac: 0.45
+  infer_frac: 0.45
+
+inference:
+  inference_engine_type: sgl
+  # 1:1 trainer↔engine-rank pairing: engine_count(16) × tp(1) == 16.
+  inference_num_gpus: 16
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64       # unused under colocate, kept for symmetry
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.45
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/colocate-qwen3-8b-2node
+cache_dir: ./cache/colocate-qwen3-8b-2node
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

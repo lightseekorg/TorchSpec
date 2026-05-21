@@ -1,0 +1,78 @@
+# Tiny-model colocate config with engine_tp_size=2 (multi-engine TP).
+#
+# Sibling of `configs/colocate_qwen0p6b_tiny.yaml`, but the single
+# inference engine runs tensor-parallel across 2 GPUs (tp_size=2)
+# instead of 1. This exercises the multi-engine TP data plane:
+#
+#   * world_size = 2  (Phase-0 invariant: engine_count(1) x
+#     engine_tp_size(2) == world_size(2)).
+#   * 2 trainer ranks (FSDP world=2) + 1 engine actor with 2 TP
+#     scheduler subprocesses = 4 logical ranks, paired 1:1 and
+#     MPS-shared two-per-GPU across 2 GPUs.
+#   * The engine's generate() carries a 2-prompt batch; TP rank t
+#     NCCL-sends batch item t to trainer t (see colocate.patch
+#     _send_hidden_states_to_nccl).
+#
+# Needs 2 GPUs + working MPS. Used by tests/colocate/test_colocate_tp2.py.
+
+model:
+  target_model_path: Qwen/Qwen3-0.6B-Base
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 2048
+  num_epochs: 1
+  seed: 42
+  # 2 trainer ranks (FSDP world=2).
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: false
+  warmup_ratio: 0.015
+
+  # ─── Colocate flags ─────────────────────────────────────────────
+  colocate_strategy: mps
+  transfer_mode: nccl
+  train_frac: 0.45
+  infer_frac: 0.45
+
+inference:
+  inference_engine_type: sgl
+  # 1 engine, tensor-parallel across 2 GPUs. engine_count x
+  # engine_tp_size = 1 x 2 = world_size 2.
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 2
+  inference_num_gpus_per_node: 2
+  max_sample_pool_size: 8
+  inference_buffer_threshold: 4
+  inference_batch_size: 2
+  sglang:
+    tp_size: 2
+    mem_fraction_static: 0.45
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 4GB
+  local_buffer_size: 1GB
+
+output_dir: ./outputs/colocate-qwen0p6b-tp2-tiny
+cache_dir: ./cache/colocate-qwen0p6b-tp2-tiny
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

@@ -1,0 +1,79 @@
+# Tiny-model DISAGGREGATED config — the grad-parity baseline arm.
+#
+# Sibling of `configs/colocate_qwen0p6b_tiny.yaml`. Same model, dataset,
+# draft-training hyperparameters and seed; the *only* differences are the
+# transport (Mooncake disagg here vs MPS+NCCL colocate there) and the GPU
+# layout (trainer and engine on disjoint GPUs here vs shared there).
+#
+# Used by tests/colocate/test_grad_parity.py::test_phase7_grad_parity_full
+# as the reference arm: run this + the colocate tiny config with the same
+# `training.seed`, dump per-parameter gradients, and assert they match.
+#
+# Topology: 1 trainer GPU (FSDP world=1) + 1 engine GPU = 2 GPUs total.
+# dp_size=1 deliberately — at a single trainer rank FSDP is a no-op, so
+# there is no all-reduce reduction-order term and the only thing that can
+# differ between the two arms is the hidden-state transport itself.
+#
+# Disagg needs the Mooncake store, whose native .so links the RDMA verbs
+# stack; install libibverbs1 libnuma1 librdmacm1 libnl-3-200 on hosts
+# that do not ship them (the grad-parity test skips cleanly if absent).
+
+model:
+  target_model_path: Qwen/Qwen3-0.6B-Base
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+  # Deterministic prompt order so both grad-parity arms see the same batch.
+  shuffle_dataset: false
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 2048
+  num_epochs: 1
+  seed: 42
+  # FSDP world=1: single trainer rank, no sharding (matches the colocate
+  # tiny config's dp_size=1 so step 1 sees an identical global batch).
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: false
+  warmup_ratio: 0.015
+  # No colocate flags: transfer_mode defaults to "mooncake" (disagg).
+
+inference:
+  inference_engine_type: sgl
+  # 1 engine on its own GPU (disjoint from the trainer GPU).
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 8
+  inference_buffer_threshold: 4
+  inference_batch_size: 2
+  sglang:
+    tp_size: 1
+    # Engine owns its whole GPU in disagg, so it can take the usual share.
+    mem_fraction_static: 0.8
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 4GB
+  local_buffer_size: 1GB
+
+output_dir: ./outputs/disagg-qwen0p6b-tiny
+cache_dir: ./cache/disagg-qwen0p6b-tiny
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

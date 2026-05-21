@@ -1,0 +1,89 @@
+# Configuration for colocate (MPS+NCCL) training on a single 4×H100 node.
+#
+# This is the colocate sibling of `configs/sglang_qwen3_8b.yaml`. The two
+# configs differ in three places:
+#
+#   1. `training.colocate_strategy: mps` + `training.transfer_mode: nccl`
+#      enable the colocate path (Phase 0 invariants).
+#   2. `training.train_frac` + `training.infer_frac` set the per-GPU
+#      memory split (Phase 1 invariant: train + infer + 0.10 headroom <= 1.0).
+#   3. `inference.inference_num_gpus` == `training.training_num_gpus_per_node`
+#      and `inference.inference_num_gpus_per_engine == 1`. This pins the
+#      1:1 trainer↔engine-rank pairing the union NCCL world expects
+#      (Phase 2 invariant: engine_count × engine_tp_size == training_world_size).
+#
+# Everything else mirrors the disaggregated config so a side-by-side
+# comparison is meaningful (Phase 7 grad parity + convergence runs).
+#
+# Run:
+#   ./examples/colocate-qwen3-8b-1node/run.sh
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 16384
+  num_epochs: 1
+  seed: 42
+  training_num_gpus_per_node: 4
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+
+  # ─── Colocate flags (Phase 0–4) ─────────────────────────────────
+  # mps: trainer + engine ranks share one physical GPU via NVIDIA MPS.
+  # nccl: hidden states cross the engine→trainer boundary via P2P
+  # `dist.batch_isend_irecv` on the Phase-2 union world (no Mooncake).
+  colocate_strategy: mps
+  transfer_mode: nccl
+  train_frac: 0.45
+  infer_frac: 0.45
+
+inference:
+  inference_engine_type: sgl
+  # 1:1 trainer↔engine-rank pairing — see Phase 1 config invariant C.
+  inference_num_gpus: 4
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 4
+  max_sample_pool_size: 64       # unused under colocate, kept for symmetry
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    # Unused under colocate — `infer_frac` is the canonical budget; SglEngine
+    # overrides `mem_fraction_static` to match. Setting it here just docs the
+    # equivalence.
+    mem_fraction_static: 0.45
+
+# Mooncake config is not required when transfer_mode=nccl, but the
+# parser still expects the section. Leaving it as null sentinel; the
+# colocate train_entry branch never invokes build_mooncake_config so
+# these never get used.
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/colocate-qwen3-8b-1node
+cache_dir: ./cache/colocate-qwen3-8b-1node
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false
