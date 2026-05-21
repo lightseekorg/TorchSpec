@@ -36,7 +36,8 @@ Placement groups reserve GPUs for training and inference as a unit and place the
 | Mode | Training GPUs | Inference GPUs | Use case |
 |------|--------------|----------------|----------|
 | Default (separate) | Dedicated PG | Dedicated PG | Production: no GPU contention |
-| `colocate` | Shared PG | Shared PG | Dev: share GPUs between train & inference |
+| `colocate` (legacy boolean) | Shared PG | Shared PG | Dev: share GPUs between train & inference, Mooncake transfer |
+| `colocate_strategy=mps` + `transfer_mode=nccl` | Shared PG, fractional `num_gpus=train_frac` | Shared PG (same bundles), fractional `num_gpus=infer_frac` | Single-node colocate with MPS-shared GPUs and NCCL P2P hidden-state transfer (no Mooncake). See [`docs/colocate/usage.md`](colocate/usage.md). |
 | `debug_train_only` | Dedicated PG | Empty | Debug training without inference |
 | `debug_inference_only` | Empty | Dedicated PG | Debug inference without training |
 

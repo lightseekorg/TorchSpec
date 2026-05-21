@@ -89,3 +89,6 @@ wandb/log.txt
 
 .claude/
 wandb/
+
+# Colocate knowledge docs (keep local only, not for PR)
+docs/colocate/knowledge*.md
