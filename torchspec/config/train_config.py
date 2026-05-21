@@ -103,8 +103,10 @@ class TrainingConfig:
     fsdp_reduce_dtype: str = "float32"  # "float32" or "bfloat16"
     fsdp_strategy: str = "REPLICATE"
     # Controls which workload claims head-node GPUs first under PACK strategy.
-    # "training_first" (default) or "inference_first". Extensible to custom mappings later.
+    # "training_first" (default), "inference_first", or "custom".
     placement_strategy: str = "training_first"
+    training_node_ips: Optional[list[str]] = None
+    training_node_selectors: Optional[list[dict[str, str]]] = None
     compile_model: bool = False  # torch.compile the full training model
     sp_ring_size: int = 1
     sp_ulysses_size: int = 1

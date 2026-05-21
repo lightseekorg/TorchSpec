@@ -35,12 +35,13 @@ Placement groups reserve GPUs for training and inference as a unit and place the
 
 | Mode | Training GPUs | Inference GPUs | Use case |
 |------|--------------|----------------|----------|
-| Default (separate) | Dedicated PG | Dedicated PG | Production: no GPU contention |
+| Default | Sliced from unified PG | Sliced from unified PG | Production: deterministic node-to-role assignment |
+| `custom` | Sliced from custom unified PG | Sliced from custom unified PG | Production: explicit node choice with the same unified reservation semantics |
 | `colocate` | Shared PG | Shared PG | Dev: share GPUs between train & inference |
 | `debug_train_only` | Dedicated PG | Empty | Debug training without inference |
 | `debug_inference_only` | Empty | Dedicated PG | Debug inference without training |
 
-Each placement group probes bundles with a temporary `InfoActor` to discover the actual (node IP, GPU ID) mapping, then sorts by (node, GPU ID) for deterministic ordering.
+Each placement group probes bundles with a temporary `InfoActor` to discover the actual (node IP, GPU ID) mapping, then sorts by (node, GPU ID) for deterministic ordering. In `custom` mode, TorchSpec sorts by the configured node order first and by physical GPU ID within each selected node.
 
 ## Ray Cluster Setup
 
@@ -133,6 +134,65 @@ The PACK placement strategy spreads them across nodes automatically.
 |-----|---------|-------------|
 | `training.training_num_nodes` | 1 | Number of training nodes |
 | `training.training_num_gpus_per_node` | 1 | GPUs per training node |
+
+### Custom node placement
+
+By default, TorchSpec creates a unified placement group with Ray's `PACK`
+strategy, probes the resulting bundles, and assigns the ordered bundles to
+training or inference according to `training.placement_strategy`
+(`training_first` or `inference_first`). Set
+`training.placement_strategy: custom` to explicitly choose the nodes for each
+role while still reserving the non-colocated training and inference bundles in a
+single unified placement group.
+
+IP-based placement uses Ray's per-node resource labels (`node:<ip>`) and does
+not require custom Ray labels:
+
+```yaml
+training:
+  placement_strategy: custom
+  training_num_nodes: 2
+  training_num_gpus_per_node: 8
+  training_node_ips:
+    - 10.0.0.1
+    - 10.0.0.3
+
+inference:
+  inference_num_gpus: 16
+  inference_num_gpus_per_node: 8
+  inference_node_ips:
+    - 10.0.0.2
+    - 10.0.0.4
+```
+
+Ray label selectors are also supported when the installed Ray version supports
+placement group `bundle_label_selector`. Start Ray nodes with labels, then use
+matching selectors in the config:
+
+```yaml
+training:
+  placement_strategy: custom
+  training_num_nodes: 2
+  training_num_gpus_per_node: 8
+  training_node_selectors:
+    - {"torchspec/node": "trainer-0"}
+    - {"torchspec/node": "trainer-1"}
+
+inference:
+  inference_node_selectors:
+    - {"torchspec/node": "infer-0"}
+    - {"torchspec/node": "infer-1"}
+```
+
+The configured node order is preserved. For multi-node inference, this order
+determines the order of inference engine actors and therefore the `node_rank`
+passed to SGLang or vLLM. Within each selected node, bundles are ordered by the
+actual GPU ID discovered by `InfoActor`.
+
+The number of configured training nodes must equal
+`training.training_num_nodes`. The number of configured inference nodes must
+match `ceil(inference.inference_num_gpus / inference.inference_num_gpus_per_node)`.
+For each role, set only one of `*_node_ips` or `*_node_selectors`.
 
 ### Inference across nodes (SglEngine multi-node TP)
 

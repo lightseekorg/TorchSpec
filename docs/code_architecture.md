@@ -12,7 +12,7 @@ torchspec/
 ├── ray/                     # Ray infrastructure (shared across all packages)
 │   ├── ray_actor.py         #   RayActor base class (GPU setup, network utils)
 │   ├── train_group.py       #   RayTrainGroup (manages training actor group)
-│   └── placement_group.py   #   Placement group creation, GPU resource management
+│   └── placement_group.py   #   Placement group creation, GPU resource management, custom node placement
 ├── controller/              # Async pipeline orchestration
 │   ├── training_controller.py  # AsyncTrainingController (Ray actor)
 │   ├── inference_manager.py    # AsyncInferenceManager (Ray actor)
@@ -209,11 +209,14 @@ training:
   ttt_length: 7                   # Speculative depth
   train_backend: fsdp
   fsdp_strategy: REPLICATE
+  placement_strategy: training_first  # or inference_first/custom
+  training_node_ips: null             # custom placement only
 
 inference:
   inference_engine_type: hf       # or "sgl"
   inference_batch_size: 1
   inference_num_gpus: 4
+  inference_node_ips: null        # custom placement only
   sglang:                         # nested under inference
     tp_size: 8
     extra_args:                   # power-user passthrough to sgl.Engine
@@ -258,7 +261,7 @@ python train.py --config base.yaml --config experiment.yaml training.learning_ra
 |--------|---------|
 | `torchspec/ray/ray_actor.py` | `RayActor` base class (GPU setup, IP/port utils, master addr negotiation) |
 | `torchspec/ray/train_group.py` | `RayTrainGroup` - Manages a group of training actors |
-| `torchspec/ray/placement_group.py` | Placement group creation, GPU resource waiting, `create_placement_groups()`, `create_train_group()` |
+| `torchspec/ray/placement_group.py` | Placement group creation, GPU resource waiting, custom node placement, `create_placement_groups()`, `create_train_group()` |
 
 ### Controller
 
