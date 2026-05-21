@@ -59,6 +59,44 @@ class TrainProfiler:
     def iterate_train_actor(self, iterator):
         return _profile_simple_loop(iterator, self.args, name="train_actor")
 
+    def peak_alloc_metrics(self, *, reset: bool = True) -> dict:
+        """Return peak GPU allocation since the last reset, in bytes.
+
+        Phase 6 stability monitor: under MPS colocate the engine and
+        trainer share one GPU's memory pool, so a slow leak on either
+        side will show up here as monotonic growth across steps. The
+        plan's done-when criterion is "peak_alloc(step=10) ≈
+        peak_alloc(step=999) within 1%" — wired in
+        ``tests/colocate/test_stability.py``.
+
+        Args:
+            reset: If True (default), reset the peak counter after
+                reading. The stability test resets every 100 steps and
+                compares the windowed peaks; the trainer's regular
+                metrics dump can also reset every step.
+
+        Returns:
+            ``{"peak_bytes_allocated": int, "peak_bytes_reserved": int,
+              "current_bytes_allocated": int, "current_bytes_reserved": int}``
+            for ``torch.cuda.current_device()``. Empty dict if CUDA is
+            unavailable (CPU-only test runs).
+        """
+        if not torch.cuda.is_available():
+            return {}
+        device = torch.cuda.current_device()
+        peak_alloc = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+        cur_alloc = int(torch.cuda.memory_allocated(device))
+        cur_reserved = int(torch.cuda.memory_reserved(device))
+        if reset:
+            torch.cuda.reset_peak_memory_stats(device)
+        return {
+            "peak_bytes_allocated": peak_alloc,
+            "peak_bytes_reserved": peak_reserved,
+            "current_bytes_allocated": cur_alloc,
+            "current_bytes_reserved": cur_reserved,
+        }
+
 
 def _profile_simple_loop(iterator, args, name):
     if not (args.use_pytorch_profiler and (name in args.profile_target)):

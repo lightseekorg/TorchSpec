@@ -59,6 +59,24 @@ def setup_logger(log_level=None, actor_name=None, ip_addr=None):
         )
     handler.setLevel(log_level)
     _logger.addHandler(handler)
+
+    # Also configure the lowercase `torchspec` namespace logger. Several
+    # submodules — torchspec/colocate/{world,mps}.py,
+    # torchspec/training/nccl_data_fetcher.py,
+    # torchspec/inference/engine/nccl_hidden_states_connector.py — use
+    # `logging.getLogger("torchspec.X.Y")` directly instead of importing
+    # the central `logger` above. Without a configured ancestor those
+    # INFO-level diagnostics fall through to the root logger's default
+    # WARNING filter and are silently dropped. By attaching the same
+    # handler to the `torchspec` namespace logger, every child logger
+    # in that hierarchy inherits it via propagation. Without this,
+    # debugging the colocate path is effectively impossible — we lose
+    # `init_union_world` / MPS lifecycle / NCCL P2P send-recv visibility.
+    _ts_logger = logging.getLogger("torchspec")
+    if not _ts_logger.handlers:
+        _ts_logger.setLevel(log_level)
+        _ts_logger.addHandler(handler)
+        _ts_logger.propagate = False
     return _logger
 
 
