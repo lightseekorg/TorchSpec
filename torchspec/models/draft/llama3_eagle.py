@@ -1222,6 +1222,15 @@ class LlamaAttention(nn.Module):
                     mscale=rope_get("mscale"),
                     mscale_all_dim=rope_get("mscale_all_dim"),
                 )
+            elif scaling_type in ("default", None):
+                # transformers >=4.x normalises "no scaling" to
+                # rope_scaling={"rope_type": "default"} rather than
+                # rope_scaling=None — treat it as standard RoPE.
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=getattr(self.config, "rope_theta", 10000),
+                )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 

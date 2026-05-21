@@ -81,18 +81,33 @@ class TargetLMHead(nn.Module):
         return instance
 
     def _load_lm_head(self, model_path: str, lm_head_key: str):
+        # Tied-embedding models (Qwen3-*-Base, Llama-3.2, Gemma, and
+        # most small models) do NOT ship a standalone `lm_head.weight`
+        # — the LM head shares the input-embedding matrix. When
+        # `tie_word_embeddings` is set, fall back to the embedding key
+        # so loading doesn't KeyError on the missing lm_head tensor.
+        fallback_key = None
+        if getattr(self.config, "tie_word_embeddings", False):
+            fallback_key = "model.embed_tokens.weight"
+
         index_files = glob.glob(os.path.join(model_path, "*.index.json"))
 
         if index_files:
             with open(index_files[0], "r") as f:
                 index = json.load(f)
             weight_map = index.get("weight_map", {})
+            resolved_key = None
             if lm_head_key in weight_map:
-                file_path = os.path.join(model_path, weight_map[lm_head_key])
-                self._load_key_from_file(file_path, lm_head_key)
+                resolved_key = lm_head_key
+            elif fallback_key and fallback_key in weight_map:
+                resolved_key = fallback_key
+            if resolved_key is not None:
+                file_path = os.path.join(model_path, weight_map[resolved_key])
+                self._load_key_from_file(file_path, resolved_key, fallback_key)
             else:
+                tried = [lm_head_key] + ([fallback_key] if fallback_key else [])
                 raise KeyError(
-                    f"lm_head_key '{lm_head_key}' not found in weight_map. "
+                    f"None of {tried} found in weight_map. "
                     f"Available keys: {list(weight_map.keys())[:10]}..."
                 )
         else:
@@ -100,26 +115,38 @@ class TargetLMHead(nn.Module):
             bins = glob.glob(os.path.join(model_path, "*.bin"))
             target_file = safetensors[0] if safetensors else (bins[0] if bins else None)
             if target_file:
-                self._load_key_from_file(target_file, lm_head_key)
+                self._load_key_from_file(target_file, lm_head_key, fallback_key)
             else:
                 raise FileNotFoundError(f"No checkpoint file found in {model_path}")
 
-    def _load_key_from_file(self, file_path: str, key: str):
+    def _load_key_from_file(self, file_path: str, key: str, fallback_key: str = None):
+        # Try `key` first, then `fallback_key` (used for tied-embedding
+        # models where the lm_head weight lives under the embedding
+        # key). Whichever resolves is copied into self.lm_head.weight.
+        keys_to_try = [key]
+        if fallback_key and fallback_key != key:
+            keys_to_try.append(fallback_key)
+
         tensor = None
         if file_path.endswith(".safetensors"):
             with safe_open(file_path, framework="pt") as f:
-                if key in f.keys():
-                    tensor = f.get_tensor(key)
+                available = set(f.keys())
+                for k in keys_to_try:
+                    if k in available:
+                        tensor = f.get_tensor(k)
+                        break
         else:
             state_dict = torch.load(file_path, map_location="cpu")
-            if key in state_dict:
-                tensor = state_dict[key]
-                del state_dict
+            for k in keys_to_try:
+                if k in state_dict:
+                    tensor = state_dict[k]
+                    break
+            del state_dict
 
         if tensor is not None:
             self.lm_head.weight.data.copy_(tensor)
         else:
-            raise KeyError(f"Key {key} not found in {file_path}")
+            raise KeyError(f"None of {keys_to_try} found in {file_path}")
 
     def _init_norm_structure(self) -> None:
         """Create the norm module structure (no weights loaded).
