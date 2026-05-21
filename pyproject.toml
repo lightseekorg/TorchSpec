@@ -23,7 +23,13 @@ dependencies = [
     "ninja",
     "packaging",
     "pyzmq",
-    "mooncake-transfer-engine>=0.3.10.post1",
+    # Pinned: 0.3.10.post2 is the same Mooncake release rebuilt with the
+    # go1.25 toolchain, whose runtime SIGSEGVs in `runtime.sigfwd` when
+    # `libetcd_wrapper.so`'s Go signal handlers collide with PyTorch/CUDA
+    # in one process (crashes the disagg TrainerActor before step 1 --
+    # GPU-confirmed 2026-05-20). post1 is the go1.24.13 build and runs
+    # clean. Revisit when Mooncake ships a non-crashing go1.25 build.
+    "mooncake-transfer-engine==0.3.10.post1",
     "openai",
     "omegaconf",
     "ray",
@@ -69,3 +75,8 @@ ban-relative-imports = "all"
 [tool.ruff.lint.isort]
 known-first-party = ["torchspec"]
 known-third-party = ["wandb"]
+
+[tool.ruff.lint.per-file-ignores]
+# These files intentionally adjust sys.path before importing.
+"scripts/colocate/bench_transport.py" = ["E402"]
+"tests/colocate/*" = ["E402"]

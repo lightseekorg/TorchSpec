@@ -23,7 +23,49 @@ from abc import ABC
 from typing import Any, Dict, Optional
 
 import torch
-from mooncake.store import MooncakeDistributedStore
+
+# NOTE: `mooncake-transfer-engine` is pinned to *exactly* 0.3.10.post1 in
+# pyproject.toml — do not loosen it to a `>=` range. 0.3.10.post2 is the
+# same Mooncake release rebuilt with the go1.25 toolchain, whose runtime
+# SIGSEGVs in `runtime.sigfwd` once `libetcd_wrapper.so`'s Go signal
+# handlers are loaded alongside PyTorch/CUDA in one process — it crashes
+# the disagg TrainerActor before the first training step (GPU-confirmed
+# 2026-05-20; see docs/colocate/implementation_log.md "Follow-up round
+# 6"). post1 (go1.24.13) runs clean. Every newer wheel will likely also
+# ship on go1.25, so the pin is exact, not a ceiling — revisit only when
+# Mooncake publishes a non-crashing go1.25 build.
+try:
+    from mooncake.store import MooncakeDistributedStore
+except ImportError as _mooncake_import_err:
+    # mooncake.store's native .so links against the RDMA verbs userspace
+    # stack (libibverbs, libnuma, librdmacm, libnl-3 …). On hosts without
+    # those libraries — RunPod's stock PyTorch template, CPU-only CI
+    # boxes, and the entire colocate MPS+NCCL path which doesn't transfer
+    # via Mooncake at all — a hard top-level ImportError would prevent
+    # any module that transitively imports torchspec.training.trainer
+    # from loading, including the colocate code path that never touches
+    # Mooncake.
+    #
+    # Define a stub that satisfies the type annotation on
+    # MooncakeHiddenStateStore._store and raises a clear, actionable
+    # error only if the Mooncake disagg path actually tries to
+    # instantiate the store at runtime (i.e. setup() is called).
+
+    class MooncakeDistributedStore:  # type: ignore[no-redef]
+        _import_error = _mooncake_import_err
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "Mooncake native library failed to import; cannot create "
+                "MooncakeDistributedStore. Original error: "
+                f"{type(self)._import_error!r}. Install the RDMA verbs "
+                "userspace stack (apt-get install -y libibverbs1 libnuma1 "
+                "librdmacm1 libnl-3-200) and reinstall the `mooncake` "
+                "Python package. Note: the colocate MPS+NCCL transfer "
+                "path does NOT require Mooncake — if you're hitting this "
+                "from `transfer_mode=nccl`, something else has gone wrong."
+            )
+
 
 from torchspec.config.mooncake_config import MooncakeConfig
 from torchspec.transfer.mooncake.buffers import (
