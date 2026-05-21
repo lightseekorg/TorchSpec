@@ -96,6 +96,22 @@ class ModelConfig:
 class TrainingConfig:
     attention_backend: str = "sdpa"
     colocate: bool = False
+    # Colocate-mode strategy. None = today's behaviour (only meaningful when
+    # colocate=True). "mps" = pair every (trainer rank, engine rank) on the
+    # same Ray bundle and rely on NVIDIA MPS to share the GPU. See
+    # docs/colocate/implementation.md §Phase 1.
+    colocate_strategy: Optional[str] = None
+    # How hidden states cross the engine→trainer boundary. "mooncake" is the
+    # disaggregated baseline (default). "nccl" sends them peer-to-peer over a
+    # union NCCL world; required when colocate_strategy is set. See Phases 2-4.
+    transfer_mode: str = "mooncake"
+    # Per-process memory fraction for the trainer (used as
+    # `set_per_process_memory_fraction(train_frac)`). Required when colocate
+    # is enabled with strategy=mps; ignored otherwise.
+    train_frac: Optional[float] = None
+    # Engine `mem_fraction_static` value. Required when colocate is enabled
+    # with strategy=mps; ignored otherwise.
+    infer_frac: Optional[float] = None
     continual_training: bool = False
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10

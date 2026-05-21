@@ -20,6 +20,7 @@
 
 """Pipeline training loop: main training loop with sync training and async inference."""
 
+import os
 import re
 import shutil
 import tempfile
@@ -320,6 +321,16 @@ def training_loop(
                 # Add step counters for wandb x-axis (required in shared mode)
                 metrics["train/step"] = completed_steps
                 metrics["inference/step"] = completed_steps
+
+                # Optional per-step loss-curve trace, env-gated so it is
+                # silent in normal runs. Consumed by the colocate-vs-disagg
+                # convergence test (tests/colocate/test_convergence.py),
+                # which needs an identically-formatted loss point from both
+                # this disaggregated loop and the colocate loop.
+                if os.environ.get("TORCHSPEC_LOSS_CURVE_LOG"):
+                    _lc = metrics.get("train/avg_loss")
+                    if _lc is not None:
+                        logger.info("[loss_curve] step=%d loss=%.6f", completed_steps, float(_lc))
 
                 # Add inference metrics (e2e_latency, spec metrics, etc.)
                 inference_metrics = ray.get(inference_manager.flush_metrics.remote())

@@ -87,6 +87,91 @@ def setup_async_training_with_engines(
     return controller, inference_manager
 
 
+def setup_colocate_training_with_engines(args, train_group, inference_engines, controller=None):
+    """Setup the slim colocate (NCCL transfer) variant of training.
+
+    Differs from :func:`setup_async_training_with_engines` in three ways:
+
+    1. **No** ``AsyncInferenceManager``. The async backpressure machinery
+       around a Mooncake-backed sample pool is unused: the engine is
+       rate-limited by the trainer's NCCL recv on the paired union-world
+       rank, so there's nothing to manage. Callers receive ``None`` for
+       the manager slot and the loop must handle that.
+
+    2. **No** ``mooncake_config`` passed to ``train_group.set_train_queues``.
+       The trainer-side ``set_train_queue`` already branches on the
+       union-world handle (set by ``TrainerActor.init`` in colocate mode);
+       passing ``None`` here keeps the API symmetric and ensures
+       ``init_mooncake_store`` is never invoked.
+
+    3. The Mooncake master / config plumbing is **never imported**. We
+       deliberately don't import :mod:`torchspec.transfer.mooncake` from
+       this code path so that ``test_phase5_no_mooncake_imports`` can
+       guard the property via ``sys.modules`` introspection.
+
+    The :class:`AsyncTrainingController` actor itself is reused — it owns
+    prompt buffering, dataset shuffle, eval queue partitioning, and step
+    bookkeeping, none of which are Mooncake-specific. Phase 5 also adds a
+    ``dispatch_colocate_batch`` method on that controller (see
+    ``torchspec/controller/training_controller.py``) for the runtime to
+    push :class:`ColocateTrainSample` items into the per-DP train queues.
+
+    Args:
+        args: Configuration arguments. ``transfer_mode`` must be
+            ``'nccl'``; we don't enforce here because validation in
+            ``colocate/config.py`` already does.
+        train_group: Training group; trainers must have been initialised
+            with ``transfer_mode='nccl'`` so their ``Trainer._union_world``
+            is set and ``set_train_queue`` will route to the colocate
+            fetcher.
+        inference_engines: List of Ray engine actor handles. Held by the
+            caller and passed straight through to the runtime loop.
+        controller: Optional pre-created controller; created if None.
+
+    Returns:
+        ``(controller, None)`` — the second slot exists only to keep the
+        return shape symmetric with ``setup_async_training_with_engines``.
+        The runtime loop must check for ``inference_manager is None`` and
+        skip the manager-only steps (``flush_metrics`` etc.).
+    """
+    # NOTE: deliberately do NOT import inference_manager / Mooncake here.
+    # The whole point of Phase 5 is to keep this path Mooncake-free.
+    from torchspec.controller.training_controller import AsyncTrainingController
+
+    dp_size = (
+        getattr(args, "dp_size", None) or args.training_num_nodes * args.training_num_gpus_per_node
+    )
+
+    if controller is None:
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        driver_node_id = ray.get_runtime_context().get_node_id()
+        controller = AsyncTrainingController.options(
+            runtime_env={"env_vars": get_torchspec_env_vars()},
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
+        ).remote(args, dp_size)
+
+    train_queues = ray.get(controller.get_train_queues.remote())
+    train_group.set_train_queues(
+        train_queues,
+        mooncake_config=None,
+        per_dp_rank_batch_size=args.per_dp_rank_batch_size,
+    )
+
+    eval_queues = ray.get(controller.get_eval_queues.remote())
+    train_group.set_eval_queues(eval_queues, mooncake_config=None, per_dp_rank_batch_size=1)
+
+    logger.info(
+        "Colocate (NCCL) training wiring complete: %d engines, dp_size=%d, "
+        "per_dp_rank_batch_size=%d, no AsyncInferenceManager, no Mooncake.",
+        len(inference_engines),
+        dp_size,
+        args.per_dp_rank_batch_size,
+    )
+
+    return controller, None
+
+
 def auto_calculate_training_steps(args, dataset_size: int):
     """Auto-calculate num_train_steps and lr_total_steps based on dataset size if not explicitly set.
 

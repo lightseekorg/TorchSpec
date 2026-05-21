@@ -38,6 +38,7 @@ from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from torchspec import AutoDraftModelConfig
+from torchspec.colocate import is_mps_colocate, validate_colocate_config
 from torchspec.config.train_config import config_to_flat_args, load_config
 from torchspec.config.utils import generate_draft_model_config
 from torchspec.controller import (
@@ -46,6 +47,7 @@ from torchspec.controller import (
     build_mooncake_config,
     run_training_loop,
     setup_async_training_with_engines,
+    setup_colocate_training_with_engines,
 )
 from torchspec.inference.factory import prepare_inference_engines
 from torchspec.ray.placement_group import (
@@ -148,6 +150,7 @@ def parse_config():
 
     _resolve_batch_size(flat_args)
     _validate_usp_args(flat_args)
+    validate_colocate_config(flat_args)
 
     return flat_args
 
@@ -279,6 +282,28 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         logger.info(f"DFlash: set aux_hidden_states_layers = {target_layer_ids}")
 
 
+def _maybe_resolve_colocate_aux_layers(args) -> None:
+    """Auto-resolve aux_hidden_states_layers for Eagle3 colocate runs.
+
+    The colocate training loop sizes the NCCL hidden-states transfer
+    buffer up front, so it needs aux_hidden_states_layers on `args`
+    before the loop starts — unlike the disagg path there's no engine
+    round-trip to discover it. DFlash configs are already handled by
+    _validate_and_configure_dflash; this covers Eagle3, using the same
+    default the engine falls back to (sgl_engine resolves the identical
+    function when args.aux_hidden_states_layers is None) so both sides
+    agree on the tensor's last-dim.
+    """
+    if not is_mps_colocate(args):
+        return
+    if getattr(args, "aux_hidden_states_layers", None):
+        return
+    from torchspec.utils.misc import get_default_eagle3_aux_layer_ids
+
+    args.aux_hidden_states_layers = get_default_eagle3_aux_layer_ids(args.target_model_path)
+    logger.info(f"Colocate: auto-set aux_hidden_states_layers = {args.aux_hidden_states_layers}")
+
+
 def train_async_no_generation(args):
     """Entry point for Eagle3 online training.
 
@@ -295,11 +320,59 @@ def train_async_no_generation(args):
     init_tracking(args)
     timer = _InitTimer()
 
+    # [0] Pre-Ray MPS bring-up (Phase 1): once the MPS control daemon is
+    # running on a node, the *node* enters MPS client mode — every CUDA
+    # context on that node has to register with MPS by setting
+    # CUDA_MPS_PIPE_DIRECTORY (otherwise CUDA calls fail with
+    # error 805, "MPS client failed to connect"). Ray spawns its
+    # gcs/worker processes inheriting `os.environ`; if we start MPS
+    # *after* Ray is up, those workers come up with no MPS env and
+    # any later `torch.cuda.*` call in any actor blows up. Start
+    # the daemon first AND export the client env into our own
+    # process so every actor (including ones whose runtime_env we
+    # don't directly own, e.g. AsyncTrainingController) inherits it.
+    if is_mps_colocate(args):
+        from torchspec.colocate.mps import setup_for_colocate as _early_setup_mps
+
+        _mps_handle, _mps_env = _early_setup_mps()
+        if _mps_handle is None:
+            # MPS is unavailable in this environment (e.g. Modal sandbox
+            # without --ipc=host). Continue with fractional GPU sharing
+            # but no MPS — see setup_for_colocate docstring for the
+            # tradeoff. Mark the args so downstream code knows not to
+            # inject CUDA_MPS_PIPE_DIRECTORY into actor runtime_envs.
+            args.colocate_mps_unavailable = True
+            logger.warning(
+                "MPS unavailable on this host; running colocate without "
+                "kernel concurrency (fractional GPU sharing only)."
+            )
+        else:
+            args.colocate_mps_unavailable = False
+            os.environ.update(_mps_env)
+            logger.info(
+                "MPS daemon ready (pre-Ray start, started_by_us=%s, pipe_dir=%s)",
+                _mps_handle.started_by_us,
+                _mps_handle.pipe_dir,
+            )
+
     # [1] Create controller early (lightweight: only needs args + dp_size)
     with timer.phase("Create controller"):
         driver_node_id = ray.get_runtime_context().get_node_id()
+        controller_env = get_torchspec_env_vars()
+        # Ray inherits os.environ for in-cluster workers, but the
+        # controller's runtime_env override is layered separately —
+        # explicitly include MPS pipe so the controller process
+        # joins the same MPS client world as the trainer/engine
+        # actors created later. Without this, the first
+        # `torch.cuda.is_available()` inside the controller (e.g.
+        # via tokenizer/dataset code that does `torch.cuda.*`)
+        # crashes the whole run.
+        if is_mps_colocate(args) and not getattr(args, "colocate_mps_unavailable", False):
+            from torchspec.colocate.mps import mps_client_env as _mps_env_fn
+
+            controller_env.update(_mps_env_fn())
         controller = AsyncTrainingController.options(
-            runtime_env={"env_vars": get_torchspec_env_vars()},
+            runtime_env={"env_vars": controller_env},
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=driver_node_id, soft=False),
         ).remote(args, args.dp_size)
 
@@ -309,6 +382,7 @@ def train_async_no_generation(args):
         args.draft_model_config_obj = draft_model_config
 
         _validate_and_configure_dflash(args, draft_model_config)
+        _maybe_resolve_colocate_aux_layers(args)
 
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
     timer.begin_async("Dataset loading")
@@ -317,9 +391,36 @@ def train_async_no_generation(args):
 
     # [3] Do initialization that doesn't depend on dataset in parallel
     with timer.phase("Driver-side init"):
+        # NOTE: under colocate the MPS daemon was already started
+        # in step [0] above so the controller (started in step [1])
+        # could come up with the matching CUDA_MPS_PIPE_DIRECTORY.
+        # `setup_for_colocate` is idempotent so callers expecting a
+        # handle here still get one, but we intentionally don't
+        # re-start the daemon.
+        #
+        # Multi-node colocate: step [0]'s pre-Ray MPS bring-up only
+        # covered the driver's own node. Bootstrap the daemon on every
+        # other node before the trainer/engine actors are placed there.
+        # No-op for single-node (the driver node's daemon is already up)
+        # so the validated single-node path is untouched.
+        if (
+            is_mps_colocate(args)
+            and not getattr(args, "colocate_mps_unavailable", False)
+            and int(getattr(args, "training_num_nodes", 1) or 1) > 1
+        ):
+            from torchspec.colocate.mps import ensure_mps_on_all_nodes
+
+            ensure_mps_on_all_nodes()
         pgs = create_placement_groups(args)
-        launch_mooncake_master(args)
-        mooncake_config = build_mooncake_config(args)
+        # Phase 5: in colocate (NCCL transfer) mode the entire Mooncake
+        # plumbing is unused. Skip both the master daemon and the
+        # config build. Downstream code (Trainer / SglEngine) treats
+        # `mooncake_config=None` as "not on the Mooncake path".
+        if is_mps_colocate(args):
+            mooncake_config = None
+        else:
+            launch_mooncake_master(args)
+            mooncake_config = build_mooncake_config(args)
 
     # [4] Wait for dataset sizes (small ints, unlike the old ray.put of the full dataset)
     dataset_size, eval_dataset_size = timer.wait(
@@ -359,6 +460,60 @@ def train_async_no_generation(args):
             pg=pgs["training"],
             training_class=TrainerActor,
         )
+
+        # Phase 4/5: Driver-computed colocate union-world rendezvous params.
+        # The trainer rank-0 already self-discovered its master_addr/port
+        # via setup_master in its constructor — we read them off the
+        # train_group, derive the union-world endpoint (port + 5000), and
+        # inject the env contract into BOTH the driver process (so trainer
+        # actors created below see it via Ray's child env propagation) and
+        # the engine actors' runtime_env (so they see it before they
+        # spawn the sglang TP scheduler subprocess).
+        engine_extra_env: dict[str, str] = {}
+        if is_mps_colocate(args):
+            n_per_role = args.training_num_nodes * args.training_num_gpus_per_node
+            union_master_addr = train_group.master_addr
+            union_master_port = int(train_group.master_port) + 5000
+            union_timeout_min = int(getattr(args, "distributed_timeout_minutes", 30))
+            union_env = {
+                "TORCHSPEC_COLOCATE_TRANSFER_MODE": "nccl",
+                "TORCHSPEC_COLOCATE_UNION_MASTER_ADDR": str(union_master_addr),
+                "TORCHSPEC_COLOCATE_UNION_MASTER_PORT": str(union_master_port),
+                "TORCHSPEC_COLOCATE_UNION_WORLD_SIZE": str(2 * n_per_role),
+                "TORCHSPEC_COLOCATE_UNION_N_PER_ROLE": str(n_per_role),
+                "TORCHSPEC_COLOCATE_UNION_TIMEOUT_MIN": str(union_timeout_min),
+                # engine_tp_size for the colocate rank math. Currently
+                # always 1 (validator invariant D); part of the contract
+                # so the multi-TP data-plane work doesn't have to touch
+                # the env wiring later.
+                "TORCHSPEC_COLOCATE_ENGINE_TP_SIZE": str(
+                    int(getattr(args, "inference_num_gpus_per_engine", 1) or 1)
+                ),
+            }
+            # Re-publish any explicit CUDA IPC override through the same
+            # env contract so the trainer-side fetcher and the engine-side
+            # connector make an identical transport decision (a one-sided
+            # choice would desync the wire protocol). CUDA IPC is the
+            # default transport; when the var is unset both sides default
+            # to it independently, so only an explicit value needs to be
+            # forwarded (typically TORCHSPEC_COLOCATE_IPC=0 to force gloo).
+            _ipc_opt = os.environ.get("TORCHSPEC_COLOCATE_IPC")
+            if _ipc_opt is not None:
+                union_env["TORCHSPEC_COLOCATE_IPC"] = _ipc_opt
+            for k, v in union_env.items():
+                os.environ[k] = v
+            engine_extra_env = union_env
+            logger.info(
+                "[colocate] Driver-computed union rendezvous: %s:%d "
+                "(world_size=2*%d=%d, timeout=%dmin). Injecting into engine "
+                "runtime_env so the patched sglang sees it before init.",
+                union_master_addr,
+                union_master_port,
+                n_per_role,
+                2 * n_per_role,
+                union_timeout_min,
+            )
+
         train_init_refs = train_group.async_init(
             args, role="training", mooncake_config=mooncake_config, with_ref=False
         )
@@ -369,11 +524,31 @@ def train_async_no_generation(args):
         # dispatched after to maximize parallelism with the wait below.
         _maybe_create_scratch_draft(args, train_group)
 
+        # NOTE: the previous "init-order fence" that awaited trainer init
+        # before kicking off engines is incompatible with the colocate
+        # union-world rendezvous, which is COLLECTIVE across all 2N ranks.
+        # If we waited on trainer init here, every trainer's
+        # init_process_group(world_size=2N) would block forever waiting
+        # for engines that hadn't been spawned. Instead we let trainer
+        # init and engine init run in parallel; both block on the
+        # rendezvous, both unblock together. Memory contention under
+        # MPS is handled by `expandable_segments:True` + the
+        # train_frac/infer_frac budget split (no double-allocation
+        # because both sides start tiny and grow into their share).
+
         inference_engines, engine_init_refs = prepare_inference_engines(
-            args, pgs["inference"], mooncake_config
+            args,
+            pgs["inference"],
+            mooncake_config,
+            extra_env_vars=engine_extra_env if is_mps_colocate(args) else None,
         )
 
-    # [8] Wait for all actor init to complete concurrently
+    # [8] Wait for all actor init to complete concurrently. Under
+    # colocate mode this is also where the union-world rendezvous
+    # collectively unblocks — every trainer + engine rank is sitting
+    # inside dist.init_process_group(world_size=2N) until ALL of them
+    # call it. Awaiting both sets of refs together is what allows
+    # progress.
     n_train = len(train_init_refs)
     logger.info(
         f"Waiting for {n_train} training actors and {len(engine_init_refs)} "
@@ -381,8 +556,9 @@ def train_async_no_generation(args):
     )
     all_results = timer.wait("Actor initialization", train_init_refs + engine_init_refs)
 
-    train_results = all_results[:n_train]
-    assert len(set(train_results)) == 1
+    if n_train > 0:
+        train_results = all_results[:n_train]
+        assert len(set(train_results)) == 1
     logger.info(
         f"All {n_train} training actors and {len(engine_init_refs)} inference engines initialized"
     )
@@ -391,13 +567,33 @@ def train_async_no_generation(args):
         train_group.set_vocab_buffers(*vocab_mapping)
         logger.info("Loaded vocab mapping into training actors")
 
-    # [9] Setup async training with pre-created controller
-    with timer.phase("Setup async training"):
-        controller, inference_manager = setup_async_training_with_engines(
-            args, train_group, mooncake_config, inference_engines, controller=controller
-        )
+    # [9] Setup training with pre-created controller. Colocate (NCCL)
+    # mode skips the AsyncInferenceManager entirely — see
+    # setup_colocate_training_with_engines for what's left out.
+    with timer.phase("Setup training"):
+        if is_mps_colocate(args):
+            controller, inference_manager = setup_colocate_training_with_engines(
+                args, train_group, inference_engines, controller=controller
+            )
+        else:
+            controller, inference_manager = setup_async_training_with_engines(
+                args, train_group, mooncake_config, inference_engines, controller=controller
+            )
 
     timer.log_summary()
+
+    if is_mps_colocate(args):
+        from torchspec.controller.colocate_loop import run_colocate_training_loop
+
+        run_colocate_training_loop(
+            args,
+            controller,
+            train_group,
+            inference_engines=inference_engines,
+            dataset_size=dataset_size,
+            eval_dataset_size=eval_dataset_size,
+        )
+        return
 
     # [10] Run training loop (no ray.put needed — dataset lives on controller)
     run_training_loop(
