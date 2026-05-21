@@ -26,6 +26,7 @@ import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from torchspec.colocate import is_colocate_enabled, is_mps_colocate
 from torchspec.ray.train_group import RayTrainGroup
 from torchspec.utils.logging import logger
 
@@ -113,7 +114,7 @@ def _get_expected_gpu_count(args) -> int:
     training_gpus = args.training_num_nodes * args.training_num_gpus_per_node
     inference_gpus = getattr(args, "inference_num_gpus", 0)
     if (
-        getattr(args, "colocate", False)
+        is_colocate_enabled(args)
         or getattr(args, "debug_train_only", False)
         or getattr(args, "debug_inference_only", False)
     ):
@@ -174,12 +175,34 @@ def create_placement_groups(args):
             "inference": (inference_pg, inference_bundle_indices, inference_gpu_ids),
         }
 
-    if args.colocate:
+    if is_colocate_enabled(args):
         num_gpus = args.training_num_nodes * args.training_num_gpus_per_node
-        logger.info(f"Creating colocated placement group with {num_gpus} GPUs...")
+        strategy_label = "mps" if is_mps_colocate(args) else "legacy"
+        logger.info(
+            f"Creating colocated placement group with {num_gpus} GPUs "
+            f"(strategy={strategy_label})..."
+        )
         pg, bundle_indices, gpu_ids = _create_placement_group(
             num_gpus, strategy="PACK", name="colocate_pg"
         )
+        # MPS strategy: validate the engine-rank invariant so a misconfig
+        # surfaces here (driver) rather than later as a NCCL hang. Phase 0's
+        # validate_colocate_config already enforces this on flat_args, but
+        # we re-check here because users could (and do) construct args
+        # programmatically and skip parse_config.
+        if is_mps_colocate(args):
+            engine_count = max(
+                1,
+                int(getattr(args, "inference_num_gpus", 0))
+                // max(1, int(getattr(args, "inference_num_gpus_per_engine", 1))),
+            )
+            engine_tp = max(1, int(getattr(args, "inference_num_gpus_per_engine", 1)))
+            if engine_count * engine_tp != num_gpus:
+                raise ValueError(
+                    f"colocate_strategy=mps requires engine_count ({engine_count}) "
+                    f"× engine_tp ({engine_tp}) == world_size ({num_gpus}); "
+                    f"got {engine_count * engine_tp}."
+                )
         return {
             "training": (pg, bundle_indices, gpu_ids),
             "inference": (pg, bundle_indices, gpu_ids),
@@ -226,12 +249,23 @@ def create_placement_groups(args):
 
 
 def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, training_class=None):
+    # Under MPS colocate, the trainer claims `train_frac` of each bundle so
+    # the engine actor can claim the remaining `infer_frac` on the same
+    # bundle (Ray refuses to over-subscribe). Under the legacy colocate path
+    # (or disagg) the trainer was hard-coded to 0.4; we keep that as the
+    # fallback so non-MPS configs are unchanged.
+    if is_mps_colocate(args):
+        train_frac = float(getattr(args, "train_frac", 0.45) or 0.45)
+        num_gpus_per_actor = train_frac
+    else:
+        num_gpus_per_actor = 0.4
+
     return RayTrainGroup(
         args=args,
         num_nodes=num_nodes,
         num_gpus_per_node=num_gpus_per_node,
         pg=pg,
-        num_gpus_per_actor=0.4,
+        num_gpus_per_actor=num_gpus_per_actor,
         training_class=training_class,
     )
 

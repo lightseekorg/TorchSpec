@@ -84,7 +84,37 @@ class RayActor:
             gpu_ids = ray.get_gpu_ids()
             base_gpu_id = int(float(gpu_ids[0])) if gpu_ids else 0
         local_gpu_id = self.resolve_local_gpu_id(base_gpu_id)
-        torch.cuda.set_device(local_gpu_id)
+        try:
+            torch.cuda.set_device(local_gpu_id)
+        except RuntimeError as e:
+            # MPS-mode failures show up as CUDA error 805. Surface
+            # the daemon log + env so the user doesn't have to
+            # re-run with extra logging.
+            mps_pipe = os.environ.get("CUDA_MPS_PIPE_DIRECTORY")
+            mps_log = os.environ.get("CUDA_MPS_LOG_DIRECTORY")
+            diag = [
+                f"setup_gpu(local_gpu_id={local_gpu_id}) failed: {e}",
+                f"  CUDA_MPS_PIPE_DIRECTORY = {mps_pipe!r}",
+                f"  CUDA_MPS_LOG_DIRECTORY = {mps_log!r}",
+                f"  CUDA_VISIBLE_DEVICES   = {os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
+                f"  ray.get_gpu_ids()      = {ray.get_gpu_ids()!r}",
+            ]
+            if mps_pipe:
+                pipe_file = os.path.join(mps_pipe, "control")
+                diag.append(f"  pipe_file_exists       = {os.path.exists(pipe_file)} ({pipe_file})")
+            if mps_log:
+                ctl_log = os.path.join(mps_log, "control.log")
+                if os.path.exists(ctl_log):
+                    try:
+                        with open(ctl_log, "rb") as f:
+                            tail = f.read()[-4096:].decode("utf-8", errors="replace")
+                        diag.append(f"  control.log tail:\n{tail}")
+                    except Exception as read_err:
+                        diag.append(f"  control.log unreadable: {read_err}")
+                else:
+                    diag.append(f"  control.log missing at {ctl_log}")
+            print("\n".join(diag), flush=True)
+            raise
         os.environ["LOCAL_RANK"] = str(local_gpu_id)
         return local_gpu_id
 

@@ -26,6 +26,8 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from torchspec.colocate import is_mps_colocate
+from torchspec.colocate.mps import mps_client_env
 from torchspec.utils.distributed import _build_usp_group_ranks
 from torchspec.utils.env import get_torchspec_env_vars
 
@@ -99,6 +101,30 @@ class RayTrainGroup:
             os.environ.get("TORCHINDUCTOR_FX_GRAPH_CACHE", "1"),
         )
 
+        # MPS colocate: every trainer process must talk to the same MPS
+        # control daemon as its paired engine. The gloo-fallback transport
+        # also wants expandable_segments so two cohabiting CUDA contexts
+        # can grow without thrashing the segment table.
+        if is_mps_colocate(self.args):
+            from torchspec.colocate.cuda_ipc import ipc_enabled
+
+            if not getattr(self.args, "colocate_mps_unavailable", False):
+                env_vars.update(mps_client_env())
+            # CUDA IPC (the default) needs non-expandable memory: its
+            # classic capability-free handle path does not work with
+            # expandable_segments (which forces pidfd_getfd, needing
+            # CAP_SYS_PTRACE — not granted in typical containers). The
+            # gloo fallback wants expandable_segments; the IPC default
+            # must *actively disable* it, because the driver env may
+            # carry expandable_segments:True (the colocate tests set it)
+            # and the trainer actor would otherwise inherit it.
+            if not ipc_enabled():
+                env_vars.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+                env_vars.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+            else:
+                env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+                env_vars["PYTORCH_ALLOC_CONF"] = "expandable_segments:False"
+
         TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(
             self._training_class
         )
@@ -118,6 +144,14 @@ class RayTrainGroup:
             if rank == 0:
                 master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             self._actor_handlers.append(actor)
+
+        # Expose the rendezvous address so the driver can derive the colocate
+        # union-world endpoint and inject the matching env vars into the
+        # engine actors' runtime_env BEFORE engines spawn sglang. Without
+        # this, the engines would have no way to discover the trainer-side
+        # master_port the union world is rendezvousing on.
+        self.master_addr = master_addr
+        self.master_port = master_port
 
     def async_init(self, args, role, mooncake_config=None, with_ref=False):
         """
