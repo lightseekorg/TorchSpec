@@ -23,6 +23,8 @@
 import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from torchspec.colocate import is_mps_colocate
+from torchspec.colocate.mps import mps_client_env
 from torchspec.utils.env import get_torchspec_env_vars
 from torchspec.utils.logging import logger
 
@@ -61,12 +63,27 @@ def create_inference_engines(args, inference_pg, mooncake_config, engine_group: 
     return engines
 
 
-def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group: int = 0):
+def prepare_inference_engines(
+    args,
+    inference_pg,
+    mooncake_config,
+    engine_group: int = 0,
+    extra_env_vars: dict | None = None,
+):
     """Create inference engines and fire init calls without waiting.
 
     Use this to parallelize engine initialization with other setup work
     (e.g., training actor initialization). Call ray.get() on the returned
     init_refs before using the engines.
+
+    Args:
+        extra_env_vars: Optional dict of extra env vars to inject into the
+            engine actors' ``runtime_env``. Used by the colocate path to
+            ship the driver-computed ``TORCHSPEC_COLOCATE_UNION_*``
+            rendezvous params + ``TORCHSPEC_COLOCATE_TRANSFER_MODE=nccl``
+            into engines BEFORE they spawn sglang. Without this, the
+            sglang patch wouldn't see the env contract and would fall
+            through to the disagg path.
 
     Returns:
         Tuple of (head_engines, init_refs) where head_engines are the engines
@@ -82,7 +99,13 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
     if engine_type == "hf":
         engines, init_refs = _prepare_hf_engines(args, inference_pg, mooncake_config, engine_group)
     elif engine_type == "sgl":
-        engines, init_refs = _prepare_sgl_engines(args, inference_pg, mooncake_config, engine_group)
+        engines, init_refs = _prepare_sgl_engines(
+            args,
+            inference_pg,
+            mooncake_config,
+            engine_group,
+            extra_env_vars=extra_env_vars,
+        )
     else:
         engines, init_refs = _prepare_vllm_engines(
             args, inference_pg, mooncake_config, engine_group
@@ -150,7 +173,11 @@ def _init_hf_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> l
 
 
 def _prepare_sgl_engines(
-    args, pg, mooncake_config=None, engine_group: int = 0
+    args,
+    pg,
+    mooncake_config=None,
+    engine_group: int = 0,
+    extra_env_vars: dict | None = None,
 ) -> tuple[list, list]:
     """Create SGL engine actors and fire init calls without waiting.
 
@@ -193,6 +220,49 @@ def _prepare_sgl_engines(
     SglRayActor = ray.remote(SglEngine)
     env_vars = get_torchspec_env_vars()
 
+    # MPS colocate: claim infer_frac of each bundle (the trainer will claim
+    # train_frac so the two together fit, with headroom). Plus inject MPS
+    # client env vars + expandable_segments allocator. See Phase 1 in
+    # docs/colocate/implementation.md.
+    if is_mps_colocate(args):
+        from torchspec.colocate.cuda_ipc import ipc_enabled
+
+        sgl_num_gpus = float(getattr(args, "infer_frac", 0.45) or 0.45)
+        sgl_num_cpus = sgl_num_gpus
+        # CUDA IPC (the default transport) needs the classic, capability-
+        # free cudaIpc* handle path, which only works on *non*-expandable
+        # memory. expandable_segments forces the pidfd_getfd fd-passing
+        # path, which needs CAP_SYS_PTRACE (not granted in typical
+        # containers). The gloo fallback (TORCHSPEC_COLOCATE_IPC=0) wants
+        # expandable_segments; the IPC default must *actively disable* it
+        # — the driver env may carry expandable_segments:True (the
+        # colocate tests set it) and the actor would otherwise inherit it,
+        # which makes CUDA IPC unusable and trips the ensure_ipc_usable
+        # fail-fast guard.
+        if not ipc_enabled():
+            env_vars = {
+                **env_vars,
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "PYTORCH_ALLOC_CONF": "expandable_segments:True",
+            }
+        else:
+            env_vars = {
+                **env_vars,
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
+                "PYTORCH_ALLOC_CONF": "expandable_segments:False",
+            }
+        if not getattr(args, "colocate_mps_unavailable", False):
+            env_vars.update(mps_client_env())
+    else:
+        sgl_num_gpus = 0.2
+        sgl_num_cpus = 0.2
+
+    # Driver-supplied env vars (e.g. colocate union-world rendezvous params)
+    # win over any defaults set above. Layered last so they cannot be
+    # accidentally clobbered by the local mode-specific overrides.
+    if extra_env_vars:
+        env_vars = {**env_vars, **extra_env_vars}
+
     # Step 1: Create all engine actors (without calling init yet)
     engines = []
     for i in range(num_engines):
@@ -208,8 +278,8 @@ def _prepare_sgl_engines(
         )
 
         engine = SglRayActor.options(
-            num_cpus=0.2,
-            num_gpus=0.2,
+            num_cpus=sgl_num_cpus,
+            num_gpus=sgl_num_gpus,
             scheduling_strategy=scheduling_strategy,
             runtime_env={"env_vars": env_vars},
         ).remote(
