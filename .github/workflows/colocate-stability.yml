@@ -1,0 +1,64 @@
+name: Colocate 1000-step stability
+
+# Long-run memory-stability check for the colocate (MPS + NCCL) training
+# path -- the nightly counterpart to the per-PR colocate smoke. Runs
+# tests/colocate/test_stability.py with PHASE6_STABILITY_STEPS=1000 and
+# asserts peak GPU allocation stays within 1 % between a post-warmup
+# early step and a late step (see the test for the rationale).
+#
+# This job needs a real 4xH100 + working-MPS host, which GitHub-hosted
+# runners do not provide. It is therefore pinned to a self-hosted runner
+# labelled `colocate-stability`. Until such a runner is registered the
+# job is queued but never picked up -- that is intentional: the gating
+# structure lives here so wiring a runner is the only remaining step.
+#
+# Triggers:
+#   * schedule       -- nightly at 08:00 UTC.
+#   * workflow_dispatch -- manual, with an optional step-count override.
+#   * pull_request (labeled) -- only when the PR carries the
+#     `colocate-stability` label, so the expensive run is opt-in.
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "PHASE6_STABILITY_STEPS override"
+        required: false
+        default: "1000"
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: colocate-stability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stability:
+    # Run on schedule/dispatch unconditionally; on a PR only when the
+    # `colocate-stability` label is the one that was just added (or is
+    # present). Keeps the 4xH100 nightly opt-in per PR.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.label.name == 'colocate-stability'
+    runs-on: [self-hosted, gpu, colocate-stability]
+    timeout-minutes: 180
+    env:
+      # workflow_dispatch can override; schedule / PR-label use 1000.
+      PHASE6_STABILITY_STEPS: ${{ github.event.inputs.steps || '1000' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run 1000-step colocate stability
+        run: bash scripts/colocate/run_smoke_host.sh --stability
+
+      - name: Upload stability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: colocate-stability-report
+          path: |
+            colocate-smoke-report.txt
+            colocate-smoke-pytest.log
+          if-no-files-found: warn
