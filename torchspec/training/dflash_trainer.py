@@ -230,10 +230,16 @@ class DFlashTrainer(Trainer):
             self.target_lm_head.eval()
             self.target_lm_head.requires_grad_(False)
 
-        dist.barrier()
+        # Scope to the trainer-only group (get_gloo_group()). Without an
+        # explicit group these collectives default to the union-world PG
+        # in colocate mode — the engine ranks never enter this method, so
+        # the trainer deadlocks here. Mirrors eagle3_trainer's
+        # _init_target_lm_head. 1-trainer => no-op; >=2 => syncs replicas.
+        _trainer_grp = get_gloo_group()
+        dist.barrier(group=_trainer_grp)
 
         for param in self.target_lm_head.parameters():
-            dist.broadcast(param.data, src=0)
+            dist.broadcast(param.data, src=0, group=_trainer_grp)
 
         logger.info(f"[Rank {self.dp_rank}] TargetLMHead initialized and synced")
 
@@ -308,9 +314,13 @@ class DFlashTrainer(Trainer):
         )
         count_pp = torch.stack([m[count_key] for m in all_step_metrics]).sum(dim=0)
 
-        dist.all_reduce(loss_sum_pp, op=dist.ReduceOp.SUM)
-        dist.all_reduce(correct_sum_pp, op=dist.ReduceOp.SUM)
-        dist.all_reduce(count_pp, op=dist.ReduceOp.SUM)
+        # Trainer-only group: in colocate mode the default PG is the
+        # union world (trainer + engine ranks) and the engine never
+        # reaches this metric reduction — see eagle3_trainer.
+        _metric_grp = get_gloo_group()
+        dist.all_reduce(loss_sum_pp, op=dist.ReduceOp.SUM, group=_metric_grp)
+        dist.all_reduce(correct_sum_pp, op=dist.ReduceOp.SUM, group=_metric_grp)
+        dist.all_reduce(count_pp, op=dist.ReduceOp.SUM, group=_metric_grp)
 
         safe_count_pp = count_pp.clamp(min=1.0)
         avg_loss_pp = loss_sum_pp / safe_count_pp

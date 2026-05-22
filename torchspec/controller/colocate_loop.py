@@ -67,7 +67,6 @@ def _build_tensor_specs(
     *,
     hidden_size: int,
     num_aux_layers: int,
-    store_last_hidden_states: bool,
 ) -> dict[str, tuple[tuple[int, ...], Any]]:
     """Return the ``ColocateTrainSample.tensor_specs`` dict for one sample.
 
@@ -77,7 +76,20 @@ def _build_tensor_specs(
 
       * ``hidden_states``: (seq_len, num_aux_layers * hidden_size), bf16
       * ``input_ids``: (seq_len,), int64
-      * ``last_hidden_states``: (seq_len, hidden_size), bf16 [optional]
+      * ``last_hidden_states``: (seq_len, hidden_size), bf16
+
+    ``last_hidden_states`` is ALWAYS declared. The colocate engine runs
+    with ``enable_return_hidden_states=True`` unconditionally, so
+    sglang's ``_send_hidden_states_to_nccl`` always ships a non-None
+    ``last_hidden_states`` — it ignores the training-side
+    ``store_last_hidden_states`` config (that flag only gates the disagg
+    Mooncake metadata path). The trainer must declare every tensor the
+    engine sends, or the CUDA-IPC handshake deadlocks: the receiver
+    pre-allocates one buffer per declared spec and acks per spec, so an
+    undeclared tensor leaves the engine's send blocked forever waiting
+    for an ack that never comes. Draft trainers that do not consume
+    ``last_hidden_states`` (e.g. DFlash, ``store_last_hidden_states:
+    false``) simply ignore the extra key.
 
     Trainer and engine both sort by key, so insertion order is
     irrelevant.
@@ -88,12 +100,8 @@ def _build_tensor_specs(
     specs: dict[str, tuple[tuple[int, ...], Any]] = {
         "hidden_states": ((seq_len, concat_hidden_size), _HIDDEN_STATES_DTYPE),
         "input_ids": ((seq_len,), torch.long),
+        "last_hidden_states": ((seq_len, hidden_size), _HIDDEN_STATES_DTYPE),
     }
-    if store_last_hidden_states:
-        specs["last_hidden_states"] = (
-            (seq_len, hidden_size),
-            _HIDDEN_STATES_DTYPE,
-        )
     return specs
 
 
@@ -268,7 +276,6 @@ def run_colocate_training_loop(
                 seq_len,
                 hidden_size=hidden_size,
                 num_aux_layers=num_aux_layers,
-                store_last_hidden_states=store_last_hidden_states,
             )
             train_queues[r].put(
                 ColocateTrainSample(
