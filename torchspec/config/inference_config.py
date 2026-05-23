@@ -115,6 +115,8 @@ class InferenceConfig:
     inference_num_gpus: Optional[int] = None
     inference_num_gpus_per_engine: int = 1
     inference_num_gpus_per_node: int = 8
+    inference_node_ips: Optional[list[str]] = None
+    inference_node_selectors: Optional[list[dict[str, str]]] = None
     last_hidden_states_prenorm: Optional[bool] = None
     max_sample_pool_size: int = 0
     store_last_hidden_states: bool = True

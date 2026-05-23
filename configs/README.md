@@ -37,6 +37,51 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `inference.sglang` | `tp_size`, `mem_fraction_static`, `extra_args` | SGLang engine settings (nested under inference) |
 | `mooncake` | `protocol`, `device_name` | Mooncake transfer engine settings |
 
+## Custom Ray placement
+
+Use `training.placement_strategy: custom` when training and inference must run
+on explicitly chosen Ray nodes. This is useful when the default `PACK` placement
+would put actors on nodes with the wrong network locality, cache state, or GPU
+partition.
+
+IP-based placement uses Ray's built-in `node:<ip>` resource and does not require
+custom Ray labels:
+
+```yaml
+training:
+  placement_strategy: custom
+  training_num_nodes: 1
+  training_num_gpus_per_node: 8
+  training_node_ips:
+    - 10.0.0.1
+
+inference:
+  inference_num_gpus: 16
+  inference_num_gpus_per_node: 8
+  inference_node_ips:
+    - 10.0.0.2
+    - 10.0.0.3
+```
+
+Ray label selectors are also supported when your Ray version supports placement
+group `bundle_label_selector`:
+
+```yaml
+training:
+  placement_strategy: custom
+  training_node_selectors:
+    - {"torchspec/node": "trainer-0"}
+
+inference:
+  inference_node_selectors:
+    - {"torchspec/node": "infer-0"}
+    - {"torchspec/node": "infer-1"}
+```
+
+For each role, set either `*_node_ips` or `*_node_selectors`, not both. The
+configured node order is preserved; for multi-node inference it determines the
+engine actor order and therefore the `node_rank` passed to SGLang or vLLM.
+
 ## SGLang engine configuration
 
 SGLang settings live under `inference.sglang` and are split into two tiers:

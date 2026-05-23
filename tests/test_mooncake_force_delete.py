@@ -68,6 +68,56 @@ class TestEnableHardPinConfig:
             assert restored.enable_hard_pin is False
 
 
+class TestMooncakeEnvDefaults:
+    def test_tcp_memcpy_default_is_applied_by_export_env(self):
+        config = MooncakeConfig(protocol="tcp")
+
+        with patch.dict(os.environ, {}, clear=True):
+            config.export_env()
+
+            assert os.environ["MC_STORE_MEMCPY"] == "0"
+
+    def test_tcp_memcpy_default_preserves_user_override(self):
+        config = MooncakeConfig(protocol="tcp")
+
+        with patch.dict(os.environ, {"MC_STORE_MEMCPY": "1"}, clear=True):
+            config.apply_env_defaults()
+
+            assert os.environ["MC_STORE_MEMCPY"] == "1"
+
+    def test_tcp_memcpy_default_not_applied_for_rdma(self):
+        config = MooncakeConfig(protocol="rdma")
+
+        with patch.dict(os.environ, {}, clear=True):
+            config.apply_env_defaults()
+
+            assert "MC_STORE_MEMCPY" not in os.environ
+
+    def test_direct_store_setup_applies_tcp_memcpy_before_mooncake_client_setup(self):
+        config = MooncakeConfig(protocol="tcp", async_put_pool_size=0)
+        mock_raw_store = MagicMock()
+        mock_raw_store.setup.return_value = 0
+
+        class ConcreteStore(MooncakeHiddenStateStore):
+            pass
+
+        def make_raw_store():
+            assert os.environ["MC_STORE_MEMCPY"] == "0"
+            return mock_raw_store
+
+        store = ConcreteStore(config)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("torchspec.transfer.mooncake.store.MooncakeDistributedStore", make_raw_store),
+            patch.object(ConcreteStore, "_verify_force_delete"),
+            patch.object(ConcreteStore, "_build_replicate_config"),
+            patch("torch.cuda.is_available", return_value=False),
+        ):
+            store.setup()
+
+        mock_raw_store.setup.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Tests 2-3: _verify_force_delete
 # ---------------------------------------------------------------------------

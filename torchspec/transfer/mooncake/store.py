@@ -115,6 +115,7 @@ class MooncakeHiddenStateStore(ABC):
                 "Set mooncake.device_name to a specific RDMA device (e.g. 'mlx5_0')."
             )
 
+        self.config.apply_env_defaults()
         self._store = MooncakeDistributedStore()
         logger.info(
             "Connecting to Mooncake master at %s, metadata server at %s",
