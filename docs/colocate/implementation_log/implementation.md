@@ -3,13 +3,16 @@
 > Scope: implement the colocate (training + inference on the same GPU) mode
 > described in [Issue #81](https://github.com/lightseekorg/TorchSpec/issues/81).
 >
-> Prerequisite: read [`knowledge.md`](knowledge.md) first. This doc assumes
-> you already understand MPS, fractional Ray bundles, NCCL union worlds, and
-> how the disaggregated baseline works today.
+> Prerequisite: read [`knowledge/knowledge.zh-en.md`](knowledge/knowledge.zh-en.md)
+> first (bilingual conceptual background — English paragraphs followed by
+> Chinese translations). This doc assumes you already understand MPS,
+> fractional Ray bundles, NCCL union worlds, the two colocate contracts
+> (default-PG = union world; engine owns the wire payload), and how the
+> disaggregated baseline works today.
 
 > ⚠️ **This is the original plan — superseded in places. Read with
 > [`implementation_log.md`](implementation_log.md).** Cross-check, updated
-> 2026-05-21:
+> 2026-05-22:
 > - **Phase 3's "NCCL P2P data plane" is not what shipped.** NCCL hard-rejects
 >   a communicator with two ranks on one physical GPU ("Duplicate GPU
 >   detected"), so same-GPU NCCL P2P is impossible. The shipped hidden-state
@@ -19,17 +22,41 @@
 >   probe fix), and [`transport_benchmark.md`](transport_benchmark.md).
 > - **`expandable_segments`** is wanted only by the gloo fallback; the CUDA
 >   IPC default actively disables it (IPC needs plain `cudaMalloc` memory).
-> - The phase plan completed (Phases 0-8) plus follow-up rounds 1-10; the
->   `--full` matrix is GPU-green. `implementation_log.md` is the source of
->   truth for what actually happened. Original text below is kept for the
->   design rationale and flagged inline.
+> - The phase plan completed (Phases 0-8) plus follow-up rounds 1-12; the
+>   `--full` matrix is GPU-green and both draft model families have a
+>   production-scale (20000-step, 40k-sample) colocate result against
+>   same-SGLang disagg baselines: **Eagle3 ≈2.1× less GPU-h** (CE1,
+>   round 11), **DFlash ≈1.5× less GPU-h** (C1, round 12).
+>   `implementation_log.md` is the source of truth for what actually
+>   happened. Original text below is kept for the design rationale and
+>   flagged inline.
 > - **Transport optimization** was investigated separately —
 >   [`transport_optimization.md`](transport_optimization.md): no
 >   hand-written C++/CUDA/Triton kernel is needed (the path is a
 >   bandwidth-bound D→D copy plus driver-API calls); the worthwhile
 >   headroom is protocol-level (`ipc-pipe` ack pipelining — 3.9× on the
 >   engine-`send()` stall) and **low-priority**, since the transport is
->   only ~1 % of a colocate step. Round 10 in the log.
+>   only ~1 % of a colocate step. Round 10/11 in the log.
+> - **Phase 5's `_build_tensor_specs` design has one round-12 amendment.**
+>   `colocate_loop._build_tensor_specs` originally derived its tensor set
+>   from training-side flags (`store_last_hidden_states`). That is wrong:
+>   the wire payload is decided by the **engine + sglang patch**, not by a
+>   trainer config, and a mismatch deadlocks the per-tensor CUDA-IPC
+>   handshake (engine sent 3 tensors, trainer declared 2 → engine's 3rd
+>   `dist.recv` blocked forever). The trainer-side spec must mirror what
+>   the engine actually sends. Now `last_hidden_states` is always
+>   declared. Round 12 in the log.
+> - **Phase 7's grad-parity story is complete.** `grad_parity_full` is now
+>   gloo-vs-CUDA-IPC (round 2); `test_phase7_grad_parity_vs_disagg` adds
+>   the literal Mooncake-disagg comparison (rounds 6 + 8). Both pass.
+> - **Trainer-only collectives must scope `group=` in colocate.**
+>   `Eagle3Trainer` carried this fix for `_init_target_lm_head`;
+>   `DFlashTrainer` did not, and silently deadlocked under colocate at
+>   `dist.barrier()`. Round-12 amendment to the trainer-actor contract:
+>   any bare `dist.barrier` / `broadcast` / `all_reduce` in a trainer
+>   path will deadlock the union default PG in colocate; scope them to
+>   `get_gloo_group()` (or another trainer-only group). Same shape as the
+>   round-7 `set_model_state_dict` / `dcp.save` / `dcp.load` bugs.
 
 The plan is **phased**: each phase is independently runnable and testable. Do
 not skip ahead — Phase 3 (the data plane) is far easier to debug if Phases 1

@@ -2493,3 +2493,268 @@ Issue-#81 follow-up items 3, 4, 6, 7 are GPU-validated. Items 1 (2-node)
 and 2 (8-GPU TP) remain — they need different hardware (2 nodes / 8
 GPUs), not code. `ipc-pipe` is production-wired but opt-in and
 low-priority.
+
+---
+
+## Follow-up round 12 — DFlash colocate two deadlocks + C1 20000-step GPU validation (2026-05-22, RunPod 2×H100)
+
+Round 11 GPU-validated the Eagle3 colocate path end-to-end on a real
+production workload (CE1: Qwen3-8B Eagle3 2+2 colocate, 20000 steps).
+The DFlash colocate path had **not** been exercised at production
+scale until this round — the existing colocate tests use Eagle3
+configs. Bringing DFlash up surfaced **two distinct, sequential**
+deadlocks; both are now fixed and DFlash colocate is GPU-validated
+through a matched 20000-step / 40k-sample C1 run.
+
+Code change: `f28dc73 fix(colocate): resolve two DFlash
+colocate-training deadlocks` (`dflash_trainer.py` + `colocate_loop.py`).
+Both fixes are no-ops outside colocate. Companion cleanup:
+`a2ed921` drops a duplicated `_COLOCATE_UNION_WORLD_PORT_OFFSET`
+constant in `trainer_actor.py` (cherry-pick artefact, no functional
+change).
+
+### Symptom
+
+DFlash 2+2 colocate first attempt (C1-v1, 2026-05-21): init completed
+on both sides (both `SglEngine` ranks + both DFlash `TrainerActor`
+ranks; DFlash draft 1.05 B trainable, `TargetLMHead`, FSDP2). Then the
+log froze immediately after
+`dflash_trainer.py:220 [Rank 0] TargetLMHead loaded`, GPU **0 %** on
+both, no `[colocate_loop] step=` line ever — a silent ~13-min deadlock,
+no traceback.
+
+### Hang #1 — bare collectives in `DFlashTrainer._init_target_lm_head`
+
+**Root cause found offline by `git`-reading the trainer.**
+`DFlashTrainer._init_target_lm_head` calls `dist.barrier()` and
+`dist.broadcast(param.data, src=0)` with **no `group=`**. In colocate
+mode the *default* process group is the **union NCCL world**
+(trainer ranks `[0,N)` + engine ranks `[N,2N)`). Only trainer ranks
+execute `_init_target_lm_head`; the engine ranks are inside sglang and
+never reach it → the barrier waits for all `2N` ranks, only `N`
+arrive → **deadlock**, exactly at the observed freeze point (the log
+line that printed is the `logger.info` immediately preceding
+`dist.barrier()`).
+
+This is **not** the transport. `Eagle3Trainer._init_target_lm_head`
+already carries the exact fix and even documents it: *"Without the
+explicit group they default to the union-world PG in colocate mode, and
+the engine never enters this code path, so the trainer hangs."* The
+DFlash trainer — comment-labelled "same as Eagle3Trainer" — never
+received it. CE1 (Eagle3) ran fine on the identical setup precisely
+because Eagle3 scopes these collectives to `get_gloo_group()` (the
+trainer-only group).
+
+**Five bare collectives** in `dflash_trainer.py` default to the union
+PG and hang in colocate:
+
+* `dist.barrier()` + `dist.broadcast()` in `_init_target_lm_head` (the
+  C1 hang).
+* 3 × `dist.all_reduce()` in the per-position metric reduction (would
+  hang at the first step that crosses the metric-reduction boundary).
+
+**Fix.** All five scoped to `get_gloo_group()` — already imported,
+already used correctly elsewhere in the same file (`init_model`).
+Mirrors `eagle3_trainer.py` exactly. **Safe for disagg**: there
+`get_gloo_group()` *is* the whole trainer PG, so the change is a no-op
+outside colocate — which is exactly why disagg D1 was unaffected.
+
+GPU-verified 2026-05-21 — the patched re-run (C1-v2) reached
+"TargetLMHead initialized and synced", the colocate data-fetcher init,
+and the `Colocate Training: 0/20000` bar, i.e. it cleared hang #1.
+Then immediately hit hang #2.
+
+### Hang #2 — CUDA-IPC handshake deadlock at step 0
+
+C1-v2 froze at step 0 — log stopped at `Colocate Training: 0/20000`,
+GPU **0 %** on both, no `[colocate_loop] step=`, no error.
+
+**Debug rounds.** Three instrumented re-runs were needed; the first
+two gave a *wrong* intermediate conclusion that the third overturned:
+
+* **C1-v3/v4** added `[HANG2]` phase markers to `colocate_loop.py` and
+  `[HANG2-DEBUG]` prints inside the connector/fetcher. The loop markers
+  showed it blocking at `ray.get(engine_refs)`; the transfer markers
+  appeared not to print, which was read as *"the hang is upstream of
+  the transfer, inside the engine `generate()`"* and *"transport ruled
+  out."* **That conclusion was wrong** — the markers simply weren't
+  captured before the freeze, and `ray.get(engine_refs)` blocks
+  whenever the engine's *send* (deep inside `generate()`) blocks.
+* **C1-v5** ran with `PYTHONFAULTHANDLER=1` and `kill -ABRT <pid>` on
+  the hung processes to dump every thread's Python stack. **No ptrace
+  needed** — `py-spy` was blocked by the container's missing
+  `CAP_SYS_PTRACE`, but `kill -ABRT` is allowed to the process owner.
+  This **pinned it exactly.**
+
+**Root cause — a 3-vs-2 tensor-count mismatch in the CUDA-IPC
+handshake.** The faulthandler dump put the engine at:
+
+```
+cuda_ipc.py:250  ipc_send  (blocked in dist.recv — waiting for an ack)
+  ← nccl_hidden_states_connector.py:242  NcclHiddenStatesConnector.send
+  ← colocate.patch  _send_hidden_states_to_nccl
+```
+
+and the `[HANG2-DEBUG]` payload prints showed the mismatch:
+
+| side | tensors declared / sent | count |
+|---|---|--:|
+| **engine** `connector.send` | `hidden_states (388,20480)`, `input_ids (388,)`, `last_hidden_states (388,4096)` | **3** |
+| **trainer** `recv_step` specs | `hidden_states (388,20480)`, `input_ids (388,)` | **2** |
+
+CUDA-IPC transfer is a **per-tensor handshake**: `ipc_send` ships one
+IPC handle per tensor (walking `sorted(keys)`) and **blocks on
+`dist.recv` for one ack per tensor**; the trainer's `recv_step` walks
+the same `sorted(keys)`, maps each handle, and sends one ack each. The
+engine sent 3 handles and waited for 3 acks; the trainer declared only
+2 specs, mapped 2, acked 2 → the engine's **3rd `dist.recv` blocked
+forever**.
+
+**Why the trainer declared only 2.** `colocate_loop._build_tensor_specs`
+gated `last_hidden_states` behind `store_last_hidden_states`, and
+DFlash's `sglang_qwen3_8b_dflash.yaml` sets `store_last_hidden_states:
+false` → the spec was omitted. **But the colocate engine always sends
+`last_hidden_states`**: `sgl_engine.py` sets
+`enable_return_hidden_states=True` *unconditionally*, so
+`logits_output.last_hidden_states` is always populated, and the sglang
+`colocate.patch`'s `_send_hidden_states_to_nccl` ships it whenever it
+is non-`None` — it does **not** consult `store_last_hidden_states`
+(that flag only gates the disagg Mooncake metadata path,
+`_get_tensor_shapes`).
+
+**Why CE1 (Eagle3) never hit it.** Eagle3's config has
+`store_last_hidden_states: true`, so its `_build_tensor_specs` already
+declared all 3 tensors → trainer and engine agreed. The bug is
+specific to draft configs with `store_last_hidden_states: false`
+(DFlash and any future draft of the same shape).
+
+**Fix.** `_build_tensor_specs` now **always declares
+`last_hidden_states`** — the `if store_last_hidden_states:` gate (and
+the now-unused parameter) were removed; the new docstring captures the
+contract inline. The trainer must declare every tensor the engine
+sends, or the IPC handshake deadlocks. Draft trainers that don't
+consume `last_hidden_states` (DFlash reads only `input_ids` +
+`hidden_states`) simply ignore the extra dict key — the cost is one
+unused `(seq_len, 4096)` bf16 buffer per step (~3 MB), negligible.
+
+### C1 — 20000-step DFlash 2+2 colocate run
+
+With both fixes in place the C1 production run (C1-v6) completed all
+20000 steps cleanly. 2×H100 80GB HBM3 SXM RunPod pod, same colocate
+setup as CE1 (`uv` launcher; `colocate_strategy=mps`,
+`transfer_mode=nccl`, `train_frac/infer_frac=0.45`, `accum=1`), base
+config `sglang_qwen3_8b_dflash.yaml`. Global batch = 2 (dp_size 2 ×
+micro 1 × accum 1).
+
+| Metric | C1 (DFlash 2+2 colocate) |
+|---|--:|
+| Steps / samples | 20000 / 40000 |
+| Training-loop wall | 5384 s (1 h 29 m 44 s), rc=0 |
+| Warm step time (step ≥ 1000) | **0.266 s** mean / 0.262 s median |
+| Warm throughput | **7.51 samples/s** (2 GPUs, global batch 2) |
+| Per-step compute (fwd+bwd) | ~180 ms (fwd ~75 ms + bwd ~108 ms) |
+| Per-step non-compute overhead | ~85 ms (engine-forward wait + IPC transfer + loop) |
+| Loss (window mean) | 6.19 (step 0–2k) → **3.81** (step 18–20k) |
+| Peak GPU alloc | ~30 GB / 80 GB |
+| GPU-h (loop wall, 2 GPUs) | **2.99 GPU-h** |
+
+Loss converged near-monotonically by 2k-step window: 6.19 → 5.07 →
+4.56 → 4.40 → 4.27 → 4.21 → 4.06 → 3.96 → 4.01 → 3.81. The first
+~1000 steps ran slow (~0.39 s/step, compile + KV-cache warmup) then
+locked to a flat ~0.262–0.270 s for the remaining 19000.
+
+**Disagg D1 vs colocate C1** (same-SGLang baseline:
+`dflash_eagle3_disagg_modal_rerun_on_main.md`, D1 re-run on
+`origin/main @ 068f253` with sglang `94f03a39` + `v0.5.10.post1`):
+
+| | Disagg D1 (rerun-on-main) | Colocate C1 | Ratio |
+|---|--:|--:|--:|
+| Physical GPUs | 4 (2 infer + 2 train) | **2** (MPS-shared) | ½ |
+| Step time / global batch | 800 ms / gb 8 | 266 ms / gb 2 | — |
+| Per-sample compute | ~97 ms | ~90 ms | ≈ |
+| Raw throughput (samples/s) | 10.00 | 7.51 | colocate **0.75×** |
+| GPU-h for 40k samples (warm rate) | 4.44 | **2.96** | colocate **1.50× less** |
+| GPU-h for 40k samples (actual wall) | 4.96 | 2.99 | colocate **1.66× less** |
+
+The GPU-h win decomposes exactly: `2.0` (half the GPU count) × `0.75`
+(colocate's lower raw throughput) = **1.50× less GPU-h**. Colocate
+trades ~25 % raw throughput — the cost of two roles MPS-sharing each
+GPU — for halving the GPU count.
+
+DFlash's win is smaller than Eagle3's (≈1.5× vs ≈2.1× GPU-h) because
+its heavier trainer leaves less GPU headroom for the colocated engine
+→ more MPS contention → a steeper (0.75× vs ~1.0×) raw-throughput
+penalty. Full disagg-vs-colocate analysis: `colocate_benchmark.md`.
+
+### Lessons captured
+
+1. **Trainer-only collectives must scope `group=` in colocate.**
+   Anything that bare-calls `dist.barrier` / `broadcast` / `all_reduce`
+   on the default PG hangs in colocate, since the engine never reaches
+   trainer-only paths. The five `dflash_trainer.py` sites are the same
+   shape as the round-7 `set_model_state_dict` / `dcp.save` /
+   `dcp.load` bugs (see `pr92_detail.md` "Key architectural
+   corrections"). **All future trainer code must scope collectives to
+   `get_gloo_group()` (or another trainer-only group), or it will
+   deadlock the first time it runs under colocate.** Worth turning into
+   a lint or runtime check (see "Follow-up" below).
+2. **The tensor spec is the engine's, not a config flag.** The
+   trainer-side `tensor_specs` is a *contract that must mirror what the
+   engine actually sends*, not what a training-side config says it
+   should want. `store_last_hidden_states` is a training-side
+   preference; the wire payload is decided by the engine + sglang
+   patch. Any future draft variant must derive its
+   `_build_tensor_specs` from the engine's real output set (or, better,
+   have the engine announce its key set on the metadata channel) —
+   never from a local flag. Inline docstring (`colocate_loop.py:71-95`)
+   captures this.
+3. **Diagnosing silent hangs without `py-spy` works.** RunPod's no-
+   `CAP_SYS_PTRACE` containers block `py-spy`, but
+   `PYTHONFAULTHANDLER=1` + `kill -ABRT <pid>` is allowed to the
+   process owner and dumps every Python thread's stack to stderr. This
+   is the standard recipe for the colocate hung-process case (round-9
+   used `dump_traceback_later` via `sitecustomize.py`; round-12 used
+   `SIGABRT`; either works).
+
+### Follow-up — make these hangs impossible
+
+Both round-12 deadlocks were *silent* — no traceback, no error, just
+0 % GPU on both ranks until somebody noticed. Two cheap guards would
+have caught each immediately:
+
+* **For hang #1**: a colocate-mode runtime check inside
+  `Trainer.__init__` that asserts the **default PG is the
+  trainer-only group**, not the union world. Any bare collective then
+  fails fast with a clear assertion instead of hanging. Alternative:
+  a lint that flags `dist.*(group=None)` in trainer files. Better
+  fix: install the trainer-only group as the default PG for the
+  trainer process's lifetime in colocate mode, mirroring
+  `_default_pg_override` (which is currently scoped only to
+  `set_model_state_dict`).
+* **For hang #2**: a step-0 watchdog in `colocate_loop.py` that times
+  out the first `ray.get(engine_refs)` (e.g. 60 s) and dumps both
+  sides' tensor specs on mismatch. Even simpler: have the engine
+  announce its tensor set on the metadata channel (round-12 the
+  trainer derives the spec from local config; the engine could send
+  the actual key set + shapes, and the trainer would build buffers
+  from that).
+
+Both are tracked in `handoff_followups.md` as item #6 ("Colocate
+fail-fast for spec/PG mismatches"). Not blocking the open PR.
+
+### Spend
+
+C1 across all v1–v6 pods: ~$27 (~$16 across 5 debug pods + ~$11 for
+the v6 production pod, ~100 min on 2×H100). All pods were torn down.
+
+### Outcome
+
+DFlash colocate is GPU-validated end-to-end at production scale
+(20000 steps, 40k samples, `rc=0`, loss 6.19 → 3.81). Combined with
+CE1 (Eagle3) from round 11, both draft model families now have a
+clean colocate result against same-SGLang disagg baselines —
+**Eagle3 ≈2.1× less GPU-h, DFlash ≈1.5× less GPU-h** — driven by
+reclaiming the idle disagg inference GPUs. Open items unchanged from
+round 11: 2-node multi-host (#1), 8-GPU TP (#2),  out-of-scope
+`pp_size>1` (#3) — plus the round-12 follow-ups: CE2/C2 benchmark
+cells (#4) and the optional fail-fast guards above.

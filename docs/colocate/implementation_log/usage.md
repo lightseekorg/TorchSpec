@@ -22,8 +22,10 @@
 > flagged inline.
 >
 > Background reading:
-> - [`knowledge.md`](knowledge.md) — what MPS / NCCL / fractional Ray
->   bundles actually do here.
+> - [`knowledge/knowledge.zh-en.md`](knowledge/knowledge.zh-en.md) —
+>   bilingual conceptual background: what MPS / NCCL / fractional Ray
+>   bundles / the union world actually do here, plus the two colocate
+>   contracts (default PG and wire-payload).
 > - [`implementation.md`](implementation.md) — the phased build plan.
 > - [`implementation_log.md`](implementation_log.md) — what is actually
 >   wired up so far + Modal verification status.

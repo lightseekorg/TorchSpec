@@ -23,10 +23,11 @@ Every phase is gated behind `colocate_strategy=mps` + `transfer_mode=nccl` so th
 - [x] Phase 2 — union NCCL world bootstrap
 - [x] Phase 3 — P2P data plane (smoke test)
 - [x] Phase 4 — sglang hidden-state hook
-- [x] Phase 5 — controller / sync training loop
+- [x] Phase 5 — controller / sync training loop — **DFlash-config tensor-spec contract amended round 12 (`last_hidden_states` always declared)**
 - [x] Phase 6 — memory caps & stability — **`test_phase6_peak_alloc_flatness` PASSED (200 steps; 1000-step `--stability` GREEN, round 11)**
 - [x] Phase 7 — numeric parity & convergence — **`test_phase7_convergence_loss_decreases` PASSED (50 steps), `test_phase7_grad_parity_smoke` PASSED, `test_convergence_disagg_overlap` GREEN (1000 steps vs Mooncake, round 11)**
 - [x] Phase 8 — docs & example config
+- [x] **Production-scale GPU validation** — Eagle3 (CE1, round 11) **and** DFlash (C1, round 12) each ran 20000 steps / 40k samples clean on 2×H100, rc=0; same-SGLang disagg baseline rerun on `main` shows **≈2.1× less GPU-h for Eagle3, ≈1.5× for DFlash**
 
 ## Test results — full suite GREEN on 4×H100
 
@@ -258,11 +259,59 @@ investigated for further headroom — full write-up in
   `bench_transport.py`. `ipc-pipe` (persistent send-buffer pool +
   one-step ack pipelining) cuts the engine `send()` stall **3.9×** on
   the realistic Eagle3 payload, A/B-measured under MPS. It is
-  **low-priority and not wired into `cuda_ipc.py`** — the transport is
-  only ~1 % of a colocate step, so it is not a step-time bottleneck.
+  **low-priority** — the transport is only ~1 % of a colocate step, so
+  it is not a step-time bottleneck.
+- **`ipc-pool` alone is NOT worth shipping.** The A/B (see
+  `transport_optimization.md` Part 4 finding 3 + Part 5) showed
+  `ipc-pool` standalone is **break-even** at most payloads and a **net
+  regression at 256 MB** (engine `send()` 1.71 → 2.68 ms — copying a
+  256 MB tensor into the pool costs more than the handle-open it
+  avoids). The pool's value is **solely as the enabler** for
+  `ipc-pipe`'s double-buffered ack deferral; the
+  `TORCHSPEC_COLOCATE_IPC_PIPELINE` flag deliberately enables pool +
+  pipe together, never the pool by itself.
 - **3000-step 4-GPU stability soak** — `colocate_qwen0p6b_2eng_tp2_tiny`
   (2 engines × tp2, 4×H100 MPS-shared), CUDA IPC default: 3000/3000
   steps, no hang, step time and `peak_alloc` flat throughout.
+
+## Production-scale colocate runs (rounds 11 + 12)
+
+Until round 11 the colocate path had been GPU-validated only against
+the `--full` CI matrix (Qwen3-0.6B tiny + a 4-engine Qwen3-8B
+one-step) and a 3000-step Qwen0.6B soak. **Production-scale (20000-step
+/ 40k-sample) Qwen3-8B colocate runs were unproven** until the two
+benchmark cells below — one per draft model family — completed
+end-to-end. Both were matched against the **same-SGLang disagg rerun
+on `origin/main @ 068f253`** (see
+`docs/colocate/modal_benchmark/dflash_eagle3_disagg_modal_rerun_on_main.md`),
+which retires the cross-branch confound earlier versions of the
+benchmark carried.
+
+| Cell | Steps | Samples | Throughput | GPU-h | Disagg baseline | Win |
+|---|--:|--:|--:|--:|--:|---|
+| **CE1** — Eagle3 2+2 colocate (round 11, 2026-05-21) | 20000 | 40000 | ~13.25 samples/s | **1.68** / 40k (2 GPU) | E1-rerun = 12.72 samples/s, **3.49** / 40k (4 GPU) | **~2.1× less GPU-h** |
+| **C1** — DFlash 2+2 colocate (round 12, 2026-05-22) | 20000 | 40000 | 7.51 samples/s | **2.96** / 40k (2 GPU) | D1-rerun = 10.00 samples/s, **4.44** / 40k (4 GPU) | **~1.5× less GPU-h** |
+| CE2 — Eagle3 4+4 colocate | — | — | — | — | — | pending |
+| C2 — DFlash 4+4 colocate | — | — | — | — | — | pending |
+
+Both wins decompose cleanly as `2.0 ×` (half the GPU count via MPS
+sharing) `× r` (colocate's raw-throughput ratio): Eagle3 r ≈ 1.0
+(colocate ≈ even with disagg), DFlash r ≈ 0.75 (heavier trainer →
+more MPS contention → ~25 % raw-throughput hit). **The architectural
+saving is reclaiming the idle disagg inference GPUs**; both trainers
+do the same draft-model math regardless of where inference runs. Full
+analysis: `docs/colocate/modal_benchmark/colocate_benchmark.md`.
+
+**Convergence holds for both cells.** CE1's final rolling loss
+(~2.09 at 40k samples) matches disagg E1's (2.24 / 1.98) — equal data,
+equal LR phase, equal convergence. C1's final rolling loss (~3.81 at
+40k samples) sits inside the disagg D1 noise band (D1 orig 3.67,
+D1-rerun-on-`main` 4.89). Notably, the disagg D1 rerun on `main`
+flagged a **DFlash loss regression** (3.67 → 4.89, attributed by the
+rerun doc to FA4 #96 / post-norm #97 changes on the trainer side);
+**C1 colocate does not show that regression** — its loss lands
+between the two disagg points, so the colocate path is producing
+genuine, on-trend DFlash training, not a degraded variant.
 
 ## One-pod batch validation (round 11)
 
@@ -289,6 +338,55 @@ secure-cloud pod session (~1.6 h, ~$21). Full results in
   **mean 0.006 % / max 0.219 %** deviation — the colocate transport
   converges identically to the disaggregated baseline.
 
+## DFlash colocate two deadlocks (round 12, 2026-05-22)
+
+Round 11 GPU-validated Eagle3 at production scale; **the DFlash
+colocate path had not been exercised at production scale until round
+12**. Bringing DFlash up surfaced two distinct, sequential
+DFlash-only deadlocks. Both are now fixed (`f28dc73`) and the C1
+20000-step run completed cleanly (above).
+
+| # | Hang | Root cause | Fix |
+|---|------|-----------|-----|
+| 1 | `DFlashTrainer._init_target_lm_head` froze right after `[Rank 0] TargetLMHead loaded` | `dist.barrier()` / `dist.broadcast()` + 3 `dist.all_reduce()` ran with no `group=` → in colocate the default PG is the **union world** (trainer `[0,N)` + engine `[N,2N)`); only trainer ranks execute the method, the engine ranks never arrive → deadlock. **Same shape as the round-7 `set_model_state_dict` / `dcp.save` / `dcp.load` bugs.** `Eagle3Trainer` already carried the fix; `DFlashTrainer` (comment-labelled "same as Eagle3Trainer") had never received it. | All 5 collectives scoped to `get_gloo_group()`. No-op for disagg. |
+| 2 | `colocate_loop` froze at step 0; faulthandler dump put the engine in `cuda_ipc.py:250 ipc_send` `dist.recv` waiting for an ack | CUDA-IPC handshake is **per-tensor**: engine ships one IPC handle per tensor and blocks for one ack each. Colocate engine *always* sends `last_hidden_states` (`enable_return_hidden_states=True` is unconditional); trainer's `_build_tensor_specs` gated it on `store_last_hidden_states` (= `false` in DFlash's config) → **3 sent, 2 declared → 3rd `dist.recv` blocked forever**. CE1 (Eagle3, `store_last_hidden_states: true`) declared all 3, so it never hit the bug. | `_build_tensor_specs` now **always** declares `last_hidden_states`. Trainers that don't consume it (DFlash) ignore the extra ~3 MB / step bf16 buffer. The `store_last_hidden_states` parameter was removed. |
+
+**How hang #2 was pinned.** Three debug rounds were needed; the first
+two used `[HANG2]` phase markers + `[HANG2-DEBUG]` payload prints and
+gave a *wrong* intermediate conclusion that the hang was upstream of
+the transfer (the markers simply weren't captured before the freeze).
+The third ran with `PYTHONFAULTHANDLER=1` and `kill -ABRT <pid>` on the
+hung processes — **no ptrace needed** (`py-spy` is blocked by the
+container's missing `CAP_SYS_PTRACE`, but `SIGABRT` is allowed to the
+process owner), and dumped every Python thread's stack to stderr.
+That pinned it exactly.
+
+### Lessons captured
+
+1. **Trainer-only collectives must scope `group=` in colocate.** Any
+   bare `dist.barrier` / `broadcast` / `all_reduce` on a trainer path
+   will hang the union default PG. The five `dflash_trainer.py` sites
+   are the same shape as the round-7 fixes. Worth converting into a
+   runtime check inside `Trainer.__init__` (assert the default PG is
+   the trainer-only group, not the union world) or a colocate-mode
+   lint that flags `dist.*(group=None)` in trainer files.
+2. **The tensor spec is the engine's, not a config flag.** The
+   trainer-side `tensor_specs` is a contract that must mirror what the
+   engine actually sends, not what a training-side config says it
+   should want. `store_last_hidden_states` is a training-side
+   preference; the wire payload is decided by the engine + sglang
+   patch. Any future draft variant must derive its
+   `_build_tensor_specs` from the engine's real output set (or, better,
+   have the engine announce its key set on the metadata channel) —
+   never from a local flag. Captured in the new `_build_tensor_specs`
+   docstring (`colocate_loop.py:71-95`).
+
+### Companion cleanup
+
+`a2ed921` drops a duplicated `_COLOCATE_UNION_WORLD_PORT_OFFSET`
+constant in `trainer_actor.py` (cherry-pick artefact, no functional
+change).
+
 ## Open follow-ups (tracked, not blocking this PR)
 
 | Follow-up | Why it's open |
@@ -296,10 +394,15 @@ secure-cloud pod session (~1.6 h, ~$21). Full results in
 | Multi-node 2-node colocate run | code-complete (`ensure_mps_on_all_nodes`, 2-node config) but untested at scale — needs a 2-node rented cluster with cross-node networking |
 | Large `engine_tp_size` (8-GPU TP per engine) | rank math + data plane handle any TP size but are only GPU-tested at `engine_tp_size=2`; issue-#81 scale-out wants 1 engine × 8-GPU TP — needs an 8-GPU config + run |
 | v0.5.10 `pp_size>1` | `v0.5.10.post1/colocate.patch` passed the full 4×H100 `--full` matrix and is now the default; only `pp_size>1` (pipeline parallelism) is unexercised — blocked by an explicit guard, out of scope for the current colocate plan |
+| CE2 / C2 benchmark cells (4+4 colocate) | the disagg-vs-colocate study (`colocate_benchmark.md`) has CE1 + C1 done at 2+2; CE2 (Eagle3 4+4) and C2 (DFlash 4+4) are the outstanding cells, matched against the existing disagg E2 / D2 rerun-on-`main` baselines. Code-ready, unrun — needs one 4×H100 pod and a matched 40k-sample run per cell. **Next productive item that does not need new hardware beyond a 4-GPU pod.** |
+| `draft_accumulation_steps > 1` in `colocate_loop.py` | guarded with `NotImplementedError("Multi-step accumulation is parked")`; CE1/C1 ran at `accum=1` / global-batch 2 so they cannot match the disagg §8 contract (`accum=4` / global-batch 8). Out of scope unless the benchmark needs the §8 cell-for-cell parity. |
+| Colocate fail-fast for spec / default-PG mismatches | round 12 found two distinct silent-deadlock failure modes (bare collective → union default PG; tensor-spec count mismatch). Both could be turned into immediate, legible errors with: (a) a runtime check in `Trainer.__init__` that asserts the default PG is **not** the union world, and/or a colocate-mode lint that flags `dist.*(group=None)` in trainer files; (b) a step-0 watchdog in `colocate_loop.py` that times out the first `engine_refs` `ray.get` and dumps both sides' tensor specs on mismatch. Small code change, high value — converts the next deadlock of either shape into an immediate error instead of a multi-pod debug round. |
 | ~~Literal Mooncake-disagg parity~~ | ✅ **Done.** Per-parameter gradient parity vs the disagg baseline is covered by `test_phase7_grad_parity_vs_disagg` (1-step), and the 1k-step convergence-curve comparison by `test_convergence_disagg_overlap` — GPU-validated round 11 (loss curves overlap mean 0.006 % over 1000 steps). The Mooncake crash that blocked this was fixed in round 6 (`mooncake-transfer-engine==0.3.10.post1`). |
 | ~~`--full` re-run with CUDA IPC as default~~ | ✅ **Done (round 9).** 4×H100 `run_smoke_host.sh --full` under CUDA IPC default — 13 colocate tests pass after the `e166c21` probe fix + `e62c941` expandable-segments fix. |
 | ~~Productionize `ipc-pipe` (ack pipelining)~~ | ✅ **Done (round 11).** Folded into `cuda_ipc.py` as `IpcPipelineTransport` behind the opt-in `TORCHSPEC_COLOCATE_IPC_PIPELINE` flag; GPU-validated on 4×H100 (one OOM bug on the 8B config found + fixed). Opt-in and low-priority — the transport is ~1 % of a colocate step. |
+| ~~Eagle3 production-scale colocate run~~ | ✅ **Done (round 11, CE1).** Qwen3-8B Eagle3 2+2 colocate, 20000 steps / 40k samples, `rc=0`. ~13.25 samples/s, **~1.68 GPU-h** for 40k samples on 2 GPU vs **3.49 GPU-h** on 4 GPU for same-SGLang disagg E1-rerun → **~2.1× less GPU-h**. |
+| ~~DFlash production-scale colocate run~~ | ✅ **Done (round 12, C1).** Qwen3-8B DFlash 2+2 colocate, 20000 steps / 40k samples, `rc=0`. Two latent DFlash-only deadlocks fixed in `f28dc73` (see "DFlash colocate two deadlocks (round 12)" above). 7.51 samples/s, **~2.96 GPU-h** for 40k samples on 2 GPU vs **4.44 GPU-h** on 4 GPU for same-SGLang disagg D1-rerun → **~1.5× less GPU-h**. |
 
 ## Full debug log
 
-[`docs/colocate/implementation_log.md`](https://github.com/lightseekorg/TorchSpec/blob/feature/colocate-training-inference/docs/colocate/implementation_log.md) — RunPod sessions #1-#3 (1×H100 / tiny green) + Vast sessions #4-#5 (4×H100 / full green) + follow-up rounds 1-10 (grad parity, CUDA IPC, multi-engine TP + fan-out, v0.5.10 port + multi-TP validation, RoPE fix, Mooncake crash diagnosis + fix, CUDA-IPC-default switch + transport benchmark, v0.5.10 full-matrix cutover, CUDA-IPC-default hang diagnosis + probe fix, transport optimization investigation + MPS re-benchmark, ipc-pipe productionization + one-pod GPU validation of issue-#81 follow-ups). Transport benchmark detail: [`docs/colocate/transport_benchmark.md`](https://github.com/lightseekorg/TorchSpec/blob/feature/colocate-training-inference/docs/colocate/transport_benchmark.md).
+[`docs/colocate/implementation_log.md`](https://github.com/lightseekorg/TorchSpec/blob/feature/colocate-training-inference/docs/colocate/implementation_log.md) — RunPod sessions #1-#3 (1×H100 / tiny green) + Vast sessions #4-#5 (4×H100 / full green) + follow-up rounds 1-12 (grad parity, CUDA IPC, multi-engine TP + fan-out, v0.5.10 port + multi-TP validation, RoPE fix, Mooncake crash diagnosis + fix, CUDA-IPC-default switch + transport benchmark, v0.5.10 full-matrix cutover, CUDA-IPC-default hang diagnosis + probe fix, transport optimization investigation + MPS re-benchmark, ipc-pipe productionization + one-pod GPU validation of issue-#81 follow-ups, CE1 production-scale Eagle3 20000-step run, round 12 DFlash two deadlocks + C1 production-scale DFlash 20000-step run). Transport benchmark detail: [`docs/colocate/transport_benchmark.md`](https://github.com/lightseekorg/TorchSpec/blob/feature/colocate-training-inference/docs/colocate/transport_benchmark.md). Disagg-vs-colocate study: [`docs/colocate/modal_benchmark/colocate_benchmark.md`](https://github.com/lightseekorg/TorchSpec/blob/feature/colocate-training-inference/docs/colocate/modal_benchmark/colocate_benchmark.md).
