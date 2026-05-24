@@ -485,11 +485,12 @@ class AsyncTrainingController:
         longest-first greedy bin-packing with a per-rank capacity cap so
         that ranks see similar total sequence load. Falls back to
         round-robin when there is at most one sample per rank (e.g. eval
-        dispatch, or training with per_dp_rank_batch_size=1) because no
-        balancing is possible in that case.
+        dispatch, or training with per_dp_rank_batch_size=1) or when
+        len(results) is not divisible by dp_size — preserving the old
+        round-robin behavior for irregular batch sizes.
         """
         partitions: list[list[InferenceOutput]] = [[] for _ in range(self.dp_size)]
-        if self.dp_size <= 1 or len(results) <= self.dp_size:
+        if self.dp_size <= 1 or len(results) <= self.dp_size or len(results) % self.dp_size != 0:
             for i, result in enumerate(results):
                 partitions[i % self.dp_size].append(result)
             return partitions

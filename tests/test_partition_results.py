@@ -65,6 +65,18 @@ class TestPartitionFallback:
 
         assert partitions == [[], [], [], []]
 
+    def test_non_divisible_batch_falls_back_to_round_robin(self):
+        # 5 results over 2 ranks: capacity would floor to 2 and the
+        # greedy generator would empty out on the 5th item. Fall back
+        # to round-robin instead of crashing.
+        controller = _make_controller(dp_size=2, per_dp_rank_batch_size=2)
+        results = [_make_output(f"s{i}", seq_len=100 + i) for i in range(5)]
+
+        partitions = controller._partition_results(results)
+
+        assert [r.data_id for r in partitions[0]] == ["s0", "s2", "s4"]
+        assert [r.data_id for r in partitions[1]] == ["s1", "s3"]
+
 
 class TestPartitionBinPacking:
     """When per-rank capacity > 1, partition balances total sequence load."""
