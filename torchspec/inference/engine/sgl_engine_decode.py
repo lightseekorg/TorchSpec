@@ -90,6 +90,43 @@ class SglDecodeEngineMixin:
 
     # -- Generation -----------------------------------------------------------
 
+    def _decode_prompt_token_lengths(
+        self,
+        *,
+        use_prompts: bool,
+        formatted_prompts: list[str] | None,
+        input_ids_list: list[torch.Tensor] | None,
+    ) -> list[int | None]:
+        if not use_prompts:
+            lengths: list[int | None] = []
+            assert input_ids_list is not None
+            for ids in input_ids_list:
+                if ids.dim() == 2 and ids.shape[0] == 1:
+                    ids = ids.squeeze(0)
+                lengths.append(int(ids.numel()))
+            return lengths
+
+        tokenizer_manager = getattr(self._engine, "tokenizer_manager", None)
+        tokenizer = getattr(tokenizer_manager, "tokenizer", None)
+        if tokenizer is None or not hasattr(tokenizer, "encode"):
+            return [None for _ in formatted_prompts or []]
+
+        lengths = []
+        for prompt in formatted_prompts or []:
+            try:
+                try:
+                    token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                except TypeError:
+                    token_ids = tokenizer.encode(prompt)
+                lengths.append(len(token_ids))
+            except Exception as exc:
+                logger.warning(
+                    f"SglEngine rank {self.rank}: failed to estimate prompt token "
+                    f"length before decode ({exc!r}); letting SGLang tokenize it."
+                )
+                lengths.append(None)
+        return lengths
+
     def generate_with_decode(
         self,
         data_id: str | list[str],
@@ -99,7 +136,7 @@ class SglDecodeEngineMixin:
         return_last_hidden_states: bool = False,
         return_logits: bool = True,
         multimodal_inputs: list[dict] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any] | None]:
         """Generate training data with decoding (spec training with actual token generation).
 
         Unlike generate() which does prefill-only, this method generates new tokens
@@ -149,7 +186,22 @@ class SglDecodeEngineMixin:
 
         # Build sampling params for decode mode
         max_new_tokens = getattr(self.args, "decode_max_new_tokens", 512)
-        sampling_params = {"max_new_tokens": max_new_tokens}
+        min_new_tokens = getattr(self.args, "decode_min_new_tokens", 2)
+        if min_new_tokens < 0:
+            raise ValueError(f"decode.min_new_tokens must be >= 0, got {min_new_tokens}")
+        if min_new_tokens > max_new_tokens:
+            raise ValueError(
+                f"decode.min_new_tokens ({min_new_tokens}) cannot exceed "
+                f"decode.max_new_tokens ({max_new_tokens})"
+            )
+        sampling_params = {
+            "max_new_tokens": max_new_tokens,
+            "min_new_tokens": min_new_tokens,
+        }
+        stop_token_ids = getattr(self.args, "decode_stop_token_ids", None)
+        if stop_token_ids:
+            sampling_params["stop_token_ids"] = list(stop_token_ids)
+        stop_token_id_set = set(stop_token_ids or [])
         temperature = getattr(self.args, "decode_temperature", 1.0)
         if temperature != 1.0:
             sampling_params["temperature"] = temperature
@@ -159,56 +211,100 @@ class SglDecodeEngineMixin:
         top_k = getattr(self.args, "decode_top_k", -1)
         if top_k > 0:
             sampling_params["top_k"] = top_k
+        logger.debug(
+            f"SglEngine rank {self.rank}: decode sampling_params={sampling_params}"
+        )
+
+        outputs: list[dict[str, Any] | None] = [None for _ in range(batch_size)]
+        active_indices = list(range(batch_size))
+        max_seq_length = getattr(self.args, "max_seq_length", None)
+        if max_seq_length:
+            prompt_lengths = self._decode_prompt_token_lengths(
+                use_prompts=use_prompts,
+                formatted_prompts=formatted_prompts,
+                input_ids_list=None if use_prompts else input_ids_list,
+            )
+            active_indices = []
+            for i, prompt_len in enumerate(prompt_lengths):
+                if prompt_len is not None and prompt_len + min_new_tokens > max_seq_length:
+                    logger.warning(
+                        f"SglEngine rank {self.rank}: skipping data_id={data_ids[i]} "
+                        f"because prompt_tokens={prompt_len} leaves less than "
+                        f"min_new_tokens={min_new_tokens} within max_seq_length={max_seq_length}"
+                    )
+                    continue
+                active_indices.append(i)
+
+        if not active_indices:
+            return outputs
+
+        active_data_ids = [data_ids[i] for i in active_indices]
+        active_multimodal_inputs = (
+            [multimodal_inputs[i] for i in active_indices]
+            if multimodal_inputs is not None
+            else None
+        )
 
         if use_prompts:
+            active_formatted_prompts = [formatted_prompts[i] for i in active_indices]
             logger.debug(
-                f"SglEngine rank {self.rank}: decode prompt mode processing data_ids={data_ids}, "
-                f"num_prompts={len(formatted_prompts)}"
+                f"SglEngine rank {self.rank}: decode prompt mode processing data_ids={active_data_ids}, "
+                f"num_prompts={len(active_formatted_prompts)}"
             )
             engine_kwargs = {
-                "prompt": formatted_prompts,
-                "spec_training_data_id": data_ids,
+                "prompt": active_formatted_prompts,
+                "spec_training_data_id": active_data_ids,
                 "sampling_params": sampling_params,
                 "return_hidden_states": True,
             }
         else:
             input_ids_list_of_lists = []
-            for ids in input_ids_list:
+            for i in active_indices:
+                ids = input_ids_list[i]
                 if ids.dim() == 2 and ids.shape[0] == 1:
                     ids = ids.squeeze(0)
                 elif ids.dim() > 2:
                     raise ValueError(f"Unexpected input_ids shape: {ids.shape}")
                 input_ids_list_of_lists.append(ids.tolist())
 
+            active_packed_loss_mask_list = (
+                [packed_loss_mask_list[i] for i in active_indices]
+                if packed_loss_mask_list is not None
+                else None
+            )
             logger.debug(
-                f"SglEngine rank {self.rank}: decode mode processing data_ids={data_ids}, "
+                f"SglEngine rank {self.rank}: decode mode processing data_ids={active_data_ids}, "
                 f"shapes: {[len(ids) for ids in input_ids_list_of_lists]}"
             )
             engine_kwargs = {
                 "input_ids": input_ids_list_of_lists,
-                "spec_training_data_id": data_ids,
-                "packed_loss_mask": packed_loss_mask_list,
+                "spec_training_data_id": active_data_ids,
+                "packed_loss_mask": active_packed_loss_mask_list,
                 "sampling_params": sampling_params,
                 "return_hidden_states": True,
             }
 
-        image_data = self._extract_image_data(multimodal_inputs)
+        image_data = self._extract_image_data(active_multimodal_inputs)
         if image_data is not None:
             engine_kwargs["image_data"] = image_data
 
         results = self._engine.generate(**engine_kwargs)
+        if len(results) != len(active_indices):
+            raise RuntimeError(
+                f"SglEngine rank {self.rank}: decode expected {len(active_indices)} "
+                f"results from SGLang, got {len(results)}"
+            )
 
         # IMPORTANT: Must produce exactly one output per input result to match
         # the zip(entries, outputs, strict=True) in the inference manager.
-        outputs = []
-        for i, result in enumerate(results):
+        for result_index, result in enumerate(results):
+            i = active_indices[result_index]
             store_keys = result["meta_info"].get("spec_training_mooncake_store_keys", [])
             if not store_keys:
                 logger.warning(
                     f"SglEngine rank {self.rank}: No mooncake keys returned for "
-                    f"data_id={data_ids[i]}, skipping this sample."
+                    f"data_id={active_data_ids[result_index]}, skipping this sample."
                 )
-                outputs.append(None)
                 continue
 
             meta_info = result["meta_info"]
@@ -226,14 +322,25 @@ class SglDecodeEngineMixin:
             key = store_keys[0]
             prompt_tokens = meta_info.get("prompt_tokens", 0)
             completion_tokens = meta_info.get("completion_tokens", 0)
-            if completion_tokens > 0:
-                seq_len = prompt_tokens + completion_tokens - 1
-            else:
+            output_ids = result.get("output_ids", [])
+            if completion_tokens <= 1:
+                text = result.get("text", "")
                 logger.warning(
-                    f"SglEngine rank {self.rank}: completion_tokens=0 for "
-                    f"data_id={data_ids[i]}, sample will produce zero loss"
+                    f"SglEngine rank {self.rank}: completion_tokens={completion_tokens} for "
+                    f"data_id={active_data_ids[result_index]}, finish_reason={meta_info.get('finish_reason')}, "
+                    f"output_ids={output_ids}, text={text!r}, dropping sample to avoid "
+                    f"a zero-loss mask"
                 )
-                seq_len = prompt_tokens
+                continue
+            if output_ids and output_ids[0] in stop_token_id_set:
+                logger.warning(
+                    f"SglEngine rank {self.rank}: completion starts with stop token "
+                    f"{output_ids[0]} for data_id={active_data_ids[result_index]}, "
+                    f"finish_reason={meta_info.get('finish_reason')}, dropping sample."
+                )
+                continue
+
+            seq_len = prompt_tokens + completion_tokens - 1
             logger.debug(
                 f"SglEngine rank {self.rank}: decode mode - "
                 f"prompt={prompt_tokens}, completion={completion_tokens}, "
@@ -272,11 +379,12 @@ class SglDecodeEngineMixin:
             )
             output_dict.update({k: meta_info[k] for k in _METRIC_KEYS if k in meta_info})
 
-            outputs.append(output_dict)
+            outputs[i] = output_dict
 
+        accepted_count = sum(output is not None for output in outputs)
         logger.debug(
-            f"SglEngine rank {self.rank}: decode generated {len(outputs)} mooncake keys "
-            f"for data_ids={data_ids}"
+            f"SglEngine rank {self.rank}: decode generated {accepted_count} mooncake keys "
+            f"for {len(data_ids)} data_ids={data_ids}"
         )
         return outputs
 

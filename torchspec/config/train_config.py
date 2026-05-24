@@ -159,6 +159,8 @@ class DecodeConfig:
 
     cuda_graph_max_bs: Optional[int] = None
     max_new_tokens: int = 512
+    min_new_tokens: int = 2
+    stop_token_ids: Optional[list[int]] = None
     max_running_requests: Optional[int] = None
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None

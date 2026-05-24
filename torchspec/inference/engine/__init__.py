@@ -21,13 +21,20 @@
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.inference.engine.hf_engine import HFEngine
-from torchspec.inference.engine.hf_runner import HFRunner
 
 __all__ = [
     "InferenceEngine",
     "HFEngine",
-    "HFRunner",
 ]
+
+try:
+    from torchspec.inference.engine.hf_runner import HFRunner
+
+    __all__.append("HFRunner")
+except ImportError as _e:
+    from torchspec.utils.logging import logger as _logger
+
+    _logger.debug("HFRunner not available: %s", _e)
 
 # Lazy imports: SGLang/vLLM are optional — HF-only training (e.g. single-GPU
 # DFlash) should not require these heavy dependencies to be installed.
