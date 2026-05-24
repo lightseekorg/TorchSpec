@@ -472,11 +472,37 @@ class AsyncTrainingController:
         self.batch_id += 1
         return True
 
+    @staticmethod
+    def _seq_len(result: InferenceOutput) -> int:
+        shapes = result.tensor_shapes or {}
+        ids_shape = shapes.get("input_ids")
+        return ids_shape[-1] if ids_shape else 0
+
     def _partition_results(self, results: list[InferenceOutput]) -> list[list[InferenceOutput]]:
-        """Partition InferenceOutputs across DP ranks."""
+        """Partition InferenceOutputs across DP ranks.
+
+        When each rank receives more than one sample per dispatch, uses
+        longest-first greedy bin-packing with a per-rank capacity cap so
+        that ranks see similar total sequence load. Falls back to
+        round-robin when there is at most one sample per rank (e.g. eval
+        dispatch, or training with per_dp_rank_batch_size=1) because no
+        balancing is possible in that case.
+        """
         partitions: list[list[InferenceOutput]] = [[] for _ in range(self.dp_size)]
-        for i, result in enumerate(results):
-            partitions[i % self.dp_size].append(result)
+        if self.dp_size <= 1 or len(results) <= self.dp_size:
+            for i, result in enumerate(results):
+                partitions[i % self.dp_size].append(result)
+            return partitions
+
+        capacity = len(results) // self.dp_size
+        loads = [0] * self.dp_size
+        for result in sorted(results, key=self._seq_len, reverse=True):
+            min_rank = min(
+                (r for r in range(self.dp_size) if len(partitions[r]) < capacity),
+                key=lambda r: loads[r],
+            )
+            partitions[min_rank].append(result)
+            loads[min_rank] += self._seq_len(result)
         return partitions
 
     def _dispatch_to_queues(
