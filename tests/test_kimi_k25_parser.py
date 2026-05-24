@@ -138,6 +138,14 @@ class TestKimiK25ParserBasic:
         assert len(input_ids) == len(loss_mask)
         assert loss_mask.sum() > 0
 
+    def test_generation_prompt_enters_thinking_block(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [{"role": "user", "content": "Hello!"}]
+
+        formatted = parser.format(conversation, add_generation_prompt=True)
+
+        assert formatted.endswith("<|im_assistant|>assistant<|im_middle|><think>")
+
     def test_multi_turn_conversation(self, mock_tokenizer, kimi_template):
         parser = KimiK25Parser(mock_tokenizer, kimi_template)
         conversation = [

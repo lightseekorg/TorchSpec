@@ -478,7 +478,7 @@ class KimiK25Parser(Parser):
                 parts.append(f"{self.TOOL_HEADER}{content}{self.END_TOKEN}")
 
         if add_generation_prompt:
-            parts.append(self.ASSISTANT_HEADER)
+            parts.append(f"{self.ASSISTANT_HEADER}<think>")
 
         return "".join(parts)
 
