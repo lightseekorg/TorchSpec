@@ -28,7 +28,7 @@ __all__ = [
 ]
 
 try:
-    from torchspec.inference.engine.hf_runner import HFRunner
+    from torchspec.inference.engine.hf_runner import HFRunner  # noqa: F401
 
     __all__.append("HFRunner")
 except ImportError as _e:

@@ -211,9 +211,7 @@ class SglDecodeEngineMixin:
         top_k = getattr(self.args, "decode_top_k", -1)
         if top_k > 0:
             sampling_params["top_k"] = top_k
-        logger.debug(
-            f"SglEngine rank {self.rank}: decode sampling_params={sampling_params}"
-        )
+        logger.debug(f"SglEngine rank {self.rank}: decode sampling_params={sampling_params}")
 
         outputs: list[dict[str, Any] | None] = [None for _ in range(batch_size)]
         active_indices = list(range(batch_size))
