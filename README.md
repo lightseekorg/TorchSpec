@@ -16,6 +16,7 @@ Draft models trained with TorchSpec, available on the [LightSeek Foundation](htt
 - [lightseekorg/kimi-k2.5-eagle3-mla](https://huggingface.co/lightseekorg/kimi-k2.5-eagle3-mla)
 - [lightseekorg/kimi-k2.6-eagle3](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3)
 - [lightseekorg/kimi-k2.6-eagle3-mla](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3-mla)
+- [lightseekorg/kimi-k2.6-eagle3.1-mla](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3.1-mla)
 
 ## 🚀 Blogs
 
