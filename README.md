@@ -19,8 +19,11 @@ Draft models trained with TorchSpec, available on the [LightSeek Foundation](htt
 
 ## 🚀 Blogs
 
-- PyTorch blog: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/)
-- Release blog: [TorchSpec: Speculative Decoding Training at Scale](https://lightseek.org/blog/torchspec-speculative-decoding-training-at-scale.html)
+## Blogs and Announcements
+
+- [EAGLE 3.1: Advancing Speculative Decoding Through Collaboration Between the EAGLE Team, vLLM, and TorchSpec](https://lightseek.org/blog/eagle-3-1.html) (May 2026)
+- [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/) (PyTorch Blog, March 2026)
+- [TorchSpec: Speculative Decoding Training at Scale](https://lightseek.org/blog/torchspec-speculative-decoding-training-at-scale.html) (March 2026)
 
 ## Table of Contents
 
