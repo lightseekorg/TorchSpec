@@ -483,8 +483,28 @@ class KimiK25Parser(Parser):
     def format(self, conversation: "Conversation", **kwargs) -> str:
         """Build conversation string with Kimi-K2.5 tokens.
 
-        Strips <think>...</think> from all assistant turns except the last one,
-        aligned with Kimi's native multi-turn behavior.
+        Thinking is handled per turn to produce the faithful *training*
+        representation, which is a deliberate hybrid of the model's two native
+        chat-template modes (it does not byte-match a single one):
+
+        - **Non-last (history) assistant turns**: reasoning is stripped ->
+          ``<think></think>{answer}``, matching the native template's default
+          (``preserve_thinking=False``) — i.e. what the model actually conditions
+          on for prior turns at serving time.
+        - **Last assistant turn**: reasoning is preserved / reconstructed ->
+          ``<think>{reasoning}</think>{answer}``, matching the native template
+          with ``preserve_thinking=True`` — i.e. what the model actually
+          *generates* for the current turn (and what the draft is trained on).
+
+        So the prefix matches serving context while the supervised completion
+        matches generation. For single-turn data (the common offline case) there
+        is only the last turn, so the output equals native
+        ``preserve_thinking=True`` exactly.
+
+        The last turn's reasoning is recovered whether it arrives inline
+        (``{reasoning}</think>{answer}``, opening ``<think>`` dropped because it
+        was emitted in the generation prompt) or in a separate
+        ``reasoning_content``/``thinking`` field (reasoning-parser output).
 
         When expand_media_tokens=False, image placeholders are kept as-is so
         that sglang's multimodal processor can match them against image_data.
