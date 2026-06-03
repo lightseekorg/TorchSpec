@@ -47,11 +47,26 @@ __all__ = [
 _HAS_THINKING_RE = re.compile(r"<think>(?!\s*</think>)")
 
 
+def _has_dropped_think_opener(content: str) -> bool:
+    """True if ``content`` has a closing ``</think>`` but no opening ``<think>``.
+
+    This is the dropped-opener shape produced by Kimi K2.x inference servers: the
+    opening ``<think>`` is emitted in the generation prompt, so a captured
+    ``{reasoning}</think>{answer}`` response carries the closer but not the opener.
+    Shared by thinking *detection* (``has_thinking_content``) and thinking
+    *recovery* (``KimiK25Parser._recover_missing_think_open``) so they agree — if
+    they drift, ``last_turn_loss_only='auto'`` mismasks recovered thinking samples
+    (loss on every assistant turn instead of only the last).
+    """
+    return "</think>" in content and not content.lstrip().startswith("<think>")
+
+
 def has_thinking_content(conversation: list) -> bool:
     """Detect whether any assistant message contains real thinking content.
 
-    Checks for non-empty <think> blocks in message content and for
-    separate thinking/thinking_content/reasoning_content/reasoning fields
+    Checks for non-empty <think> blocks in message content (including the
+    dropped-opener ``{reasoning}</think>{answer}`` shape that recovery restores)
+    and for separate thinking/thinking_content/reasoning_content/reasoning fields
     on the message dict (covers preserved_thinking outputs from engines).
     Must be called on the raw conversation BEFORE formatting, since
     formatters (e.g. KimiK25Parser) inject empty <think></think> tags.
@@ -60,7 +75,9 @@ def has_thinking_content(conversation: list) -> bool:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content", "")
-        if isinstance(content, str) and _HAS_THINKING_RE.search(content):
+        if isinstance(content, str) and (
+            _HAS_THINKING_RE.search(content) or _has_dropped_think_opener(content)
+        ):
             return True
         for field in ("thinking", "thinking_content", "reasoning_content", "reasoning"):
             if msg.get(field):
@@ -433,8 +450,11 @@ class KimiK25Parser(Parser):
         and the reasoning outside any think block. If a ``</think>`` is present
         without a matching opener, restore the opener so the turn is a proper
         ``<think>{reasoning}</think>{answer}`` block matching the model's output.
+
+        Detection is shared with ``has_thinking_content`` via
+        ``_has_dropped_think_opener`` so masking stays in sync with recovery.
         """
-        if "</think>" in content and not content.lstrip().startswith("<think>"):
+        if _has_dropped_think_opener(content):
             return "<think>" + content
         return content
 
