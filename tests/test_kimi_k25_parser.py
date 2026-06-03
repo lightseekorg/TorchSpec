@@ -564,3 +564,47 @@ class TestKimiK25ParserToolCalls:
 
         assert loss_mask.sum() > 0
         assert isinstance(input_ids, torch.Tensor)
+
+
+class TestKimiK25ThinkRecovery:
+    """Tests for recovering a dropped opening <think> in assistant content.
+
+    Thinking-model servers return ``{reasoning}</think>{answer}`` because the
+    opening <think> lives in the generation prompt; offline re-tokenization must
+    restore it instead of emitting an empty <think></think> + dangling close.
+    """
+
+    def test_recovers_missing_open_think(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "What is flash attention"},
+            {"role": "assistant", "content": "let me think</think>It is fast attention."},
+        ]
+        formatted = parser.format(conversation)
+        assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+        # Exactly one well-formed think block, no empty/dangling tags.
+        assert "<think></think>" not in assistant
+        assert assistant.count("<think>") == 1
+        assert assistant.count("</think>") == 1
+        assert assistant.startswith("<think>let me think</think>It is fast attention.")
+
+    def test_plain_answer_still_gets_empty_think(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+        ]
+        formatted = parser.format(conversation)
+        assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+        assert assistant.startswith("<think></think>Hello!")
+
+    def test_wellformed_think_unchanged(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conversation = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "<think>reason</think>answer"},
+        ]
+        formatted = parser.format(conversation)
+        assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+        assert assistant.count("<think>") == 1
+        assert assistant.startswith("<think>reason</think>answer")

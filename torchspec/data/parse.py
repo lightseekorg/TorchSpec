@@ -404,6 +404,25 @@ class KimiK25Parser(Parser):
     def _strip_thinking(self, content: str) -> str:
         return self.THINK_PATTERN.sub("", content)
 
+    @staticmethod
+    def _recover_missing_think_open(content: str) -> str:
+        """Restore a dropped opening ``<think>`` tag in assistant content.
+
+        Kimi K2.x is a thinking model whose chat template emits the opening
+        ``<think>`` as part of the *generation prompt*. A response captured from
+        an inference server is therefore ``{reasoning}</think>{answer}`` — it has
+        the closing ``</think>`` but not the opening one. Without recovery, such
+        content (which does not start with ``<think>``) gets an empty
+        ``<think></think>`` prepended below, producing a malformed turn:
+        ``<think></think>{reasoning}</think>{answer}`` with a dangling close tag
+        and the reasoning outside any think block. If a ``</think>`` is present
+        without a matching opener, restore the opener so the turn is a proper
+        ``<think>{reasoning}</think>{answer}`` block matching the model's output.
+        """
+        if "</think>" in content and not content.lstrip().startswith("<think>"):
+            return "<think>" + content
+        return content
+
     def _format_tool_calls(self, tool_calls: list) -> str:
         """Format structured tool_calls into Kimi-native inline tokens."""
         tc_parts = []
@@ -468,6 +487,7 @@ class KimiK25Parser(Parser):
                 tool_calls = msg.get("tool_calls")
                 if tool_calls:
                     content += self._format_tool_calls(tool_calls)
+                content = self._recover_missing_think_open(content)
                 if not content.startswith("<think>"):
                     content = "<think></think>" + content
                 parts.append(f"{self.ASSISTANT_HEADER}{content}{self.END_TOKEN}")
