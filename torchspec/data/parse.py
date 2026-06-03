@@ -521,6 +521,11 @@ class KimiK25Parser(Parser):
                     content = self._format_content(content, role)
 
             if role == "assistant" and idx != last_assistant_idx:
+                # Recover a dropped opening <think> first so the whole reasoning
+                # block can be matched and stripped (historical turns drop their
+                # thinking). Without this, dropped-opener content (reasoning</think>
+                # answer) isn't stripped and stays malformed.
+                content = self._recover_missing_think_open(content)
                 content = self._strip_thinking(content)
 
             if role == "system":

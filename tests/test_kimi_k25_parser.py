@@ -698,3 +698,25 @@ class TestKimiK25ReasoningField:
         last = formatted.split("<|im_assistant|>assistant<|im_middle|>")[2]
         assert "r1" not in first and first.startswith("<think></think>a1")  # stripped
         assert last.startswith("<think>r2</think>a2")  # reconstructed
+
+
+class TestKimiK25MultiTurnDroppedOpener:
+    """Non-last turn with an inline dropped-opener must be stripped, not malformed."""
+
+    def test_non_last_dropped_opener_stripped(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "r1</think>a1"},  # dropped-opener historical turn
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "r2</think>a2"},  # dropped-opener last turn
+        ]
+        formatted = parser.format(conv)
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+
+        assert has_unbalanced_thinking_tags(formatted) is False
+        first = formatted.split("<|im_assistant|>assistant<|im_middle|>")[1]
+        last = formatted.split("<|im_assistant|>assistant<|im_middle|>")[2]
+        assert first.startswith("<think></think>a1")  # historical: thinking stripped
+        assert "r1" not in first
+        assert last.startswith("<think>r2</think>a2")  # last: recovered
