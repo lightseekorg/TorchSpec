@@ -567,13 +567,6 @@ class TestKimiK25ParserToolCalls:
 
 
 class TestKimiK25ThinkRecovery:
-    """Tests for recovering a dropped opening <think> in assistant content.
-
-    Thinking-model servers return ``{reasoning}</think>{answer}`` because the
-    opening <think> lives in the generation prompt; offline re-tokenization must
-    restore it instead of emitting an empty <think></think> + dangling close.
-    """
-
     def test_recovers_missing_open_think(self, mock_tokenizer, kimi_template):
         parser = KimiK25Parser(mock_tokenizer, kimi_template)
         conversation = [
@@ -582,7 +575,6 @@ class TestKimiK25ThinkRecovery:
         ]
         formatted = parser.format(conversation)
         assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
-        # Exactly one well-formed think block, no empty/dangling tags.
         assert "<think></think>" not in assistant
         assert assistant.count("<think>") == 1
         assert assistant.count("</think>") == 1
@@ -611,12 +603,9 @@ class TestKimiK25ThinkRecovery:
 
 
 class TestThinkBalanceCheck:
-    """Tests for has_unbalanced_thinking_tags (load-time data guard)."""
-
     def test_flags_dropped_open_think(self):
         from torchspec.data.parse import has_unbalanced_thinking_tags
 
-        # malformed: empty <think></think> injected + dangling </think> (1 open, 2 close)
         assert has_unbalanced_thinking_tags("<think></think>reasoning</think>answer") is True
 
     def test_wellformed_think_ok(self):
@@ -635,8 +624,6 @@ class TestThinkBalanceCheck:
         assert has_unbalanced_thinking_tags("just an answer") is False
 
     def test_catches_unfixed_parser_output(self, mock_tokenizer, kimi_template):
-        """End-to-end: formatting dropped-opener content (post-fix it's recovered,
-        so balanced); a raw double-close stays flagged."""
         from torchspec.data.parse import KimiK25Parser, has_unbalanced_thinking_tags
 
         parser = KimiK25Parser(mock_tokenizer, kimi_template)
@@ -645,14 +632,10 @@ class TestThinkBalanceCheck:
             {"role": "assistant", "content": "reasoning</think>answer"},
         ]
         formatted = parser.format(conv)
-        # with the recovery fix the formatted output is balanced
         assert has_unbalanced_thinking_tags(formatted) is False
 
 
 class TestKimiK25ReasoningField:
-    """Reconstruct <think>{reasoning}</think>{answer} from a separate reasoning field
-    (reasoning-parser output, e.g. --reasoning-parser kimi_k2)."""
-
     def _asst(self, parser, conv):
         return parser.format(conv).split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
 
@@ -685,7 +668,6 @@ class TestKimiK25ReasoningField:
         assert a.startswith("<think></think>answer")
 
     def test_non_last_turn_reasoning_field_stripped(self, mock_tokenizer, kimi_template):
-        # earlier assistant turns must NOT regain thinking from the field
         parser = KimiK25Parser(mock_tokenizer, kimi_template)
         conv = [
             {"role": "user", "content": "Q1"},
@@ -696,20 +678,18 @@ class TestKimiK25ReasoningField:
         formatted = parser.format(conv)
         first = formatted.split("<|im_assistant|>assistant<|im_middle|>")[1]
         last = formatted.split("<|im_assistant|>assistant<|im_middle|>")[2]
-        assert "r1" not in first and first.startswith("<think></think>a1")  # stripped
-        assert last.startswith("<think>r2</think>a2")  # reconstructed
+        assert "r1" not in first and first.startswith("<think></think>a1")
+        assert last.startswith("<think>r2</think>a2")
 
 
 class TestKimiK25MultiTurnDroppedOpener:
-    """Non-last turn with an inline dropped-opener must be stripped, not malformed."""
-
     def test_non_last_dropped_opener_stripped(self, mock_tokenizer, kimi_template):
         parser = KimiK25Parser(mock_tokenizer, kimi_template)
         conv = [
             {"role": "user", "content": "Q1"},
-            {"role": "assistant", "content": "r1</think>a1"},  # dropped-opener historical turn
+            {"role": "assistant", "content": "r1</think>a1"},
             {"role": "user", "content": "Q2"},
-            {"role": "assistant", "content": "r2</think>a2"},  # dropped-opener last turn
+            {"role": "assistant", "content": "r2</think>a2"},
         ]
         formatted = parser.format(conv)
         from torchspec.data.parse import has_unbalanced_thinking_tags
@@ -717,6 +697,6 @@ class TestKimiK25MultiTurnDroppedOpener:
         assert has_unbalanced_thinking_tags(formatted) is False
         first = formatted.split("<|im_assistant|>assistant<|im_middle|>")[1]
         last = formatted.split("<|im_assistant|>assistant<|im_middle|>")[2]
-        assert first.startswith("<think></think>a1")  # historical: thinking stripped
+        assert first.startswith("<think></think>a1")
         assert "r1" not in first
-        assert last.startswith("<think>r2</think>a2")  # last: recovered
+        assert last.startswith("<think>r2</think>a2")

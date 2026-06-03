@@ -48,16 +48,6 @@ _HAS_THINKING_RE = re.compile(r"<think>(?!\s*</think>)")
 
 
 def _has_dropped_think_opener(content: str) -> bool:
-    """True if ``content`` has a closing ``</think>`` but no opening ``<think>``.
-
-    This is the dropped-opener shape produced by Kimi K2.x inference servers: the
-    opening ``<think>`` is emitted in the generation prompt, so a captured
-    ``{reasoning}</think>{answer}`` response carries the closer but not the opener.
-    Shared by thinking *detection* (``has_thinking_content``) and thinking
-    *recovery* (``KimiK25Parser._recover_missing_think_open``) so they agree — if
-    they drift, ``last_turn_loss_only='auto'`` mismasks recovered thinking samples
-    (loss on every assistant turn instead of only the last).
-    """
     return "</think>" in content and not content.lstrip().startswith("<think>")
 
 
@@ -86,16 +76,6 @@ def has_thinking_content(conversation: list) -> bool:
 
 
 def has_unbalanced_thinking_tags(formatted_text: str) -> bool:
-    """Detect malformed ``<think>``/``</think>`` structure in a *formatted* string.
-
-    A well-formed conversation has one ``</think>`` per ``<think>`` (every thinking
-    block, including the empty ``<think></think>`` for non-thinking turns, is
-    balanced). An imbalance means the chat-template formatting produced a malformed
-    turn — most commonly a thinking model whose opening ``<think>`` was emitted in
-    the generation prompt (so the captured response lacks it), which then yields a
-    dangling ``</think>`` on re-tokenization. Used as a load-time data check so this
-    silently corrupting case is surfaced before training instead of after.
-    """
     return formatted_text.count("<think>") != formatted_text.count("</think>")
 
 
@@ -438,29 +418,10 @@ class KimiK25Parser(Parser):
 
     @staticmethod
     def _recover_missing_think_open(content: str) -> str:
-        """Restore a dropped opening ``<think>`` tag in assistant content.
-
-        Kimi K2.x is a thinking model whose chat template emits the opening
-        ``<think>`` as part of the *generation prompt*. A response captured from
-        an inference server is therefore ``{reasoning}</think>{answer}`` — it has
-        the closing ``</think>`` but not the opening one. Without recovery, such
-        content (which does not start with ``<think>``) gets an empty
-        ``<think></think>`` prepended below, producing a malformed turn:
-        ``<think></think>{reasoning}</think>{answer}`` with a dangling close tag
-        and the reasoning outside any think block. If a ``</think>`` is present
-        without a matching opener, restore the opener so the turn is a proper
-        ``<think>{reasoning}</think>{answer}`` block matching the model's output.
-
-        Detection is shared with ``has_thinking_content`` via
-        ``_has_dropped_think_opener`` so masking stays in sync with recovery.
-        """
         if _has_dropped_think_opener(content):
             return "<think>" + content
         return content
 
-    # Reasoning fields a server's reasoning parser may emit (kept in sync with
-    # has_thinking_content). When a reasoning parser is active, the API splits the
-    # turn: content = answer (think tags stripped), reasoning in a separate field.
     _REASONING_FIELDS = ("thinking", "thinking_content", "reasoning_content", "reasoning")
 
     @classmethod
@@ -473,15 +434,6 @@ class KimiK25Parser(Parser):
 
     @classmethod
     def _merge_reasoning_field(cls, msg: dict, content: str) -> str:
-        """Rebuild ``<think>{reasoning}</think>{answer}`` from a separate reasoning field.
-
-        When generated with a reasoning parser (e.g. ``--reasoning-parser kimi_k2``),
-        the reasoning is returned in a ``reasoning_content``/``thinking`` field and
-        ``content`` is the bare answer. Without this, ``format()`` would emit only
-        ``<think></think>{answer}`` and silently drop the reasoning from training.
-        Only applied when ``content`` carries no inline think tags (so it composes
-        with ``_recover_missing_think_open`` rather than double-wrapping).
-        """
         reasoning = cls._reasoning_from_field(msg)
         if reasoning and "<think>" not in content and "</think>" not in content:
             return f"<think>{reasoning}</think>{content}"
@@ -501,34 +453,7 @@ class KimiK25Parser(Parser):
         return self.TOOL_CALLS_SECTION_BEGIN + "".join(tc_parts) + self.TOOL_CALLS_SECTION_END
 
     def format(self, conversation: "Conversation", **kwargs) -> str:
-        """Build conversation string with Kimi-K2.5 tokens.
-
-        Thinking is handled per turn to produce the faithful *training*
-        representation, which is a deliberate hybrid of the model's two native
-        chat-template modes (it does not byte-match a single one):
-
-        - **Non-last (history) assistant turns**: reasoning is stripped ->
-          ``<think></think>{answer}``, matching the native template's default
-          (``preserve_thinking=False``) — i.e. what the model actually conditions
-          on for prior turns at serving time.
-        - **Last assistant turn**: reasoning is preserved / reconstructed ->
-          ``<think>{reasoning}</think>{answer}``, matching the native template
-          with ``preserve_thinking=True`` — i.e. what the model actually
-          *generates* for the current turn (and what the draft is trained on).
-
-        So the prefix matches serving context while the supervised completion
-        matches generation. For single-turn data (the common offline case) there
-        is only the last turn, so the output equals native
-        ``preserve_thinking=True`` exactly.
-
-        The last turn's reasoning is recovered whether it arrives inline
-        (``{reasoning}</think>{answer}``, opening ``<think>`` dropped because it
-        was emitted in the generation prompt) or in a separate
-        ``reasoning_content``/``thinking`` field (reasoning-parser output).
-
-        When expand_media_tokens=False, image placeholders are kept as-is so
-        that sglang's multimodal processor can match them against image_data.
-        """
+        """Build conversation string with Kimi-K2.5 tokens."""
         add_generation_prompt = kwargs.pop("add_generation_prompt", False)
         expand_media_tokens = kwargs.pop("expand_media_tokens", True)
         parts = []
@@ -561,10 +486,6 @@ class KimiK25Parser(Parser):
                     content = self._format_content(content, role)
 
             if role == "assistant" and idx != last_assistant_idx:
-                # Recover a dropped opening <think> first so the whole reasoning
-                # block can be matched and stripped (historical turns drop their
-                # thinking). Without this, dropped-opener content (reasoning</think>
-                # answer) isn't stripped and stays malformed.
                 content = self._recover_missing_think_open(content)
                 content = self._strip_thinking(content)
 
@@ -576,12 +497,8 @@ class KimiK25Parser(Parser):
                 tool_calls = msg.get("tool_calls")
                 if tool_calls:
                     content += self._format_tool_calls(tool_calls)
-                # Restore thinking only for the last assistant turn (earlier turns
-                # have it stripped above, matching Kimi's native multi-turn behavior).
                 if idx == last_assistant_idx:
-                    # reasoning-parser output: reasoning in a separate field
                     content = self._merge_reasoning_field(msg, content)
-                    # raw output: opening <think> dropped (emitted in the prompt)
                     content = self._recover_missing_think_open(content)
                 if not content.startswith("<think>"):
                     content = "<think></think>" + content
