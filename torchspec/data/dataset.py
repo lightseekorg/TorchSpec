@@ -257,7 +257,13 @@ def load_conversation_dataset(args):
         if result is None:
             skipped += 1
             continue
-        if has_unbalanced_thinking_tags(result.get("formatted_prompt", "")):
+        # Only meaningful for the offline path (full conversations re-tokenized).
+        # In defer/decode mode formatted_prompt ends with the generation-prompt
+        # opening <think>, which is legitimately unbalanced — skip to avoid a
+        # false positive on every sample.
+        if not defer_tokenization and has_unbalanced_thinking_tags(
+            result.get("formatted_prompt", "")
+        ):
             unbalanced_think += 1
         metadata = {}
         if "has_thinking" in result:
