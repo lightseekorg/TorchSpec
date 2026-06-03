@@ -41,6 +41,7 @@ __all__ = [
     "MiniMaxParser",
     "create_parser",
     "has_thinking_content",
+    "has_unbalanced_thinking_tags",
 ]
 
 _HAS_THINKING_RE = re.compile(r"<think>(?!\s*</think>)")
@@ -65,6 +66,20 @@ def has_thinking_content(conversation: list) -> bool:
             if msg.get(field):
                 return True
     return False
+
+
+def has_unbalanced_thinking_tags(formatted_text: str) -> bool:
+    """Detect malformed ``<think>``/``</think>`` structure in a *formatted* string.
+
+    A well-formed conversation has one ``</think>`` per ``<think>`` (every thinking
+    block, including the empty ``<think></think>`` for non-thinking turns, is
+    balanced). An imbalance means the chat-template formatting produced a malformed
+    turn — most commonly a thinking model whose opening ``<think>`` was emitted in
+    the generation prompt (so the captured response lacks it), which then yields a
+    dangling ``</think>`` on re-tokenization. Used as a load-time data check so this
+    silently corrupting case is surfaced before training instead of after.
+    """
+    return formatted_text.count("<think>") != formatted_text.count("</think>")
 
 
 class Parser(ABC):

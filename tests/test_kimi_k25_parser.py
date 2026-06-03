@@ -608,3 +608,37 @@ class TestKimiK25ThinkRecovery:
         assistant = formatted.split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
         assert assistant.count("<think>") == 1
         assert assistant.startswith("<think>reason</think>answer")
+
+
+class TestThinkBalanceCheck:
+    """Tests for has_unbalanced_thinking_tags (load-time data guard)."""
+
+    def test_flags_dropped_open_think(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+        # malformed: empty <think></think> injected + dangling </think> (1 open, 2 close)
+        assert has_unbalanced_thinking_tags("<think></think>reasoning</think>answer") is True
+
+    def test_wellformed_think_ok(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+        assert has_unbalanced_thinking_tags("<think>reasoning</think>answer") is False
+
+    def test_plain_empty_think_ok(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+        assert has_unbalanced_thinking_tags("<think></think>plain answer") is False
+
+    def test_no_think_ok(self):
+        from torchspec.data.parse import has_unbalanced_thinking_tags
+        assert has_unbalanced_thinking_tags("just an answer") is False
+
+    def test_catches_unfixed_parser_output(self, mock_tokenizer, kimi_template):
+        """End-to-end: formatting dropped-opener content (post-fix it's recovered,
+        so balanced); a raw double-close stays flagged."""
+        from torchspec.data.parse import KimiK25Parser, has_unbalanced_thinking_tags
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "reasoning</think>answer"},
+        ]
+        formatted = parser.format(conv)
+        # with the recovery fix the formatted output is balanced
+        assert has_unbalanced_thinking_tags(formatted) is False
