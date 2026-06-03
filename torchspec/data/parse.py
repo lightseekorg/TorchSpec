@@ -438,6 +438,35 @@ class KimiK25Parser(Parser):
             return "<think>" + content
         return content
 
+    # Reasoning fields a server's reasoning parser may emit (kept in sync with
+    # has_thinking_content). When a reasoning parser is active, the API splits the
+    # turn: content = answer (think tags stripped), reasoning in a separate field.
+    _REASONING_FIELDS = ("thinking", "thinking_content", "reasoning_content", "reasoning")
+
+    @classmethod
+    def _reasoning_from_field(cls, msg: dict) -> str:
+        for field in cls._REASONING_FIELDS:
+            value = msg.get(field)
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _merge_reasoning_field(cls, msg: dict, content: str) -> str:
+        """Rebuild ``<think>{reasoning}</think>{answer}`` from a separate reasoning field.
+
+        When generated with a reasoning parser (e.g. ``--reasoning-parser kimi_k2``),
+        the reasoning is returned in a ``reasoning_content``/``thinking`` field and
+        ``content`` is the bare answer. Without this, ``format()`` would emit only
+        ``<think></think>{answer}`` and silently drop the reasoning from training.
+        Only applied when ``content`` carries no inline think tags (so it composes
+        with ``_recover_missing_think_open`` rather than double-wrapping).
+        """
+        reasoning = cls._reasoning_from_field(msg)
+        if reasoning and "<think>" not in content and "</think>" not in content:
+            return f"<think>{reasoning}</think>{content}"
+        return content
+
     def _format_tool_calls(self, tool_calls: list) -> str:
         """Format structured tool_calls into Kimi-native inline tokens."""
         tc_parts = []
@@ -502,7 +531,13 @@ class KimiK25Parser(Parser):
                 tool_calls = msg.get("tool_calls")
                 if tool_calls:
                     content += self._format_tool_calls(tool_calls)
-                content = self._recover_missing_think_open(content)
+                # Restore thinking only for the last assistant turn (earlier turns
+                # have it stripped above, matching Kimi's native multi-turn behavior).
+                if idx == last_assistant_idx:
+                    # reasoning-parser output: reasoning in a separate field
+                    content = self._merge_reasoning_field(msg, content)
+                    # raw output: opening <think> dropped (emitted in the prompt)
+                    content = self._recover_missing_think_open(content)
                 if not content.startswith("<think>"):
                     content = "<think></think>" + content
                 parts.append(f"{self.ASSISTANT_HEADER}{content}{self.END_TOKEN}")

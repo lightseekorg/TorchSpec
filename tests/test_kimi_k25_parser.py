@@ -615,25 +615,30 @@ class TestThinkBalanceCheck:
 
     def test_flags_dropped_open_think(self):
         from torchspec.data.parse import has_unbalanced_thinking_tags
+
         # malformed: empty <think></think> injected + dangling </think> (1 open, 2 close)
         assert has_unbalanced_thinking_tags("<think></think>reasoning</think>answer") is True
 
     def test_wellformed_think_ok(self):
         from torchspec.data.parse import has_unbalanced_thinking_tags
+
         assert has_unbalanced_thinking_tags("<think>reasoning</think>answer") is False
 
     def test_plain_empty_think_ok(self):
         from torchspec.data.parse import has_unbalanced_thinking_tags
+
         assert has_unbalanced_thinking_tags("<think></think>plain answer") is False
 
     def test_no_think_ok(self):
         from torchspec.data.parse import has_unbalanced_thinking_tags
+
         assert has_unbalanced_thinking_tags("just an answer") is False
 
     def test_catches_unfixed_parser_output(self, mock_tokenizer, kimi_template):
         """End-to-end: formatting dropped-opener content (post-fix it's recovered,
         so balanced); a raw double-close stays flagged."""
         from torchspec.data.parse import KimiK25Parser, has_unbalanced_thinking_tags
+
         parser = KimiK25Parser(mock_tokenizer, kimi_template)
         conv = [
             {"role": "user", "content": "Q"},
@@ -642,3 +647,54 @@ class TestThinkBalanceCheck:
         formatted = parser.format(conv)
         # with the recovery fix the formatted output is balanced
         assert has_unbalanced_thinking_tags(formatted) is False
+
+
+class TestKimiK25ReasoningField:
+    """Reconstruct <think>{reasoning}</think>{answer} from a separate reasoning field
+    (reasoning-parser output, e.g. --reasoning-parser kimi_k2)."""
+
+    def _asst(self, parser, conv):
+        return parser.format(conv).split("<|im_assistant|>assistant<|im_middle|>", 1)[1]
+
+    @pytest.mark.parametrize("field", ["reasoning_content", "thinking", "reasoning"])
+    def test_reasoning_field_reconstructed(self, mock_tokenizer, kimi_template, field):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "the answer", field: "the reasoning"},
+        ]
+        a = self._asst(parser, conv)
+        assert a.startswith("<think>the reasoning</think>the answer")
+        assert "<think></think>" not in a
+        assert a.count("<think>") == 1 and a.count("</think>") == 1
+
+    def test_inline_think_not_double_wrapped(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": "<think>r</think>a", "reasoning_content": "r"},
+        ]
+        a = self._asst(parser, conv)
+        assert a.count("<think>") == 1
+        assert a.startswith("<think>r</think>a")
+
+    def test_plain_answer_no_field_unchanged(self, mock_tokenizer, kimi_template):
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "answer"}]
+        a = self._asst(parser, conv)
+        assert a.startswith("<think></think>answer")
+
+    def test_non_last_turn_reasoning_field_stripped(self, mock_tokenizer, kimi_template):
+        # earlier assistant turns must NOT regain thinking from the field
+        parser = KimiK25Parser(mock_tokenizer, kimi_template)
+        conv = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "a2", "reasoning_content": "r2"},
+        ]
+        formatted = parser.format(conv)
+        first = formatted.split("<|im_assistant|>assistant<|im_middle|>")[1]
+        last = formatted.split("<|im_assistant|>assistant<|im_middle|>")[2]
+        assert "r1" not in first and first.startswith("<think></think>a1")  # stripped
+        assert last.startswith("<think>r2</think>a2")  # reconstructed
