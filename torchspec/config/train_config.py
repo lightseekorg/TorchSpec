@@ -110,6 +110,9 @@ class TrainingConfig:
     compile_model: bool = False  # torch.compile the full training model
     sp_ring_size: int = 1
     sp_ulysses_size: int = 1
+    # Expert-parallel degree for MoE draft training. 1 = no EP (single-GPU expert
+    # compute). Wired into the device mesh / expert sharding in a later phase.
+    ep_size: int = 1
 
     gradient_checkpointing: bool = False
     learning_rate: float = 1e-4

@@ -37,10 +37,27 @@ class BF16Optimizer:
         min_lr=0.0,
         wsd_decay_steps=None,
         wsd_decay_style=None,
+        ep_group=None,
+        ep_extra_group=None,
     ):
         self.model = model
         self.model_params = [p for p in model.parameters() if p.requires_grad]
         self.max_grad_norm = max_grad_norm
+        # Expert-Parallel: when set, grad-norm clipping is EP-aware (expert grads,
+        # unique per rank, are reduced across the EP group; replicated grads counted
+        # once). ep_extra_group (ep_fsdp) additionally reduces the expert norm across
+        # FSDP shards when experts are FSDP-sharded (ep_size < world_size).
+        self.ep_group = ep_group
+        self.ep_extra_group = ep_extra_group
+        # Identify expert params robustly: the ``_is_ep`` tag is lost when FSDP
+        # converts a param to a DTensor, so also match by MoEExperts module membership.
+        ep_param_ids = set()
+        for m in model.modules():
+            if type(m).__name__ == "MoEExperts" and getattr(m, "ep_group", None) is not None:
+                for p in m.parameters(recurse=False):
+                    ep_param_ids.add(id(p))
+        self.ep_mask = [getattr(p, "_is_ep", False) or id(p) in ep_param_ids for p in self.model_params]
+        self.has_ep = ep_group is not None and any(self.ep_mask)
         self.fp32_params = [p.detach().clone().to(torch.float32) for p in self.model_params]
         self.fp32_grads = [torch.zeros_like(mp) for mp in self.fp32_params]
         for mp in self.fp32_params:
@@ -74,7 +91,18 @@ class BF16Optimizer:
                 else:
                     mp.grad = None
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
+        if self.has_ep:
+            from torchspec.training.ep_utils import clip_grad_norm_ep
+
+            grad_norm = clip_grad_norm_ep(
+                self.fp32_params,
+                self.max_grad_norm,
+                ep_group=self.ep_group,
+                ep_mask=self.ep_mask,
+                ep_extra_group=self.ep_extra_group,
+            )
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.fp32_params, self.max_grad_norm)
         if grad_norm > 0.0:
             self.optimizer.step()
 

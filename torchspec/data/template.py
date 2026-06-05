@@ -144,6 +144,20 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# GLM-4 / GLM-4.5 (glm4_moe targets). Role-token chat format; the assistant turn
+# ends at the next role token. Uses the default header-based parser.
+# NOTE: verify the exact special tokens against the target model's tokenizer
+# (GLM variants differ; some use a leading "[gMASK]<sop>" and "<|endoftext|>" EOS).
+TEMPLATE_REGISTRY.register(
+    name="glm4",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>\n",
+        user_header="<|user|>\n",
+        system_prompt="",
+        end_of_turn_token="<|user|>",
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="deepseek-r1-distill",
     template=ChatTemplate(

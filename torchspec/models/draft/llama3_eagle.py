@@ -2382,7 +2382,15 @@ class LlamaDecoderLayer(nn.Module):
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
         self.attention_backend = attention_backend
-        self.mlp = LlamaMLP(config)
+        # MoE draft (e.g. GLM-4-MoE): opt in via `use_moe: true` in the draft config;
+        # otherwise the standard dense MLP. The MoE block is GQA-agnostic (it only
+        # replaces the FFN), so GQA-based drafts can be MoE too.
+        if getattr(config, "use_moe", False):
+            from torchspec.models.draft.moe import DeepseekV3MoEBlock
+
+            self.mlp = DeepseekV3MoEBlock(config)
+        else:
+            self.mlp = LlamaMLP(config)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

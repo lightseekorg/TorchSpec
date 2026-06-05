@@ -75,14 +75,25 @@ class Eagle3Trainer(Trainer):
                 mooncake_config.master_server_address, mooncake_config.metadata_server
             )
 
-        init_context = self._get_init_weight_context_manager()
-
-        with init_context():
+        ep_enabled = getattr(self, "ep_size", 1) > 1
+        if ep_enabled:
+            # Expert Parallel: attach the EP group so the MoE block builds local
+            # (per-rank) experts + all-to-all. Build on every rank (no meta/CPU
+            # memory-saving init, since experts are not FSDP-sharded when ep_fsdp==1).
+            setattr(draft_model_config, "ep_group", self.ep_group)
             draft_model = AutoEagle3DraftModel.from_config(
                 draft_model_config,
                 attention_backend=self.args.attention_backend,
                 torch_dtype=torch.bfloat16,
             )
+        else:
+            init_context = self._get_init_weight_context_manager()
+            with init_context():
+                draft_model = AutoEagle3DraftModel.from_config(
+                    draft_model_config,
+                    attention_backend=self.args.attention_backend,
+                    torch_dtype=torch.bfloat16,
+                )
 
         if dist.get_rank() == 0:
             draft_model.load_embedding(
@@ -108,27 +119,59 @@ class Eagle3Trainer(Trainer):
             gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
         )
 
-        full_state = eagle3_model.state_dict() if dist.get_rank() == 0 else {}
+        if ep_enabled:
+            # No model-wide DDP/FSDP gradient all-reduce: routed-expert params are
+            # unique per EP rank and must NOT be averaged across the EP group. Put the
+            # model on CUDA, replicate the non-expert params from rank 0 (experts keep
+            # their per-rank init), and grad-sync manually each step via
+            # ep_utils.sync_gradients_ep (non-expert -> AVG over DP; experts -> AVG over
+            # ep_fsdp, a no-op when ep_size == world_size).
+            eagle3_model = eagle3_model.to(device=torch.cuda.current_device())
+            with torch.no_grad():
+                for _name, p in eagle3_model.named_parameters():
+                    if not getattr(p, "_is_ep", False):
+                        dist.broadcast(p.data, src=0)
+                for _name, buf in eagle3_model.named_buffers():
+                    dist.broadcast(buf, src=0)
+            # ep_fsdp > 1: experts are data-parallel REPLICATED across the ep_fsdp
+            # mesh. Make replicas identical (broadcast within each ep_fsdp group), then
+            # FSDP-shard them for memory (grads reduce-scatter across ep_fsdp via FSDP).
+            if self.ep_fsdp_group is not None and dist.get_world_size(self.ep_fsdp_group) > 1:
+                src = dist.get_global_rank(self.ep_fsdp_group, 0)
+                with torch.no_grad():
+                    for _name, p in eagle3_model.named_parameters():
+                        if getattr(p, "_is_ep", False):
+                            dist.broadcast(p.data, src=src, group=self.ep_fsdp_group)
+                from torchspec.training.ep_utils import shard_experts_fsdp
 
-        midlayer_modules = [
-            m
-            for name, m in eagle3_model.named_modules()
-            if isinstance(m, torch.nn.Linear) and "midlayer" in name
-        ]
-        eagle3_model = apply_fsdp2(
-            eagle3_model,
-            mesh=self.grad_sync_mesh,
-            cpu_offload=self.fsdp_cpu_offload,
-            args=self.args,
-            modules_to_shard=midlayer_modules,
-        )
+                shard_experts_fsdp(eagle3_model, self.ep_device_mesh["ep_fsdp"])
+                self._ep_experts_fsdp_sharded = True
+            else:
+                self._ep_experts_fsdp_sharded = False
+            self._ep_manual_sync = True
+        else:
+            full_state = eagle3_model.state_dict() if dist.get_rank() == 0 else {}
 
-        eagle3_model = fsdp2_load_full_state_dict(
-            eagle3_model,
-            full_state,
-            self.grad_sync_mesh,
-            cpu_offload=True if self.fsdp_cpu_offload else None,
-        )
+            midlayer_modules = [
+                m
+                for name, m in eagle3_model.named_modules()
+                if isinstance(m, torch.nn.Linear) and "midlayer" in name
+            ]
+            eagle3_model = apply_fsdp2(
+                eagle3_model,
+                mesh=self.grad_sync_mesh,
+                cpu_offload=self.fsdp_cpu_offload,
+                args=self.args,
+                modules_to_shard=midlayer_modules,
+            )
+
+            eagle3_model = fsdp2_load_full_state_dict(
+                eagle3_model,
+                full_state,
+                self.grad_sync_mesh,
+                cpu_offload=True if self.fsdp_cpu_offload else None,
+            )
+            self._ep_manual_sync = False
 
         self.model = eagle3_model
         self.eagle3 = self.model.module if hasattr(self.model, "module") else self.model
@@ -153,6 +196,10 @@ class Eagle3Trainer(Trainer):
             min_lr=getattr(self.args, "min_lr", 0.0),
             wsd_decay_steps=wsd_decay_steps,
             wsd_decay_style=wsd_decay_style,
+            ep_group=self.ep_group if getattr(self, "ep_size", 1) > 1 else None,
+            ep_extra_group=(
+                self.ep_fsdp_group if getattr(self, "_ep_experts_fsdp_sharded", False) else None
+            ),
         )
         self.lr_scheduler = self.optimizer.lr_scheduler
 
@@ -318,6 +365,22 @@ class Eagle3Trainer(Trainer):
             len(plosses), getattr(self.args, "ploss_weights", None)
         )
         ploss = sum(ploss_weight[i] * plosses[i] for i in range(len(plosses))) / accumulation_steps
+
+        # Optional MoE load-balancing auxiliary loss (off by default — DeepSeek-V3 is
+        # aux-loss-free and trains the gate via the expert path; enable with
+        # router_aux_loss_coef > 0). Uses the router logits cached by each MoE block.
+        aux_coef = getattr(self.args, "router_aux_loss_coef", 0.0)
+        if aux_coef > 0:
+            from torchspec.models.draft.moe import DeepseekV3MoEBlock, global_load_balancing_loss
+
+            aux = 0.0
+            for m in self.draft_model.modules():
+                if isinstance(m, DeepseekV3MoEBlock) and m.router_logits is not None:
+                    aux = aux + global_load_balancing_loss(
+                        m.router_logits, m.num_experts, m.top_k, dp_group=self.dp_group
+                    )
+            ploss = ploss + (aux_coef * aux) / accumulation_steps
+
         ploss.backward()
         return ploss
 

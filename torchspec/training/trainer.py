@@ -102,6 +102,11 @@ class Trainer(abc.ABC):
         rank = dist.get_rank()
         self.cache_rank = rank
 
+        # Expert-Parallel state (set by the EP branch below; harmless defaults otherwise).
+        self.ep_size = getattr(self.args, "ep_size", 1)
+        self.ep_group = None
+        self.ep_fsdp_group = None
+
         usp_mesh = None
         if getattr(self.args, "attention_backend", None) == "usp":
             usp_mesh = get_usp_device_mesh()
@@ -118,6 +123,34 @@ class Trainer(abc.ABC):
             logger.info(
                 f"[Rank {rank}] Device mesh (USP): world_size={world_size}, dp_size={self.dp_size}, "
                 f"dp_rank={self.dp_rank}, grad_sync_size={world_size}"
+            )
+            return
+
+        if self.ep_size > 1:
+            # Expert Parallel: 2D mesh (ep_fsdp, ep). The `ep` dim is the all-to-all
+            # group for routed experts; `ep_fsdp` holds data-parallel expert replicas
+            # (size 1 when ep_size == world_size). Non-expert params are data-parallel
+            # across ALL ranks and grad-synced manually (see ep_utils.sync_gradients_ep).
+            assert world_size % self.ep_size == 0, (
+                f"world_size {world_size} not divisible by ep_size {self.ep_size}"
+            )
+            ep_fsdp_size = world_size // self.ep_size
+            self.ep_device_mesh = init_device_mesh(
+                "cuda",
+                mesh_shape=(ep_fsdp_size, self.ep_size),
+                mesh_dim_names=("ep_fsdp", "ep"),
+            )
+            self.ep_group = self.ep_device_mesh.get_group("ep")
+            self.ep_fsdp_group = self.ep_device_mesh.get_group("ep_fsdp")
+            self.dp_size = world_size
+            self.dp_rank = rank
+            self.mesh = self.ep_device_mesh
+            self.dp_group = None  # default (world) group for non-expert grad averaging
+            self.dp_mesh = self.ep_device_mesh
+            self.grad_sync_mesh = self.ep_device_mesh
+            logger.info(
+                f"[Rank {rank}] Device mesh (EP): world={world_size}, "
+                f"ep_size={self.ep_size}, ep_fsdp={ep_fsdp_size}"
             )
             return
 
@@ -387,6 +420,16 @@ class Trainer(abc.ABC):
 
             if is_last:
                 self._maybe_dump(batch, step_metrics, step, batch_idx)
+                # Expert-Parallel manual gradient sync (when not using DDP/FSDP auto-sync):
+                # non-expert grads averaged over DP, expert grads over ep_fsdp (no-op when 1).
+                if getattr(self, "_ep_manual_sync", False):
+                    from torchspec.training.ep_utils import sync_gradients_ep
+
+                    sync_gradients_ep(
+                        self.optimizer.model_params,
+                        dp_group=self.dp_group,
+                        ep_fsdp_group=self.ep_fsdp_group,
+                    )
                 _evt_opt_s = torch.cuda.Event(enable_timing=True)
                 _evt_opt_e = torch.cuda.Event(enable_timing=True)
                 _evt_opt_s.record()
