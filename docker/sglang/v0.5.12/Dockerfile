@@ -1,4 +1,4 @@
-ARG SGLANG_IMAGE=598726163780.dkr.ecr.us-west-2.amazonaws.com/tgl:v0.5.12-cu130-43a42c1bd9-dirty-warm-20260526
+ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.12-cu130
 FROM ${SGLANG_IMAGE} AS sglang
 
 WORKDIR /root/

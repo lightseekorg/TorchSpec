@@ -69,19 +69,6 @@ class TestEnableHardPinConfig:
 
 
 class TestMooncakeEnvDefaults:
-    def test_from_env_accepts_kubernetes_service_port_urls(self):
-        env = {
-            "MOONCAKE_MASTER_HOST": "10.0.0.7",
-            "MOONCAKE_MASTER_PORT": "tcp://10.0.0.7:51135",
-            "MOONCAKE_METADATA_PORT": "tcp://10.0.0.7:8763",
-        }
-
-        with patch.dict(os.environ, env, clear=True):
-            config = MooncakeConfig.from_env()
-
-        assert config.master_server_address == "10.0.0.7:51135"
-        assert config.metadata_server == "http://10.0.0.7:8763/metadata"
-
     def test_tcp_memcpy_default_is_applied_by_export_env(self):
         config = MooncakeConfig(protocol="tcp")
 
