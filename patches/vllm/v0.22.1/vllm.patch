@@ -1,0 +1,42 @@
+TorchSpec patches for vllm v0.22.1
+
+1. Fix flash_attn rotary embedding import with FA4
+   vllm/model_executor/layers/rotary_embedding/common.py
+   flash-attn-4 provides the ``flash_attn`` module without
+   ``ops.triton.rotary``, so the unguarded import crashes at engine init
+   when FA4 is installed (e.g. via torchspec's ``.[fa]`` extra).
+
+Note: the remaining v0.19.1 patches are no longer needed on v0.22.1:
+- Quantized KV cache dtype fix: upstream in
+  vllm/model_executor/models/extract_hidden_states.py
+- VLM text_config fix (PR #38987): upstream in
+  vllm/transformers_utils/configs/extract_hidden_states.py
+- HiddenStatesCacheSpec + kv cache manager registration: upstream as
+  ``HiddenStateCacheSpec`` (vllm/v1/kv_cache_interface.py)
+- Qwen3NextModel EagleModelMixin hooks: upstream in
+  vllm/model_executor/models/qwen3_next.py
+- hybrid_kv_cache.patch (SupportsHMA connector check, heterogeneous page
+  sizes, per-layer CacheOnly slot mappings): superseded by the upstream
+  kv_offload+HMA series (PRs #36644, #36645, #37885, #38261, #38453,
+  #39401-#39403)
+
+Apply:
+  cd $VLLM_ROOT && git apply /path/to/vllm.patch
+
+--- a/vllm/model_executor/layers/rotary_embedding/common.py
++++ b/vllm/model_executor/layers/rotary_embedding/common.py
+@@ -136,9 +136,12 @@
+
+         self.apply_rotary_emb_flash_attn = None
+         if not current_platform.is_cpu() and find_spec("flash_attn") is not None:
+-            from flash_attn.ops.triton.rotary import apply_rotary
++            try:
++                from flash_attn.ops.triton.rotary import apply_rotary
+
+-            self.apply_rotary_emb_flash_attn = apply_rotary
++                self.apply_rotary_emb_flash_attn = apply_rotary
++            except (ImportError, ModuleNotFoundError):
++                pass
+
+     @staticmethod
+     def forward_static(
