@@ -101,6 +101,8 @@ class MooncakeMaster(RayActor):
         if not os.path.exists(mooncake_bin):
             raise FileNotFoundError(f"mooncake_master binary not found at {mooncake_bin}")
 
+        # Pick a free port for metrics / admin server
+        metrics_port = self.find_free_port(start_port=random.randint(9100, 10100))
         cmd = [
             mooncake_bin,
             f"--port={port}",
@@ -108,6 +110,7 @@ class MooncakeMaster(RayActor):
             f"--http_metadata_server_host={http_host}",
             "--enable_http_metadata_server=true",
             f"--default_kv_lease_ttl={int(kv_lease_ttl_s * 1000)}",
+            f"--metrics_port={metrics_port}",
         ]
 
         logger.info(f"Starting mooncake master on port {port}")
