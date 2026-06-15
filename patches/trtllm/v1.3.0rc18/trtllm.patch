@@ -1,0 +1,166 @@
+diff --git a/tensorrt_llm/_torch/speculative/save_hidden_state.py b/tensorrt_llm/_torch/speculative/save_hidden_state.py
+index 05cf2610..b8e8145a 100644
+--- a/tensorrt_llm/_torch/speculative/save_hidden_state.py
++++ b/tensorrt_llm/_torch/speculative/save_hidden_state.py
+@@ -1,10 +1,12 @@
+ import os
++import re
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, List, Optional, Set
+ 
+ import torch
+ 
+ from tensorrt_llm._utils import local_mpi_rank
++from tensorrt_llm.logger import logger
+ 
+ from ..pyexecutor.llm_request import LlmRequest
+ from ..pyexecutor.resource_manager import BaseResourceManager
+@@ -15,6 +17,25 @@ if TYPE_CHECKING:
+     from ...llmapi.llm_args import SaveHiddenStatesDecodingConfig
+ 
+ 
++# TorchSpec integration: when this env var is set, SaveHiddenStates mode writes
++# captured hidden states directly to a Mooncake store (keyed by request id)
++# instead of accumulating .pt files on disk. This mirrors the sglang/vllm
++# TorchSpec backends so the EAGLE3 draft trainer can pull tensors over RDMA.
++_TORCHSPEC_MOONCAKE_ENV = "TORCHSPEC_TRTLLM_MOONCAKE"
++
++
++def _sanitize_mooncake_key(key: str) -> str:
++    """Match the key sanitization the TorchSpec engine uses to reconstruct keys.
++
++    Keys must be reversible from ``RequestOutput.request_id`` on the engine
++    side, so this MUST stay in sync with ``TrtllmEngine``.
++    """
++    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "_", key)
++    if sanitized and sanitized[0].isdigit():
++        sanitized = "k" + sanitized
++    return sanitized
++
++
+ class SaveHiddenStatesResourceManager(BaseResourceManager):
+     """
+     Resource manager for SaveHiddenStates mode.
+@@ -45,7 +66,13 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
+             dtype=dtype,
+             device='cuda')
+ 
+-        os.makedirs(self._output_directory, exist_ok=True)
++        # TorchSpec Mooncake redirect (opt-in via env var). When enabled we do
++        # not touch the output directory; tensors stream to Mooncake instead.
++        self._mooncake_mode = bool(os.environ.get(_TORCHSPEC_MOONCAKE_ENV))
++        self._mooncake_store = None
++        self._mooncake_setup_done = False
++        if not self._mooncake_mode:
++            os.makedirs(self._output_directory, exist_ok=True)
+ 
+     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+         for req in scheduled_batch.all_requests():
+@@ -73,6 +100,9 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
+             scheduled_requests: The scheduled requests for this iteration
+             spec_metadata: The spec metadata containing layers_to_capture info
+         """
++        if self._mooncake_mode:
++            self._process_and_store_mooncake(scheduled_requests, spec_metadata)
++            return
+         for request in sorted(
+                 scheduled_requests.context_requests,
+                 key=lambda r:
+@@ -83,6 +113,97 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
+                 self._write_to_file()
+             self._iter += 1
+ 
++    def _ensure_mooncake_store(self):
++        """Lazily create the TorchSpec EagleMooncakeStore on local rank 0.
++
++        Returns the store, or None if unavailable (callers then skip storing).
++        Mooncake connection params come from env vars exported by the
++        TorchSpec engine before the LLM is constructed.
++        """
++        if self._mooncake_setup_done:
++            return self._mooncake_store
++        self._mooncake_setup_done = True
++        try:
++            from torchspec.config.mooncake_config import MooncakeConfig
++            from torchspec.transfer.mooncake.eagle_store import \
++                EagleMooncakeStore
++
++            config = MooncakeConfig.from_env()
++            store = EagleMooncakeStore(config)
++            device = None
++            if torch.cuda.is_initialized():
++                device = torch.device(f"cuda:{torch.cuda.current_device()}")
++            store.setup(device=device)
++            self._mooncake_store = store
++            logger.info(
++                f"SaveHiddenStates: Mooncake store initialized "
++                f"(master={config.master_server_address})")
++        except Exception:
++            logger.error(
++                "SaveHiddenStates: failed to init Mooncake store; hidden "
++                "states will NOT be stored.",
++                exc_info=True)
++            self._mooncake_store = None
++        return self._mooncake_store
++
++    def _process_and_store_mooncake(
++            self, scheduled_requests: ScheduledRequests,
++            spec_metadata: "SaveHiddenStatesSpecMetadata") -> None:
++        """Stream per-request hidden states to Mooncake instead of disk.
++
++        The capture buffer holds every context token of this forward packed
++        from offset 0 in scheduled order, so we walk the requests in the same
++        order and slice ``[token_offset : token_offset + num_tokens]`` for
++        each. (Upstream's disk path assumes a single request and always reads
++        from offset 0 — incorrect for the batched prefill TorchSpec runs.)
++
++        NOTE: assumes the forward packs context-request tokens in the same
++        order as this sort (by ``py_batch_idx``). Validate against real
++        batched runs during engine bring-up.
++        """
++        if local_mpi_rank() != 0:
++            return
++        store = self._ensure_mooncake_store()
++        if store is None:
++            return
++
++        token_offset = 0
++        for request in sorted(
++                scheduled_requests.context_requests,
++                key=lambda r:
++            (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
++        ):
++            token_ids = list(request.get_tokens(0))
++            num_tokens = len(token_ids)
++            buf = self.hidden_states[token_offset:token_offset + num_tokens]
++            token_offset += num_tokens
++
++            # Final post-norm state is the last captured layer (the spec
++            # metadata moves layer -1 to the end of the capture buffer);
++            # everything before it is the concatenated aux layers.
++            last_hidden_states = buf[:, -self.hidden_size:].contiguous()
++            aux_hidden_states = buf[:, :-self.hidden_size].contiguous()
++            input_ids = torch.tensor(token_ids,
++                                     dtype=torch.long,
++                                     device=buf.device)
++
++            key = _sanitize_mooncake_key(str(request.py_request_id))
++            try:
++                store.put(
++                    key=key,
++                    hidden_states=aux_hidden_states,
++                    input_ids=input_ids,
++                    last_hidden_states=last_hidden_states,
++                    target=None,
++                )
++            except Exception:
++                logger.error(
++                    f"SaveHiddenStates: failed to store request "
++                    f"{request.py_request_id} to Mooncake",
++                    exc_info=True)
++
++        store.flush()
++
+     def _process_request(self, request: LlmRequest,
+                          spec_metadata: "SaveHiddenStatesSpecMetadata") -> None:
+         if local_mpi_rank() != 0:
