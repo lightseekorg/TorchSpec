@@ -55,3 +55,12 @@ except ImportError as _e:
     from torchspec.utils.logging import logger as _logger
 
     _logger.debug("VllmEngine not available: %s", _e)
+
+try:
+    from torchspec.inference.engine.trtllm_engine import TrtllmEngine  # noqa: F401
+
+    __all__.append("TrtllmEngine")
+except ImportError as _e:
+    from torchspec.utils.logging import logger as _logger
+
+    _logger.debug("TrtllmEngine not available: %s", _e)
