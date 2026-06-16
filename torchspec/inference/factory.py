@@ -42,7 +42,7 @@ def create_inference_engines(args, inference_pg, mooncake_config, engine_group: 
     """
     engine_type = getattr(args, "inference_engine_type", "hf")
 
-    if engine_type not in ("hf", "sgl", "vllm"):
+    if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
     logger.info(f"Using {engine_type} engine for inference")
@@ -74,7 +74,7 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
     """
     engine_type = getattr(args, "inference_engine_type", "hf")
 
-    if engine_type not in ("hf", "sgl", "vllm"):
+    if engine_type not in ("hf", "sgl", "vllm", "trtllm"):
         raise ValueError(f"Unknown inference_engine_type: {engine_type}")
 
     logger.info(f"Preparing {engine_type} inference engines...")
@@ -83,6 +83,10 @@ def prepare_inference_engines(args, inference_pg, mooncake_config, engine_group:
         engines, init_refs = _prepare_hf_engines(args, inference_pg, mooncake_config, engine_group)
     elif engine_type == "sgl":
         engines, init_refs = _prepare_sgl_engines(args, inference_pg, mooncake_config, engine_group)
+    elif engine_type == "trtllm":
+        engines, init_refs = _prepare_trtllm_engines(
+            args, inference_pg, mooncake_config, engine_group
+        )
     else:
         engines, init_refs = _prepare_vllm_engines(
             args, inference_pg, mooncake_config, engine_group
@@ -97,7 +101,7 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group:
     Args:
         args: Configuration arguments.
         pg: Placement group tuple (pg, reordered_bundle_indices, reordered_gpu_ids).
-        engine_type: Engine type ("hf", "sgl", or "vllm").
+        engine_type: Engine type ("hf", "sgl", "vllm", or "trtllm").
         mooncake_config: MooncakeConfig object.
 
     Returns:
@@ -109,6 +113,8 @@ def init_engines(args, pg, engine_type: str, mooncake_config=None, engine_group:
         return _init_sgl_engines(args, pg, mooncake_config, engine_group)
     elif engine_type == "vllm":
         return _init_vllm_engines(args, pg, mooncake_config, engine_group)
+    elif engine_type == "trtllm":
+        return _init_trtllm_engines(args, pg, mooncake_config, engine_group)
     else:
         raise ValueError(f"Unknown engine_type: {engine_type}")
 
@@ -427,6 +433,80 @@ def _init_vllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) ->
     init_timeout = getattr(args, "vllm_init_timeout", 300 if nnodes == 1 else 600)
     _wait_for_init(init_handles, "Vllm", timeout=init_timeout)
     return head_engines
+
+
+def _prepare_trtllm_engines(
+    args, pg, mooncake_config=None, engine_group: int = 0
+) -> tuple[list, list]:
+    """Create TensorRT-LLM engine actors and fire init calls without waiting.
+
+    Single-node only: each engine owns a contiguous block of
+    ``inference_num_gpus_per_engine`` GPUs and runs TRT-LLM's own MPI workers
+    across them (TP degree = num_gpus_per_engine). Unlike sgl/vllm there is no
+    cross-node dist-init negotiation or port pre-allocation — TRT-LLM manages
+    worker bring-up internally.
+
+    Returns:
+        Tuple of (engines, init_handles).
+    """
+    nnodes = getattr(args, "trtllm_nnodes", 1)
+    if nnodes > 1:
+        raise NotImplementedError(
+            f"trtllm backend supports single-node TP only (trtllm_nnodes={nnodes})."
+        )
+
+    num_gpus_total = getattr(args, "inference_num_gpus", 1)
+    gpus_per_engine = getattr(args, "inference_num_gpus_per_engine", 1)
+    num_engines = num_gpus_total // gpus_per_engine
+
+    logger.info(
+        f"Initializing {num_engines} TensorRT-LLM engines "
+        f"({gpus_per_engine} GPU(s) each, tp_size={gpus_per_engine})"
+    )
+
+    from torchspec.inference.engine.trtllm_engine import TrtllmEngine
+
+    pg_obj, reordered_bundle_indices, reordered_gpu_ids = pg
+
+    TrtllmRayActor = ray.remote(TrtllmEngine)
+    env_vars = get_torchspec_env_vars()
+
+    engines = []
+    for i in range(num_engines):
+        bundle_offset = i * gpus_per_engine
+        base_gpu_id = int(reordered_gpu_ids[bundle_offset])
+
+        scheduling_strategy = PlacementGroupSchedulingStrategy(
+            placement_group=pg_obj,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=reordered_bundle_indices[bundle_offset],
+        )
+
+        engine = TrtllmRayActor.options(
+            num_cpus=0.2,
+            num_gpus=0.2,
+            scheduling_strategy=scheduling_strategy,
+            runtime_env={"env_vars": env_vars},
+        ).remote(
+            args=args,
+            rank=i,
+            base_gpu_id=base_gpu_id,
+            num_gpus_per_engine=gpus_per_engine,
+            node_rank=0,
+            engine_group=engine_group,
+        )
+        engines.append(engine)
+
+    init_handles = [engine.init.remote(mooncake_config=mooncake_config) for engine in engines]
+    return engines, init_handles
+
+
+def _init_trtllm_engines(args, pg, mooncake_config=None, engine_group: int = 0) -> list:
+    """Initialize TensorRT-LLM engines with Ray placement groups (blocking)."""
+    engines, init_handles = _prepare_trtllm_engines(args, pg, mooncake_config, engine_group)
+    init_timeout = getattr(args, "trtllm_init_timeout", 600)
+    _wait_for_init(init_handles, "Trtllm", timeout=init_timeout)
+    return engines
 
 
 def _create_and_init_actors(

@@ -106,6 +106,35 @@ class VllmConfig:
 
 
 @dataclass
+class TrtllmConfig:
+    """Essential TensorRT-LLM engine configuration.
+
+    Wraps TRT-LLM's PyTorch-backend ``LLM`` in ``SaveHiddenStates`` mode; the
+    TorchSpec patch redirects captured hidden states to Mooncake. Only fields
+    TorchSpec explicitly uses are listed; any other ``LLM`` kwarg can be passed
+    via ``extra_args``.
+
+    Single-node tensor parallelism only (nnodes must be 1); multi-node TP is
+    not yet wired up.
+    """
+
+    # Parallelism (TP degree is derived from inference_num_gpus_per_engine).
+    tp_size: int = 8
+    pp_size: int = 1
+    nnodes: int = 1
+
+    # KV-cache memory fraction (TRT-LLM's KvCacheConfig.free_gpu_memory_fraction).
+    mem_fraction_static: Optional[float] = 0.8
+
+    # TRT-LLM model build + load can be slow; give init a generous timeout.
+    init_timeout: int = 600
+
+    # Passthrough: forwarded as-is to the TRT-LLM LLM constructor
+    # (e.g. attn_backend, max_num_tokens, dtype, ...).
+    extra_args: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class InferenceConfig:
     aux_hidden_states_layers: Optional[list] = None
     inference_batch_size: int = 1
@@ -122,6 +151,7 @@ class InferenceConfig:
     store_last_hidden_states: bool = True
     sglang: SGLangConfig = field(default_factory=SGLangConfig)
     vllm: VllmConfig = field(default_factory=VllmConfig)
+    trtllm: TrtllmConfig = field(default_factory=TrtllmConfig)
 
     def resolve_last_hidden_states_prenorm(self) -> bool:
         """Whether last_hidden_states from the engine are pre-norm.
