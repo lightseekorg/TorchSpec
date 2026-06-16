@@ -64,6 +64,7 @@ TorchSpec streams hidden states from inference engines into training workers.
 |---------|--------------|--------|
 | [vLLM](https://github.com/vllm-project/vllm) | First-class | Available |
 | [TokenSpeed](https://github.com/lightseekorg/tokenspeed) | First-class | In progress |
+| [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) | First-class | Available |
 | [SGLang](https://github.com/sgl-project/sglang) | Best community effort | Available |
 | [HuggingFace Transformers](https://github.com/huggingface/transformers) | Best community effort | Available |
 
@@ -121,7 +122,17 @@ pip install -e ".[fa]"
 ./examples/qwen3-8b-single-node/run.sh
 ```
 
-TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model forward pass and capture hidden states directly inside worker processes, which avoids RPC serialization overhead during extraction. For SGLang, TorchSpec applies a patch to the existing codebase to enable hidden-state extraction.
+**TensorRT-LLM**
+
+Run inside the TensorRT-LLM image (`docker/trtllm/v1.3.0rc18/Dockerfile`), which ships `tensorrt_llm` pre-patched for Mooncake hidden-state capture:
+
+```bash
+./examples/qwen3-8b-single-node/run.sh --config configs/trtllm_qwen3_8b.yaml
+```
+
+Single-node tensor parallelism only for now (multi-node TP is not yet wired up).
+
+TorchSpec uses vLLM's **Worker Extension** mechanism to hook into the model forward pass and capture hidden states directly inside worker processes, which avoids RPC serialization overhead during extraction. For SGLang, TorchSpec applies a patch to the existing codebase to enable hidden-state extraction. For TensorRT-LLM, TorchSpec builds on its native **SaveHiddenStates** speculative mode and applies a small patch that redirects the captured aux + final hidden states to Mooncake instead of writing them to disk.
 
 ## Examples
 
