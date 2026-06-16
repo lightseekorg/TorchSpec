@@ -1,10 +1,11 @@
 BACKEND := env("BACKEND", "sglang")
 SGLANG_VERSION := env("SGLANG_VERSION", "v0.5.8.post1")
 VLLM_VERSION := env("VLLM_VERSION", "v0.22.1")
+TRTLLM_VERSION := env("TRTLLM_VERSION", "v1.3.0rc18")
 IMAGE_REPO := env("IMAGE_REPO", "ghcr.io/torchspec-project/torchspec")
 IMAGE_TAG := env("IMAGE_TAG", "")
 
-_dockerfile := if BACKEND == "vllm" { "docker/vllm/" + VLLM_VERSION + "/Dockerfile" } else { "docker/sglang/" + SGLANG_VERSION + "/Dockerfile" }
+_dockerfile := if BACKEND == "vllm" { "docker/vllm/" + VLLM_VERSION + "/Dockerfile" } else if BACKEND == "trtllm" { "docker/trtllm/" + TRTLLM_VERSION + "/Dockerfile" } else { "docker/sglang/" + SGLANG_VERSION + "/Dockerfile" }
 
 build:
     ARG_TAG_POSTFIX="${ARG_TAG_POSTFIX:-""}" ARG_BUILD_EXTRA_ARGS="" just _build-only
