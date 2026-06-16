@@ -15,7 +15,6 @@
 #
 # Note: Uses TensorRT-LLM's SaveHiddenStates speculative mode; the TorchSpec
 # patch redirects captured aux + final hidden states to Mooncake.
-# Single-node tensor parallelism only.
 
 model:
   target_model_path: Qwen/Qwen3-8B
