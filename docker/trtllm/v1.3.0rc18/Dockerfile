@@ -9,19 +9,21 @@ RUN apt-get update && \
 
 # Patch the installed tensorrt_llm package so SaveHiddenStates mode streams
 # captured hidden states to Mooncake instead of writing .pt files to disk.
-# Resolve the site-packages dir dynamically (so this is independent of the
-# image's Python version) and apply with -p1 to strip the diff's a/ prefix.
+# tensorrt_llm lives in dist-packages (python 3.12 in this release image, same
+# location the vLLM image uses). Do NOT import tensorrt_llm at build time — its
+# package init loads libcuda.so.1, which is absent until container runtime.
+# Apply with -p1 to strip the diff's a/ prefix.
 COPY patches/trtllm/v1.3.0rc18/*.patch /tmp/patches/
-RUN TRTLLM_SITE_PACKAGES=$(python3 -c "import os, tensorrt_llm; print(os.path.dirname(os.path.dirname(tensorrt_llm.__file__)))") && \
-    cd "$TRTLLM_SITE_PACKAGES" && \
+RUN cd /usr/local/lib/python3.12/dist-packages && \
     for p in /tmp/patches/*.patch; do patch -p1 < "$p"; done && \
     rm -rf /tmp/patches
 
-# Fail the build early if the patch did not land where we expect.
-RUN python3 -c "import inspect, tensorrt_llm._torch.speculative.save_hidden_state as m; \
-    src = inspect.getsource(m); \
-    assert 'TORCHSPEC_TRTLLM_MOONCAKE' in src and '_process_and_store_mooncake' in src, \
-    'TorchSpec Mooncake patch was not applied to save_hidden_state.py'"
+# Fail the build early if the patch did not land. Grep the file directly
+# (import-free, since build-time has no CUDA driver).
+RUN F=/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/speculative/save_hidden_state.py && \
+    grep -q "TORCHSPEC_TRTLLM_MOONCAKE" "$F" && \
+    grep -q "_process_and_store_mooncake" "$F" || \
+    { echo "ERROR: TorchSpec Mooncake patch was not applied to $F"; exit 1; }
 
 COPY . /root/torchspec
 RUN cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"
