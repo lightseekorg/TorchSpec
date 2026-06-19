@@ -351,9 +351,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
             raise ValueError("Exactly one of input_ids_ref or formatted_prompts must be set")
 
         if multimodal_inputs is not None and any(m for m in multimodal_inputs):
-            raise NotImplementedError(
-                "TrtllmEngine does not support multimodal inputs yet."
-            )
+            raise NotImplementedError("TrtllmEngine does not support multimodal inputs yet.")
 
         use_prompts = formatted_prompts is not None
         if use_prompts:
