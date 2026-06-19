@@ -277,10 +277,19 @@ class TrtllmEngine(InferenceEngine, RayActor):
                 extra = {k: v for k, v in extra.items() if k not in _PROTECTED_ENGINE_KEYS}
             engine_kwargs.update(extra)
 
+        # Block reuse must be OFF for hidden-state capture: when two prompts
+        # share a prefix, TRT-LLM reuses the cached KV blocks and only runs a
+        # forward pass over the new suffix tokens, so SaveHiddenStates captures
+        # hidden states for fewer tokens than the prompt length. The trainer
+        # then sees a shape mismatch (engine reports full seq_len, store holds
+        # only the recomputed tokens). Disabling reuse forces a full prefill.
+        kv_cache_kwargs: dict[str, Any] = {
+            "enable_block_reuse": False,
+            "enable_partial_reuse": False,
+        }
         if mem_fraction is not None:
-            engine_kwargs["kv_cache_config"] = KvCacheConfig(
-                free_gpu_memory_fraction=mem_fraction
-            )
+            kv_cache_kwargs["free_gpu_memory_fraction"] = mem_fraction
+        engine_kwargs["kv_cache_config"] = KvCacheConfig(**kv_cache_kwargs)
 
         max_seq_length = getattr(self.args, "max_seq_length", None)
         if max_seq_length:
