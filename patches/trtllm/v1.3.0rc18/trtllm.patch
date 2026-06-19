@@ -1,5 +1,5 @@
 diff --git a/tensorrt_llm/_torch/speculative/save_hidden_state.py b/tensorrt_llm/_torch/speculative/save_hidden_state.py
-index 05cf2610..b8e8145a 100644
+index 05cf261..f20431a 100644
 --- a/tensorrt_llm/_torch/speculative/save_hidden_state.py
 +++ b/tensorrt_llm/_torch/speculative/save_hidden_state.py
 @@ -1,10 +1,12 @@
@@ -66,7 +66,7 @@ index 05cf2610..b8e8145a 100644
          for request in sorted(
                  scheduled_requests.context_requests,
                  key=lambda r:
-@@ -83,6 +113,97 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
+@@ -83,6 +113,107 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
                  self._write_to_file()
              self._iter += 1
  
@@ -144,7 +144,17 @@ index 05cf2610..b8e8145a 100644
 +                                     dtype=torch.long,
 +                                     device=buf.device)
 +
-+            key = _sanitize_mooncake_key(str(request.py_request_id))
++            # Key on the CLIENT id, not the backend py_request_id. The TorchSpec
++            # engine reconstructs keys from RequestOutput.request_id, which TRT-LLM
++            # sets to GenerationRequest.id == the client_id assigned by the proxy
++            # (_get_next_client_id). The backend py_request_id is a separate
++            # counter (see _client_id_to_request_id in base_worker) bumped by JIT
++            # warmup and internal requests, so keying on it produces a systematic
++            # offset and crossed keys. py_client_id mirrors the client id here.
++            client_key_id = getattr(request, "py_client_id", None)
++            if client_key_id is None:
++                client_key_id = request.py_request_id
++            key = _sanitize_mooncake_key(str(client_key_id))
 +            try:
 +                store.put(
 +                    key=key,
@@ -156,7 +166,7 @@ index 05cf2610..b8e8145a 100644
 +            except Exception:
 +                logger.error(
 +                    f"SaveHiddenStates: failed to store request "
-+                    f"{request.py_request_id} to Mooncake",
++                    f"{client_key_id} to Mooncake",
 +                    exc_info=True)
 +
 +        store.flush()
