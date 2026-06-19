@@ -59,7 +59,11 @@ inference:
     mem_fraction_static: 0.7
     extra_args:
       # Any extra TensorRT-LLM LLM kwarg; e.g. cap the per-iteration token budget.
-      max_num_tokens: 8192
+      # Must be >= training.max_seq_length: SaveHiddenStates runs each prompt in a
+      # single prefill (chunked prefill is disabled), so a prompt longer than
+      # max_num_tokens is rejected outright ("sum of prompt length ... should not
+      # exceed max_num_tokens") and that sample is dropped.
+      max_num_tokens: 16384
 
 mooncake:
   master_server_address: null
