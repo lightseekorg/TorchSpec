@@ -172,6 +172,7 @@ class AsyncInferenceManager:
 
         self._running = True
         self._pending_tasks: set[asyncio.Task] = set()
+        self._source_dry = False
 
         self._defer_tokenization = getattr(args, "defer_tokenization", False)
         self._return_hidden_states = getattr(args, "compute_logits_in_trainer", True)
@@ -302,6 +303,15 @@ class AsyncInferenceManager:
             task = asyncio.create_task(self._dispatch_batch(entries))
             self._pending_tasks.add(task)
 
+        if (
+            self._source_dry
+            and 0 < len(self._prompt_buffer) < self._batch_size
+            and len(self._pending_tasks) < self._engines.max_concurrent
+        ):
+            await self._await_pool_capacity()
+            entries = self._take_batch(self._batch_size)
+            self._pending_tasks.add(asyncio.create_task(self._dispatch_batch(entries)))
+
     async def _collect_completed(self) -> None:
         """Wait for at least one dispatch to finish and forward results."""
         done, self._pending_tasks = await asyncio.wait(
@@ -350,7 +360,10 @@ class AsyncInferenceManager:
         entries = await self.controller.get_prompts.remote(fetch_size)
         if entries:
             self._prompt_buffer.extend(entries)
+            self._source_dry = False
             logger.debug(f"Fetched {len(entries)} prompts, buffer_size={len(self._prompt_buffer)}")
+        else:
+            self._source_dry = True
 
     def _take_batch(self, n: int) -> list[InferenceInput]:
         """Pop up to n entries from internal buffer."""
