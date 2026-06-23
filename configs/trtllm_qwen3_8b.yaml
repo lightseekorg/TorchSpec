@@ -10,8 +10,8 @@
 #   which ships tensorrt_llm patched for Mooncake hidden-state capture.
 #   For a local install: pip install -e ".[trtllm]"
 #
-# Usage:
-#   python -m torchspec.train_entry --config configs/trtllm_qwen3_8b.yaml
+# Usage (same launcher as the sglang example, for a fair side-by-side):
+#   ./examples/qwen3-8b-single-node/run.sh configs/trtllm_qwen3_8b.yaml
 #
 # Note: Uses TensorRT-LLM's SaveHiddenStates speculative mode; the TorchSpec
 # patch redirects captured aux + final hidden states to Mooncake.
@@ -22,8 +22,6 @@ model:
 
 dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl
-  eval_data_path: ../examples/data/eval_conversations.jsonl
-  eval_interval: 100
   chat_template: qwen
   prompt_key: conversations
 
@@ -45,14 +43,14 @@ training:
 
 inference:
   inference_engine_type: trtllm
-  inference_num_gpus: 2
-  inference_num_gpus_per_engine: 2
-  inference_num_gpus_per_node: 4
-  max_sample_pool_size: 64
-  inference_buffer_threshold: 32
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 1
+  max_sample_pool_size: 64       # Max samples in controller pool
+  inference_buffer_threshold: 32     # Fetch prompts when buffer < threshold
   inference_batch_size: 8
   trtllm:
-    tp_size: 2
+    tp_size: 1
     # KV-cache memory fraction. Kept below TRT-LLM's 0.9 default to leave room
     # for the SaveHiddenStates capture buffer, which the KV profiler does not
     # account for.
@@ -69,11 +67,11 @@ mooncake:
   master_server_address: null
   metadata_server: null
   protocol: tcp
-  global_segment_size: 32GB
+  global_segment_size: 16GB
   local_buffer_size: 4GB
 
 output_dir: ./outputs/qwen3-8b-single-node
-cache_dir: ./cache
+cache_dir: ./cache/qwen3-8b-single-node
 model_download_dir: null
 
 debug:
