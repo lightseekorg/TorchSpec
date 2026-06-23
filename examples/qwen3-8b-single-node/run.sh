@@ -37,6 +37,15 @@ else
     CONFIG_FILE="$ROOT_DIR/configs/sglang_qwen3_8b.yaml"
 fi
 
+# Per-backend tp_size override key, derived from the config's engine type.
+# engine_type "sgl" lives under the "sglang" config block; vllm/trtllm match 1:1.
+# This lets run.sh launch any backend with the same 2-GPU/tp=2 inference layout.
+ENGINE_TYPE=$(grep -oE "inference_engine_type:[[:space:]]*[a-zA-Z]+" "$CONFIG_FILE" | awk '{print $2}')
+case "$ENGINE_TYPE" in
+    sgl) TP_BLOCK=sglang ;;
+    *)   TP_BLOCK="${ENGINE_TYPE:-sglang}" ;;
+esac
+
 IFS=',' read -ra GPU_ARRAY <<< "$CUDA_VISIBLE_DEVICES"
 TOTAL_GPUS=${#GPU_ARRAY[@]}
 
@@ -56,14 +65,13 @@ echo "Local IP: $LOCAL_IP"
 echo "Extra args: $*"
 echo "=============================================="
 
-# TODO: unify tp_size config across sglang/vllm backends
 python3 -m torchspec.train_entry \
     --config "$CONFIG_FILE" \
     training.training_num_gpus_per_node="$TRAIN_GPUS" \
     inference.inference_num_gpus="$INFERENCE_GPUS" \
     inference.inference_num_gpus_per_engine=2 \
     inference.inference_num_gpus_per_node="$TOTAL_GPUS" \
-    inference.sglang.tp_size=2 \
+    inference.${TP_BLOCK}.tp_size=2 \
     "$@"
 
 echo "=============================================="
