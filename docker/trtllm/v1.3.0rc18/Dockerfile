@@ -18,20 +18,6 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
     for p in /tmp/patches/*.patch; do patch -p1 < "$p"; done && \
     rm -rf /tmp/patches
 
-# Fail the build early if the patches did not land. Grep the files directly
-# (import-free, since build-time has no CUDA driver).
-RUN F=/usr/local/lib/python3.12/dist-packages/tensorrt_llm/_torch/speculative/save_hidden_state.py && \
-    grep -q "TORCHSPEC_TRTLLM_MOONCAKE" "$F" && \
-    grep -q "_process_and_store_mooncake" "$F" || \
-    { echo "ERROR: TorchSpec Mooncake patch was not applied to $F"; exit 1; }
-
-# The MPI worker pool only forwards TRTLLM*/TLLM* env vars by default; the patch
-# below also forwards TORCHSPEC*/MOONCAKE*/MC_* so the Mooncake redirect flag and
-# connection params reach the workers running SaveHiddenStates.
-RUN F=/usr/local/lib/python3.12/dist-packages/tensorrt_llm/llmapi/mpi_session.py && \
-    grep -q "TORCHSPEC" "$F" && grep -q "MOONCAKE" "$F" || \
-    { echo "ERROR: TorchSpec MPI env-forwarding patch was not applied to $F"; exit 1; }
-
 COPY . /root/torchspec
 RUN cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"
 

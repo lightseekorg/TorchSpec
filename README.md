@@ -113,7 +113,7 @@ pip install -e ".[fa]"
 **vLLM**
 
 ```bash
-./examples/qwen3-8b-single-node/run.sh --config configs/vllm_qwen3_8b.yaml
+./examples/qwen3-8b-single-node/run.sh configs/vllm_qwen3_8b.yaml
 ```
 
 **SGLang**
@@ -127,7 +127,7 @@ pip install -e ".[fa]"
 Run inside the TensorRT-LLM image (`docker/trtllm/v1.3.0rc18/Dockerfile`), which ships `tensorrt_llm` pre-patched for Mooncake hidden-state capture:
 
 ```bash
-./examples/qwen3-8b-single-node/run.sh --config configs/trtllm_qwen3_8b.yaml
+./examples/qwen3-8b-single-node/run.sh configs/trtllm_qwen3_8b.yaml
 ```
 
 Single-node tensor parallelism only for now (multi-node TP is not yet wired up).
