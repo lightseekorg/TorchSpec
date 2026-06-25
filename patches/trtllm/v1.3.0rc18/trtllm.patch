@@ -66,7 +66,7 @@ index 05cf261..f20431a 100644
          for request in sorted(
                  scheduled_requests.context_requests,
                  key=lambda r:
-@@ -83,6 +113,107 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
+@@ -83,6 +113,94 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
                  self._write_to_file()
              self._iter += 1
  
@@ -106,17 +106,8 @@ index 05cf261..f20431a 100644
 +    def _process_and_store_mooncake(
 +            self, scheduled_requests: ScheduledRequests,
 +            spec_metadata: "SaveHiddenStatesSpecMetadata") -> None:
-+        """Stream per-request hidden states to Mooncake instead of disk.
-+
-+        The capture buffer holds every context token of this forward packed
-+        from offset 0 in scheduled order, so we walk the requests in the same
-+        order and slice ``[token_offset : token_offset + num_tokens]`` for
-+        each. (Upstream's disk path assumes a single request and always reads
-+        from offset 0 — incorrect for the batched prefill TorchSpec runs.)
-+
-+        NOTE: assumes the forward packs context-request tokens in the same
-+        order as this sort (by ``py_batch_idx``). Validate against real
-+        batched runs during engine bring-up.
++        """Walk context_requests in native order -- how the forward packed the
++        buffer. Sorting by py_batch_idx (= py_seq_slot) would misalign slices.
 +        """
 +        if local_mpi_rank() != 0:
 +            return
@@ -125,11 +116,7 @@ index 05cf261..f20431a 100644
 +            return
 +
 +        token_offset = 0
-+        for request in sorted(
-+                scheduled_requests.context_requests,
-+                key=lambda r:
-+            (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
-+        ):
++        for request in scheduled_requests.context_requests:
 +            token_ids = list(request.get_tokens(0))
 +            num_tokens = len(token_ids)
 +            buf = self.hidden_states[token_offset:token_offset + num_tokens]
