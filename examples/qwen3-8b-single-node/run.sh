@@ -38,7 +38,8 @@ else
 fi
 
 # Derive the tp_size override block from the config's engine type ("sgl" -> "sglang").
-ENGINE_TYPE=$(grep -oE "inference_engine_type:[[:space:]]*[a-zA-Z]+" "$CONFIG_FILE" | awk '{print $2}')
+# `|| true` so a config without a literal inference_engine_type line falls back below instead of tripping set -e.
+ENGINE_TYPE=$(grep -oE "inference_engine_type:[[:space:]]*[a-zA-Z]+" "$CONFIG_FILE" | awk '{print $2}' || true)
 case "$ENGINE_TYPE" in
     sgl) TP_BLOCK=sglang ;;
     *)   TP_BLOCK="${ENGINE_TYPE:-sglang}" ;;
