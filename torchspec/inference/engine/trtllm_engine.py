@@ -47,8 +47,6 @@ from typing import Any
 import ray
 import torch
 from omegaconf import DictConfig, OmegaConf
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig, SaveHiddenStatesDecodingConfig
 
 from torchspec.inference.engine.base import InferenceEngine
 from torchspec.ray.ray_actor import RayActor
@@ -243,6 +241,12 @@ class TrtllmEngine(InferenceEngine, RayActor):
 
     def _init_engine(self, tp_size: int, mem_fraction: float | None) -> None:
         """Construct the TRT-LLM PyTorch ``LLM`` in SaveHiddenStates mode."""
+        # Imported here (not at module scope) so that importing this module
+        # without a CUDA driver -- e.g. on an HF/vLLM/SGLang-only host -- does
+        # not trigger tensorrt_llm's libcuda load and break the engine package.
+        from tensorrt_llm import LLM
+        from tensorrt_llm.llmapi import KvCacheConfig, SaveHiddenStatesDecodingConfig
+
         # Pin TRT-LLM's MPI workers to the assigned physical GPUs. Workers map
         # their local rank onto the visible devices, so without this they would
         # collide on devices 0..tp_size-1.
@@ -393,6 +397,8 @@ class TrtllmEngine(InferenceEngine, RayActor):
 
         # Prefill-only: SaveHiddenStates forces max_new_tokens=1 internally, but
         # we set it here too to avoid allocating decode resources.
+        from tensorrt_llm import SamplingParams
+
         sampling_params = SamplingParams(max_tokens=1)
 
         outputs = self._engine.generate(inputs, sampling_params, use_tqdm=False)
