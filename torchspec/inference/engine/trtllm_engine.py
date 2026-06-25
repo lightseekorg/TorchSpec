@@ -146,6 +146,11 @@ class TrtllmEngine(InferenceEngine, RayActor):
             )
 
         self._store_last_hidden_states = getattr(self.args, "store_last_hidden_states", True)
+        # Tell the patched resource manager whether to store last_hidden_states.
+        # Set before LLM construction so it propagates to the spawned MPI workers.
+        os.environ["TORCHSPEC_TRTLLM_STORE_LAST_HIDDEN"] = (
+            "1" if self._store_last_hidden_states else "0"
+        )
         self._mooncake_config = mooncake_config
         self._setup_mooncake_env(mooncake_config)
 
