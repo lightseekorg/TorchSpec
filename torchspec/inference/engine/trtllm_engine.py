@@ -63,6 +63,7 @@ _PROTECTED_ENGINE_KEYS = frozenset(
         "backend",
         "tensor_parallel_size",
         "pipeline_parallel_size",
+        "trust_remote_code",
         "speculative_config",
         "kv_cache_config",
         "disable_overlap_scheduler",
