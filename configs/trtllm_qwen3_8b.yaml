@@ -22,6 +22,8 @@ model:
 
 dataset:
   train_data_path: ../examples/data/sample_conversations.jsonl
+  # eval_data_path: ../examples/data/eval_conversations.jsonl
+  # eval_interval: 100
   chat_template: qwen
   prompt_key: conversations
 
@@ -59,10 +61,7 @@ inference:
     mem_fraction_static: 0.7
     extra_args:
       # Any extra TensorRT-LLM LLM kwarg; e.g. cap the per-iteration token budget.
-      # Must be >= training.max_seq_length: SaveHiddenStates runs each prompt in a
-      # single prefill (chunked prefill is disabled), so a prompt longer than
-      # max_num_tokens is rejected outright ("sum of prompt length ... should not
-      # exceed max_num_tokens") and that sample is dropped.
+      # Must be >= training.max_seq_length: chunked prefill is off, so prompts longer than max_num_tokens are dropped.
       max_num_tokens: 16384
 
 mooncake:

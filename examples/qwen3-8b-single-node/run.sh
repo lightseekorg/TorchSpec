@@ -37,9 +37,7 @@ else
     CONFIG_FILE="$ROOT_DIR/configs/sglang_qwen3_8b.yaml"
 fi
 
-# Per-backend tp_size override key, derived from the config's engine type.
-# engine_type "sgl" lives under the "sglang" config block; vllm/trtllm match 1:1.
-# This lets run.sh launch any backend with the same 2-GPU/tp=2 inference layout.
+# Derive the tp_size override block from the config's engine type ("sgl" -> "sglang").
 ENGINE_TYPE=$(grep -oE "inference_engine_type:[[:space:]]*[a-zA-Z]+" "$CONFIG_FILE" | awk '{print $2}')
 case "$ENGINE_TYPE" in
     sgl) TP_BLOCK=sglang ;;

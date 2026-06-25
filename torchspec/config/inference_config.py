@@ -126,7 +126,6 @@ class TrtllmConfig:
     # KV-cache memory fraction (TRT-LLM's KvCacheConfig.free_gpu_memory_fraction).
     mem_fraction_static: Optional[float] = 0.8
 
-    # TRT-LLM model build + load can be slow; give init a generous timeout.
     init_timeout: int = 600
 
     # Passthrough: forwarded as-is to the TRT-LLM LLM constructor
