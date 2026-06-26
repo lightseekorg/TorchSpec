@@ -471,12 +471,9 @@ def _prepare_trtllm_engines(
     TrtllmRayActor = ray.remote(TrtllmEngine)
     env_vars = get_torchspec_env_vars()
 
-    # Single-GPU engines use Ray's per-actor CVD scoping (Approach 1): drop the
-    # NOSET override and reserve a whole GPU, so Ray exposes exactly that GPU as
-    # cuda:0 to the engine and its MPI worker -- N such engines each land on
-    # their own GPU. Multi-GPU (TP) engines keep NOSET + the engine's manual
-    # contiguous-block pin and only a placeholder reservation (workers grab the
-    # real GPUs, untracked by Ray).
+    # TRT-LLM's MPI workers bind GPUs themselves, so assignment differs by TP degree:
+    # tp==1 drops NOSET and reserves a whole GPU so Ray scopes it as cuda:0 per engine;
+    # tp>1 keeps NOSET, pins a contiguous block in init(), and reserves a 0.2 placeholder.
     single_gpu = gpus_per_engine == 1
     if single_gpu:
         env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)

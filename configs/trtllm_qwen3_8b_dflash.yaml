@@ -3,9 +3,6 @@
 # Mirrors configs/sglang_qwen3_8b_dflash.yaml; only the inference backend differs
 # (engine type, the trtllm block, and placement_strategy).
 #
-# NOTE: DFlash is currently gated to inference_engine_type='sgl' in
-# train_entry.py; running this requires relaxing that guard to allow 'trtllm'.
-#
 # GPU allocation: mirrors the sglang DFlash layout (4 inference tp=1 + 4 training);
 # adjust inference_num_gpus / training_num_gpus_per_node / tp_size to your budget.
 #

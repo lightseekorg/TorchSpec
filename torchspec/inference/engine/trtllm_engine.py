@@ -261,9 +261,6 @@ class TrtllmEngine(InferenceEngine, RayActor):
         from tensorrt_llm import LLM
         from tensorrt_llm.llmapi import KvCacheConfig, SaveHiddenStatesDecodingConfig
 
-        # CUDA_VISIBLE_DEVICES is already scoped to this engine's GPUs in init(),
-        # before any CUDA/TRT init -- see the comment there.
-
         # eagle3_layers_to_capture: aux layers + the final post-norm state (-1).
         # The resource manager orders -1 last in the capture buffer, which is the
         # split point the patch relies on (aux = [:, :-H], last = [:, -H:]).
