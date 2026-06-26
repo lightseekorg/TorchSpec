@@ -255,9 +255,9 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         return
 
     engine_type = getattr(args, "inference_engine_type", "hf")
-    if engine_type not in ("vllm", "sgl"):
+    if engine_type not in ("vllm", "sgl", "trtllm"):
         raise NotImplementedError(
-            f"DFlash supports inference_engine_type in ('vllm', 'sgl'), got '{engine_type}'."
+            f"DFlash supports inference_engine_type in ('vllm', 'sgl', 'trtllm'), got '{engine_type}'."
         )
     if getattr(args, "defer_tokenization", False):
         raise NotImplementedError("DFlash does not support defer_tokenization=True.")

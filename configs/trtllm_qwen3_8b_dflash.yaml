@@ -1,0 +1,96 @@
+# DFlash training config for Qwen3-8B target model — TensorRT-LLM inference backend.
+#
+# Mirrors configs/sglang_qwen3_8b_dflash.yaml; only the inference backend differs
+# (engine type, the trtllm block, and placement_strategy).
+#
+# NOTE: DFlash is currently gated to inference_engine_type='sgl' in
+# train_entry.py; running this requires relaxing that guard to allow 'trtllm'.
+#
+# GPU allocation: mirrors the sglang DFlash layout (4 inference tp=1 + 4 training);
+# adjust inference_num_gpus / training_num_gpus_per_node / tp_size to your budget.
+#
+# Usage:
+#   ./examples/qwen3-8b-single-node/run.sh configs/trtllm_qwen3_8b_dflash.yaml
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: torchspec/config/dflash_draft_config.json
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+  min_loss_tokens: 32
+
+training:
+  attention_backend: flex_attention
+  # TRT tp-workers bind GPU 0..tp-1; keep inference on those to avoid OOM with training.
+  placement_strategy: inference_first
+  micro_batch_size: 1
+  draft_accumulation_steps: 2       # was 4 → 2x more optimizer steps
+  learning_rate: 6e-4
+  min_lr: 6e-5                      # 10% of peak — prevents LR death in later epochs
+  weight_decay: 0.01                # AdamW regularization for better generalization
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 2048
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 4
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 2
+  warmup_ratio: 0.04
+
+  # DFlash-specific parameters
+  dflash_block_size: 16
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 5
+
+inference:
+  inference_engine_type: trtllm
+  store_last_hidden_states: false
+  inference_num_gpus: 4
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 4
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  trtllm:
+    tp_size: 1
+    # KV-cache memory fraction. Kept below TRT-LLM's 0.9 default to leave room
+    # for the SaveHiddenStates capture buffer, which the KV profiler does not
+    # account for.
+    mem_fraction_static: 0.7
+    extra_args:
+      # Must be >= training.max_seq_length: chunked prefill is off, so prompts longer than max_num_tokens are dropped.
+      max_num_tokens: 2048
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  # Hard-pin: master-side TTL is disabled; we rely on our explicit
+  # batch_remove(force=True) (see mooncake/eagle_store.py). Requires
+  # mooncake-transfer-engine >= 0.3.10.post1.
+  enable_hard_pin: true
+
+output_dir: ./outputs/qwen3-8b-dflash
+cache_dir: ./cache/qwen3-8b-dflash
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false
