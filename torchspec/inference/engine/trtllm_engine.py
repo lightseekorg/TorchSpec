@@ -136,11 +136,20 @@ class TrtllmEngine(InferenceEngine, RayActor):
         pp_size = getattr(self.args, "trtllm_pp_size", 1)
         assert pp_size == 1, f"trtllm_pp_size must be 1, got {pp_size}"
 
+        # GPU pinning, before any CUDA/tensorrt_llm init (TRT reads CVD at import
+        # and picks the device by MPI rank). tp=1: the factory drops the NOSET
+        # override so Ray scopes CVD to this actor's single GPU -- don't override
+        # it. tp>1: keep all GPUs visible and pin the contiguous block ourselves.
         if self.base_gpu_id is not None:
-            self.local_gpu_id = self.setup_gpu(self.base_gpu_id)
+            if self.num_gpus_per_engine > 1:
+                gpu_ids = [str(self.base_gpu_id + i) for i in range(self.num_gpus_per_engine)]
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+            self.local_gpu_id = 0
+            torch.cuda.set_device(self.local_gpu_id)
+            os.environ["LOCAL_RANK"] = "0"
             logger.info(
                 f"TrtllmEngine rank {self.rank}: base_gpu_id={self.base_gpu_id}, "
-                f"using local GPU {self.local_gpu_id}"
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
             )
 
         self._store_last_hidden_states = getattr(self.args, "store_last_hidden_states", True)
@@ -149,6 +158,11 @@ class TrtllmEngine(InferenceEngine, RayActor):
         os.environ["TORCHSPEC_TRTLLM_STORE_LAST_HIDDEN"] = (
             "1" if self._store_last_hidden_states else "0"
         )
+        # Per-engine Mooncake key prefix: each data-parallel engine has its own
+        # LLM request_id counter, so without a prefix they collide in the shared
+        # store. Set before LLM build so the MPI worker (the patch) inherits it.
+        self._key_prefix = f"e{self.rank}_"
+        os.environ["TORCHSPEC_TRTLLM_KEY_PREFIX"] = self._key_prefix
         self._mooncake_config = mooncake_config
         self._setup_mooncake_env(mooncake_config)
 
@@ -247,16 +261,8 @@ class TrtllmEngine(InferenceEngine, RayActor):
         from tensorrt_llm import LLM
         from tensorrt_llm.llmapi import KvCacheConfig, SaveHiddenStatesDecodingConfig
 
-        # Pin TRT-LLM's MPI workers to the assigned physical GPUs. Workers map
-        # their local rank onto the visible devices, so without this they would
-        # collide on devices 0..tp_size-1.
-        if self.base_gpu_id is not None:
-            gpu_ids = [str(self.base_gpu_id + i) for i in range(self.num_gpus_per_engine)]
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
-            logger.info(
-                f"TrtllmEngine rank {self.rank}: set "
-                f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
-            )
+        # CUDA_VISIBLE_DEVICES is already scoped to this engine's GPUs in init(),
+        # before any CUDA/TRT init -- see the comment there.
 
         # eagle3_layers_to_capture: aux layers + the final post-norm state (-1).
         # The resource manager orders -1 last in the capture buffer, which is the
@@ -407,7 +413,7 @@ class TrtllmEngine(InferenceEngine, RayActor):
         for i, output in enumerate(outputs):
             did = data_ids[i]
             seq_len = len(output.prompt_token_ids)
-            mooncake_key = _sanitize_mooncake_key(str(output.request_id))
+            mooncake_key = _sanitize_mooncake_key(f"{self._key_prefix}{output.request_id}")
 
             result: dict[str, Any] = {
                 "mooncake_key": mooncake_key,

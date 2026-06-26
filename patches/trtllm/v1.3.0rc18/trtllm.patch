@@ -66,7 +66,7 @@ index 05cf261..f20431a 100644
          for request in sorted(
                  scheduled_requests.context_requests,
                  key=lambda r:
-@@ -83,6 +113,95 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
+@@ -83,6 +113,96 @@ class SaveHiddenStatesResourceManager(BaseResourceManager):
                  self._write_to_file()
              self._iter += 1
  
@@ -116,6 +116,7 @@ index 05cf261..f20431a 100644
 +            return
 +
 +        store_last = os.environ.get("TORCHSPEC_TRTLLM_STORE_LAST_HIDDEN", "1") != "0"
++        key_prefix = os.environ.get("TORCHSPEC_TRTLLM_KEY_PREFIX", "")
 +        token_offset = 0
 +        for request in scheduled_requests.context_requests:
 +            token_ids = list(request.get_tokens(0))
@@ -142,7 +143,7 @@ index 05cf261..f20431a 100644
 +            client_key_id = getattr(request, "py_client_id", None)
 +            if client_key_id is None:
 +                client_key_id = request.py_request_id
-+            key = _sanitize_mooncake_key(str(client_key_id))
++            key = _sanitize_mooncake_key(f"{key_prefix}{client_key_id}")
 +            try:
 +                store.put(
 +                    key=key,
@@ -171,7 +172,7 @@ index 2e1eeb2..7d1bca8 100644
              for key, value in os.environ.items()
              if key.startswith("TRTLLM") or key.startswith("TLLM")
 +            or key.startswith("TORCHSPEC") or key.startswith("MOONCAKE")
-+            or key.startswith("MC_")
++            or key.startswith("MC_") or key == "CUDA_VISIBLE_DEVICES"
          }
          self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                          path=sys.path,
