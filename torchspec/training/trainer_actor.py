@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
+from torchspec.models.draft.dspark import DSparkConfig
 from torchspec.ray.ray_actor import RayActor
 from torchspec.training.eagle3_trainer import Eagle3Trainer
 from torchspec.utils.distributed import init_gloo_group, init_usp_groups
@@ -75,8 +76,13 @@ class TrainerActor(RayActor):
         if draft_model_config is None and getattr(args, "draft_model_config", None):
             draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-        # Config-based trainer dispatch: DFlashConfig → DFlashTrainer, else Eagle3
-        if isinstance(draft_model_config, DFlashConfig):
+        # Config-based trainer dispatch: DSparkConfig → DSparkTrainer,
+        # DFlashConfig → DFlashTrainer, else Eagle3.
+        if isinstance(draft_model_config, DSparkConfig):
+            from torchspec.training.dspark_trainer import DSparkTrainer
+
+            self._trainer = DSparkTrainer(args)
+        elif isinstance(draft_model_config, DFlashConfig):
             from torchspec.training.dflash_trainer import DFlashTrainer
 
             self._trainer = DFlashTrainer(args)
