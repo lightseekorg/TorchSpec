@@ -154,6 +154,18 @@ class TrainingConfig:
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
 
+    # DSpark-specific parameters (ignored for Eagle3 / DFlash training).
+    # Model-structure knobs (block_size, num_anchors, markov/confidence heads,
+    # target_layer_ids) live in the DSpark draft-config JSON; these are the loss
+    # hyperparameters and the aux-layer count used by the DSpark trainer.
+    dspark_block_size: int = 7
+    dspark_num_anchors: int = 512
+    dspark_num_target_layers: int = 5
+    dspark_loss_decay_gamma: float = 4.0
+    dspark_ce_loss_alpha: float = 0.1
+    dspark_l1_loss_alpha: float = 0.9
+    dspark_confidence_head_alpha: float = 1.0
+
 
 @dataclass
 class DecodeConfig:

@@ -282,6 +282,56 @@ def _validate_and_configure_dflash(args, draft_model_config) -> None:
         logger.info(f"DFlash: set aux_hidden_states_layers = {target_layer_ids}")
 
 
+def _validate_and_configure_dspark(args, draft_model_config) -> None:
+    """Validate DSpark-specific config and auto-set aux layer IDs.
+
+    DSpark needs the target's last hidden states (for the L1 + confidence
+    objectives), so ``store_last_hidden_states`` is forced on. Called before
+    dataset loading to fail fast on misconfigurations.
+    """
+    from torchspec.models.draft.dspark import DSparkConfig
+
+    if not isinstance(draft_model_config, DSparkConfig):
+        return
+
+    engine_type = getattr(args, "inference_engine_type", "hf")
+    if engine_type not in ("vllm", "sgl"):
+        raise NotImplementedError(
+            f"DSpark supports inference_engine_type in ('vllm', 'sgl'), got '{engine_type}'."
+        )
+    if getattr(args, "defer_tokenization", False):
+        raise NotImplementedError("DSpark does not support defer_tokenization=True.")
+
+    # DSpark's L1 / confidence objectives consume the target's last hidden state.
+    l1_alpha = getattr(args, "dspark_l1_loss_alpha", 0.9)
+    conf_alpha = getattr(args, "dspark_confidence_head_alpha", 1.0)
+    if l1_alpha > 0 or conf_alpha > 0:
+        if not getattr(args, "store_last_hidden_states", True):
+            logger.info("DSpark: forcing store_last_hidden_states=True (needed for L1/confidence).")
+        args.store_last_hidden_states = True
+    if conf_alpha > 0 and not bool(getattr(draft_model_config, "enable_confidence_head", False)):
+        raise ValueError(
+            "DSpark: dspark_confidence_head_alpha > 0 requires the draft config to set "
+            "enable_confidence_head=true (so the confidence head module exists)."
+        )
+
+    block_size = int(getattr(draft_model_config, "block_size", 7))
+    min_loss = getattr(args, "min_loss_tokens", 0)
+    if min_loss < block_size + 1:
+        raise ValueError(
+            f"DSpark requires dataset.min_loss_tokens >= block_size + 1 "
+            f"({min_loss} < {block_size + 1}). Set dataset.min_loss_tokens={block_size + 1}."
+        )
+
+    # Auto-set aux layer IDs from the draft config's target_layer_ids.
+    if not getattr(args, "aux_hidden_states_layers", None):
+        target_layer_ids = getattr(draft_model_config, "target_layer_ids", None)
+        if target_layer_ids is None:
+            raise ValueError("DSpark draft config must provide target_layer_ids.")
+        args.aux_hidden_states_layers = list(target_layer_ids)
+        logger.info(f"DSpark: set aux_hidden_states_layers = {target_layer_ids}")
+
+
 def train_async_no_generation(args):
     """Entry point for Eagle3 online training.
 
@@ -312,6 +362,7 @@ def train_async_no_generation(args):
         args.draft_model_config_obj = draft_model_config
 
         _validate_and_configure_dflash(args, draft_model_config)
+        _validate_and_configure_dspark(args, draft_model_config)
 
     # [2] Kick off dataset loading on controller (async — runs on actor while driver continues)
     timer.begin_async("Dataset loading")
