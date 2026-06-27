@@ -8,7 +8,6 @@
 # Installation:
 #   Use the TensorRT-LLM docker image (docker/trtllm/v1.3.0rc18/Dockerfile),
 #   which ships tensorrt_llm patched for Mooncake hidden-state capture.
-#   For a local install: pip install -e ".[trtllm]"
 #
 # Usage (same launcher as the sglang example, for a fair side-by-side):
 #   ./examples/qwen3-8b-single-node/run.sh configs/trtllm_qwen3_8b.yaml
