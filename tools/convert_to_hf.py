@@ -484,6 +484,28 @@ def _convert_fsdp_to_hf(
     config = AutoDraftModelConfig.from_file(config_path)
     hf_model = AutoEagle3DraftModel.from_config(config)
 
+    # DSpark heads (Markov / confidence) live under draft_model.* and are extracted above.
+    # If the checkpoint carries them but the draft config does not enable them, the model
+    # built from config lacks those modules and load_state_dict(strict=False) would drop
+    # them silently. Fail loudly so the trained heads actually reach the serving engine.
+    if (
+        any(k.startswith("markov_head.") for k in model_state)
+        and int(getattr(config, "markov_rank", 0) or 0) <= 0
+    ):
+        raise ValueError(
+            "Checkpoint contains Markov head weights (markov_head.*) but the draft config "
+            "has markov_rank=0; the head would be silently dropped. Set markov_rank (and "
+            "markov_head_type) in the draft config to match the trained model."
+        )
+    if any(k.startswith("confidence_head.") for k in model_state) and not getattr(
+        config, "enable_confidence_head", False
+    ):
+        raise ValueError(
+            "Checkpoint contains confidence head weights (confidence_head.*) but the draft "
+            "config has enable_confidence_head=false; the head would be silently dropped. "
+            "Set enable_confidence_head=true in the draft config to match the trained model."
+        )
+
     ckpt_dtype = Counter(v.dtype for v in model_state.values()).most_common(1)[0][0]
     final_dtype = output_dtype or ckpt_dtype
     logger.info("Checkpoint dtype: %s, output dtype: %s", ckpt_dtype, final_dtype)

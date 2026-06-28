@@ -52,6 +52,9 @@ class DFlashTrainer(Trainer):
         self.loss_objective = getattr(args, "dflash_loss_objective", "decay")
         self.dpace_alpha = getattr(args, "dflash_dpace_alpha", 0.5)
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
+        self.dspark_ce_alpha = getattr(args, "dflash_dspark_ce_alpha", 0.1)
+        self.dspark_l1_alpha = getattr(args, "dflash_dspark_l1_alpha", 0.9)
+        self.dspark_confidence_alpha = getattr(args, "dflash_dspark_confidence_alpha", 1.0)
 
     def init_model(
         self,
@@ -128,6 +131,9 @@ class DFlashTrainer(Trainer):
             loss_objective=self.loss_objective,
             dpace_alpha=self.dpace_alpha,
             loss_decay_gamma=self.loss_decay_gamma,
+            dspark_ce_alpha=self.dspark_ce_alpha,
+            dspark_l1_alpha=self.dspark_l1_alpha,
+            dspark_confidence_alpha=self.dspark_confidence_alpha,
         )
 
         full_state = dflash_model.state_dict() if dist.get_rank() == 0 else {}
@@ -270,11 +276,26 @@ class DFlashTrainer(Trainer):
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
+        # DSpark objective needs the target's final pre-LM-head hidden state to build
+        # target distributions (TV/L1 + confidence BCE). It is already shipped via
+        # Mooncake under 'last_hidden_states'; only fetch/forward it when needed.
+        target_last_hidden_states = None
+        if self.loss_objective == "dspark":
+            tlhs = batch.get("last_hidden_states")
+            if tlhs is None:
+                raise ValueError(
+                    "loss_objective='dspark' requires 'last_hidden_states' in the batch, "
+                    "but none was found. Enable store_last_hidden_states on the inference "
+                    "engine (captured by default for HF/vLLM; set it explicitly for SGLang)."
+                )
+            target_last_hidden_states = tlhs.to(device, non_blocking=True)
+
         loss, accuracy, loss_per_position, acc_per_position, count_per_position = self.model(
             input_ids=input_ids,
             hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
             lm_head_weight=self.target_lm_head_weight,
+            target_last_hidden_states=target_last_hidden_states,
         )
 
         return loss, accuracy, loss_per_position, acc_per_position, count_per_position
@@ -438,7 +459,7 @@ class DFlashTrainer(Trainer):
         total_loss = self._backward(loss, accumulation_steps=accumulation_steps)
         evt_bwd_e.record()
 
-        return {
+        step_metrics = {
             "loss": loss.detach(),
             "accuracy": accuracy.detach(),
             "loss_per_position": loss_per_position.detach(),
@@ -448,6 +469,12 @@ class DFlashTrainer(Trainer):
             "_fwd_events": (evt_fwd_s, evt_fwd_e),
             "_bwd_events": (evt_bwd_s, evt_bwd_e),
         }
+        # Best-effort DSpark component losses (ce/l1/confidence) stashed by the forward.
+        dspark_components = getattr(self.dflash, "_dspark_components", None)
+        if dspark_components:
+            for name, value in dspark_components.items():
+                step_metrics[name] = value.detach() if torch.is_tensor(value) else value
+        return step_metrics
 
     def _aggregate_metrics(
         self, all_step_metrics: list[dict], step: int, *, grad_norm: torch.Tensor = None
@@ -492,6 +519,12 @@ class DFlashTrainer(Trainer):
         for i in range(pred_loss_pp.shape[0]):
             metrics[f"train/ploss_{i}"] = pred_loss_pp[i].item()
             metrics[f"train/acc_{i}"] = pred_acc_pp[i].item()
+
+        # DSpark objective component losses (only present when objective == "dspark").
+        for comp_key in ("dspark_ce", "dspark_l1", "dspark_conf"):
+            vals = [m[comp_key] for m in all_step_metrics if comp_key in m]
+            if vals:
+                metrics[f"train/{comp_key}"] = torch.stack([v.float() for v in vals]).mean().item()
 
         # Sub-timing breakdown (forward vs backward)
         fwd_ms = sum(

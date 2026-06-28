@@ -1,0 +1,94 @@
+# DSpark training config for Qwen3-8B target model
+#
+# Identical to configs/sglang_qwen3_8b_dflash.yaml except for the DSpark deltas, so the
+# two form a clean A/B (same data, schedule, block/anchor/target-layer setup, seed):
+#   - draft_model_config -> dspark_draft_config.json (adds markov_rank=256,
+#     markov_head_type=vanilla, enable_confidence_head=true)
+#   - training.dflash_loss_objective: dspark  (CE + TV/L1 + confidence BCE)
+#   - training.dflash_dspark_{ce,l1,confidence}_alpha
+#   - inference.store_last_hidden_states: true  (required: the dspark objective builds
+#     target distributions from the target's last hidden state)
+#
+# GPU allocation (8x GPU): 4 inference (SGLang, tp=1, duplicate) + 4 training (FSDP).
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/sglang_qwen3_8b_dspark.yaml \
+#     dataset.train_data_path=/path/to/data.jsonl output_dir=./outputs/dspark
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+  draft_model_config: torchspec/config/dspark_draft_config.json
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+  min_loss_tokens: 32
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 2
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.0
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 2048
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 4
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 2
+  warmup_ratio: 0.04
+
+  # DFlash/DSpark-specific parameters (block/anchor/target-layer identical to baseline)
+  dflash_block_size: 7
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 4.0
+  dflash_num_target_layers: 5
+
+  # DSpark objective: CE + TV/L1 distribution matching + confidence-head BCE
+  dflash_loss_objective: dspark
+  dflash_dspark_ce_alpha: 0.1
+  dflash_dspark_l1_alpha: 0.9
+  dflash_dspark_confidence_alpha: 1.0
+
+inference:
+  inference_engine_type: sgl
+  store_last_hidden_states: true  # required for the dspark objective
+  inference_num_gpus: 4
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 4
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 1
+    mem_fraction_static: 0.7
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+output_dir: ./outputs/qwen3-8b-dspark
+cache_dir: ./cache/qwen3-8b-dspark
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

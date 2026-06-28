@@ -150,9 +150,16 @@ class TrainingConfig:
     dflash_block_size: int = 16
     dflash_dpace_alpha: float = 0.5
     dflash_loss_decay_gamma: float = 7.0
-    dflash_loss_objective: str = "decay"  # "decay" or "dpace"
+    dflash_loss_objective: str = "decay"  # "decay", "dpace", or "dspark"
     dflash_num_anchors: int = 512
     dflash_num_target_layers: int = 5
+    # DSpark objective loss weights (used only when dflash_loss_objective == "dspark"):
+    # CE + TV/L1 distribution matching + optional confidence-head BCE. The Markov head and
+    # confidence head themselves are architecture knobs on the draft model config
+    # (markov_rank, enable_confidence_head), not training knobs.
+    dflash_dspark_ce_alpha: float = 0.1
+    dflash_dspark_l1_alpha: float = 0.9
+    dflash_dspark_confidence_alpha: float = 1.0
 
 
 @dataclass

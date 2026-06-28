@@ -60,6 +60,10 @@ class DFlashConfig(PretrainedConfig):
         target_num_hidden_layers: int = 36,
         target_layer_ids: Optional[List[int]] = None,
         mask_token_id: int = 151669,
+        markov_rank: int = 0,
+        markov_head_type: str = "vanilla",
+        enable_confidence_head: bool = False,
+        confidence_head_with_markov: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -78,6 +82,20 @@ class DFlashConfig(PretrainedConfig):
         self.target_num_hidden_layers = target_num_hidden_layers
         self.target_layer_ids = target_layer_ids
         self.mask_token_id = mask_token_id
+        # DSpark "Markov head": low-rank, previous-token-conditioned bias on the draft
+        # logits. markov_rank == 0 (default) disables it entirely — no parameters and no
+        # behavior change. Only the "vanilla" head type is supported in TorchSpec.
+        self.markov_rank = markov_rank
+        self.markov_head_type = markov_head_type
+        # DSpark confidence head: per-position acceptance predictor (Linear hidden->1)
+        # trained with BCE vs the TV acceptance estimate. Consumed by the serving engine
+        # for per-block early-stop. Disabled by default (no params, no behavior change).
+        # Field name matches DeepSpec/DSpark (enable_confidence_head) for serving interop.
+        self.enable_confidence_head = enable_confidence_head
+        # DSpark: when True, the confidence head also consumes the Markov head's
+        # previous-token embedding (input dim = hidden_size + markov_rank), matching
+        # DeepSpec's confidence_head_with_markov. Requires markov_rank > 0.
+        self.confidence_head_with_markov = confidence_head_with_markov
 
 
 class DFlashRMSNorm(nn.Module):
@@ -344,6 +362,77 @@ def build_target_layer_ids(num_target_layers: int, num_hidden_layers: int) -> Li
     ]
 
 
+class DFlashMarkovHead(nn.Module):
+    """Low-rank, previous-token-conditioned logit bias (DSpark "Markov head", vanilla).
+
+    Adds ``W2(W1[prev_token])`` to the draft logits, where ``W1`` is an
+    ``Embedding(vocab_size, markov_rank)`` and ``W2`` is a ``Linear(markov_rank,
+    vocab_size)`` — a rank-``markov_rank`` factorization of a per-previous-token logit
+    bias. This reintroduces the intra-block token dependency the parallel block drafter
+    otherwise loses. Training applies the bias teacher-forced; the serving engine applies
+    the same bias autoregressively while sampling each block.
+    """
+
+    def __init__(self, vocab_size: int, markov_rank: int):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.markov_rank = int(markov_rank)
+        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+
+    def compute_bias(self, prev_token_ids: torch.Tensor) -> torch.Tensor:
+        """Per-position logit bias for the previous tokens: [...] -> [..., vocab_size]."""
+        return self.markov_w2(self.markov_w1(prev_token_ids.long()))
+
+    def get_prev_embeddings(self, prev_token_ids: torch.Tensor) -> torch.Tensor:
+        """Low-rank previous-token embedding: [...] -> [..., markov_rank].
+
+        Used by the DSpark confidence head when confidence_head_with_markov is set.
+        """
+        return self.markov_w1(prev_token_ids.long())
+
+    def apply_block_logits(
+        self, base_logits: torch.Tensor, prev_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Add the Markov bias to block-structured logits.
+
+        Args:
+            base_logits: [B, num_blocks, block_size, vocab_size]
+            prev_token_ids: [B, num_blocks, block_size] — previous (teacher-forced) token per slot
+        """
+        return base_logits + self.compute_bias(prev_token_ids)
+
+
+def build_dflash_markov_head(config: PretrainedConfig) -> Optional["DFlashMarkovHead"]:
+    """Build the optional Markov head; returns None when disabled (markov_rank == 0)."""
+    markov_rank = int(getattr(config, "markov_rank", 0) or 0)
+    if markov_rank <= 0:
+        return None
+    head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
+    if head_type != "vanilla":
+        raise ValueError(f"DFlash supports only markov_head_type='vanilla', got {head_type!r}")
+    return DFlashMarkovHead(vocab_size=config.vocab_size, markov_rank=markov_rank)
+
+
+class DFlashAcceptRatePredictor(nn.Module):
+    """DSpark confidence head: per-position acceptance-probability predictor.
+
+    A single ``Linear(input_dim -> 1)`` producing a logit (apply sigmoid for the
+    acceptance probability). ``input_dim`` is ``hidden_size`` normally, or
+    ``hidden_size + markov_rank`` when ``confidence_head_with_markov`` is set (the
+    Markov previous-token embedding is concatenated to the hidden state). Trained with
+    BCE against the TV acceptance estimate ``1 - 0.5*|draft_probs - target_probs|``;
+    the serving engine consumes the sigmoid output for per-block early-stop.
+    """
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(int(input_dim), 1)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.proj(hidden_states).squeeze(-1)
+
+
 class DFlashDraftModel(PreTrainedModel):
     """DFlash draft model with dual-source KV injection.
 
@@ -389,6 +478,26 @@ class DFlashDraftModel(PreTrainedModel):
 
         # Final norm
         self.final_norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Optional DSpark Markov head — None when markov_rank == 0 (no params added).
+        self.markov_head = build_dflash_markov_head(config)
+
+        # Optional DSpark confidence head — None unless explicitly enabled. When
+        # confidence_head_with_markov is set, the head also consumes the Markov
+        # previous-token embedding (input dim = hidden_size + markov_rank), matching
+        # DeepSpec's AcceptRatePredictor.
+        self.confidence_head_with_markov = bool(
+            getattr(config, "confidence_head_with_markov", False)
+        )
+        self.confidence_head = None
+        if getattr(config, "enable_confidence_head", False):
+            conf_input_dim = config.hidden_size
+            if self.confidence_head_with_markov:
+                markov_rank = int(getattr(config, "markov_rank", 0) or 0)
+                if markov_rank <= 0:
+                    raise ValueError("confidence_head_with_markov=True requires markov_rank > 0")
+                conf_input_dim += markov_rank
+            self.confidence_head = DFlashAcceptRatePredictor(conf_input_dim)
 
     def extract_context_feature(self, all_hidden_states: List[torch.Tensor]) -> torch.Tensor:
         """Extract and project context features from target hidden states.
