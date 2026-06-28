@@ -41,12 +41,12 @@ if command -v micromamba &> /dev/null; then
     ENV_MANAGER="micromamba"
     export MAMBA_EXE="${MAMBA_EXE:-$(command -v micromamba)}"
     export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
-    ENV_CREATE_CMD=("$MAMBA_EXE" create -n torchspec python=3.12 uv -c conda-forge -y)
+    ENV_CREATE_CMD=("$MAMBA_EXE" create -n torchspec python=3.12 pip uv -c conda-forge -y)
     ENV_RUN_CMD=("$MAMBA_EXE" run -n torchspec)
     ACTIVATE_HINT="micromamba activate torchspec"
 elif command -v conda &> /dev/null; then
     ENV_MANAGER="conda"
-    ENV_CREATE_CMD=(conda create -n torchspec python=3.12 uv -c conda-forge -y)
+    ENV_CREATE_CMD=(conda create -n torchspec python=3.12 pip uv -c conda-forge -y)
     ENV_RUN_CMD=(conda run -n torchspec)
     ACTIVATE_HINT="conda activate torchspec"
 fi
@@ -73,8 +73,8 @@ if [ "$BACKEND" = "sglang" ] || [ "$BACKEND" = "both" ]; then
     echo "Installing SGLang..."
     echo "=========================================="
 
-    SGLANG_VERSION="${SGLANG_VERSION:-v0.5.10.post1}"
-    SGLANG_COMMIT=94f03a39dbd39edfc2b118b5357bbbadaaa9ad28
+    SGLANG_VERSION="${SGLANG_VERSION:-v0.5.14}"
+    SGLANG_COMMIT=4289f36ef960fad8268a6b94935686e792a81432
     SGLANG_FOLDER_NAME="_sglang"
 
     # Install sglang inside the conda environment
