@@ -1,0 +1,108 @@
+# DSpark training for GLM-5.2 (744B/40B MoE) — 8x B200, SINGLE NODE, FP8, COLOCATE
+#
+# Fits FP8 GLM-5.2 (needs TP=8 = a full node for inference) + DSpark training on
+# ONE 8-GPU node by COLOCATING both on the same 8 GPUs (training.colocate=true).
+# placement_group.py:322-331 -> expected GPUs = max(infer, train) = max(8,8) = 8.
+# Inference (SGLang TP=8) and training (FSDP) share each B200's 192GB and
+# time-slice compute. This is why B200's large VRAM makes it viable; it would NOT
+# fit on H100/H200 (80/141GB). colocate is documented as a "Dev" mode
+# (docs/ray.md:40) — experimental, expect to tune memory + watch for NCCL/compute
+# contention between the SGLang TP group and the FSDP group.
+#
+# *** CRITICAL KNOB: inference.sglang.mem_fraction_static ***
+#   FP8 weights take ~93GB/GPU. mem_fraction_static caps SGLang's (weights+KV) use.
+#   Set it LOW (~0.5) so the co-located FSDP training has room on the same GPUs.
+#   Default 0.85 WILL OOM the trainer. Budget (per 192GB B200):
+#     inference  ~0.5*192 = 96GB (93 weights + ~3 KV)
+#     training   ~remaining 96GB (FSDP draft shards + embed/lm_head + activations)
+#   If the trainer OOMs, lower mem_fraction_static further (0.45) and/or reduce
+#   training.max_seq_length; if KV is too tight for inference, raise it slightly.
+#
+# Throughput note: colocation time-slices compute, so this is SLOWER than the
+# 2-node (8 infer + 8 train) layout in sglang_glm52_dspark_2node.yaml. Use this
+# only when you are constrained to a single 8-GPU node.
+#
+# BEFORE REAL TRAINING — verify (see sglang_glm52_dspark_2node.yaml):
+#   mask_token_id (placeholder 154820), glm chat_template, embed/lm_head/norm keys,
+#   and Step 0 capture smoke (GLM inherits DeepseekV2 EAGLE3 capture).
+#
+# Run (single node; pin GPUs / force a fresh local Ray if the box is shared):
+#   RAY_ADDRESS=local CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+#     python -m torchspec.train_entry --config configs/sglang_glm52_dspark_8card_colocate.yaml
+
+model:
+  target_model_path: zai-org/GLM-5.2-FP8
+  trust_remote_code: true
+  draft_model_config: torchspec/config/glm52_dspark_draft_config.json
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: glm
+  prompt_key: conversations
+  min_loss_tokens: 32
+
+training:
+  colocate: true                       # <-- share the 8 GPUs between inference & training
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 2
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.0
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 4096
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 8        # same 8 GPUs as inference (colocate)
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 2
+  warmup_ratio: 0.04
+
+  # DSpark-specific parameters
+  dflash_block_size: 7
+  dspark_num_anchors: 512
+  dspark_num_target_layers: 5
+  dspark_loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+
+inference:
+  inference_engine_type: sgl
+  store_last_hidden_states: true       # DSpark L1/confidence loss needs last hidden
+  inference_num_gpus: 8
+  inference_num_gpus_per_engine: 8     # tp_size=8 spans the whole node
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 8
+    mem_fraction_static: 0.5           # <-- LOW: leave ~half of each B200 for training
+    dtype: auto                        # FP8 follows the checkpoint weights
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+output_dir: ./outputs/glm52-dspark-8card
+cache_dir: ./cache/glm52-dspark-8card
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false

@@ -266,3 +266,19 @@ TEMPLATE_REGISTRY.register(
         image_placeholder="<image>",
     ),
 )
+
+# GLM-4.5 / GLM-5.x family. The `[gMASK]<sop>` conversation prefix is added
+# automatically by the GLM tokenizer, so it is not encoded in the headers here.
+# NOTE: verify the headers / end_of_turn_token / thinking behavior against the
+# target checkpoint's tokenizer_config.json `chat_template` before real training.
+# For the thinking variant, mirror `qwen3-thinking` (parser_type="thinking",
+# enable_thinking=True, assistant_header="<|assistant|>\n<think>\n").
+TEMPLATE_REGISTRY.register(
+    name="glm",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>\n",
+        user_header="<|user|>\n",
+        system_prompt="You are a helpful assistant.",
+        end_of_turn_token="<|endoftext|>",
+    ),
+)

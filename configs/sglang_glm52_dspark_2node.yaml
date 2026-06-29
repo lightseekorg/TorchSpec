@@ -1,0 +1,107 @@
+# DSpark training config for GLM-5.2 (744B/40B MoE, glm_moe_dsa) — 2 node (B200)
+#
+# DSpark = DFlash block-diffusion drafter + EAGLE-style Markov & confidence
+# heads. Shares the DFlash backbone, so the draft dims here MUST match
+# torchspec/config/dflash_draft_config_glm52.json (the GLM-5.2 DFlash sibling).
+# The L1 / confidence terms need the target's final hidden state, so DSpark sets
+# inference.store_last_hidden_states: true (DFlash leaves it false).
+#
+# GPU allocation (16x B200, 2 nodes):
+#   - Node 0: 8 GPUs for INFERENCE (SGLang engine, tp_size=8, GLM-5.2 FP8)
+#   - Node 1: 8 GPUs for TRAINING (FSDP FULL_SHARD, DSpark draft)
+# Mirrors configs/sglang_kimi_k25_2node.yaml (Kimi-K2.5 is the closest ~1T MoE).
+#
+# SERVING NOTE (B200 vs the L20 DFlash work in sglang_glm52_dflash.yaml):
+#   glm_moe_dsa's DSA kernels are gated to sm90/sm100. B200 IS sm100, so the
+#   gating is SATISFIED — stock SGLang DSA kernels run and the ~32x L20 ada_dsa
+#   community port is NOT needed here (that was only for sm89/L20/4090).
+#   STILL REQUIRED: layer TorchSpec's hidden-capture patch onto GLM-5.2's SGLang
+#   serving model (deepseek_v2.py-style, since glm_moe_dsa is DeepSeek-like) so
+#   the 5 aux layers + last hidden stream to Mooncake. This is the gating Step 0.
+#
+# BEFORE REAL TRAINING — verify these target-specific values (cluster-side):
+#   1. mask_token_id in the draft config is the placeholder 154820 (= pad). Replace
+#      with the real GLM [MASK] id (154820-154879 range): tokenizer.convert_tokens_to_ids('[MASK]').
+#   2. dataset.chat_template 'glm': confirm headers / end_of_turn / thinking vs
+#      the GLM-5.2 tokenizer_config.json chat_template.
+#   3. embedding_key/lm_head_key/norm_key defaults (model.embed_tokens.weight /
+#      lm_head.weight / model.norm.weight) match the GLM-5.2 state_dict keys.
+#
+# Usage (2-node ray, see examples/kimi-k25-2node-h200/):
+#   python -m torchspec.train_entry --config configs/sglang_glm52_dspark_2node.yaml
+
+model:
+  target_model_path: zai-org/GLM-5.2-FP8    # FP8 weights so TP=8 fits one node
+  trust_remote_code: true                    # glm_moe_dsa is a custom model_type
+  draft_model_config: torchspec/config/glm52_dspark_draft_config.json
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: null
+  eval_interval: 100
+  chat_template: glm
+  prompt_key: conversations
+  min_loss_tokens: 32
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 2
+  learning_rate: 6e-4
+  min_lr: 6e-5
+  weight_decay: 0.0
+  max_concurrent_batches: 1
+  max_grad_norm: 1.0
+  max_seq_length: 4096
+  num_epochs: 3
+  seed: 42
+  training_num_gpus_per_node: 8
+  training_num_nodes: 1
+  ttt_length: 7
+  fsdp_strategy: FULL_SHARD
+  fsdp_reduce_dtype: bfloat16
+  prefetch_depth: 8
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 2
+  warmup_ratio: 0.04
+
+  # DSpark-specific parameters
+  dflash_block_size: 7
+  dspark_num_anchors: 512
+  dspark_num_target_layers: 5
+  dspark_loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+
+inference:
+  inference_engine_type: sgl
+  store_last_hidden_states: true       # DSpark L1/confidence loss needs last hidden
+  inference_num_gpus: 8
+  inference_num_gpus_per_engine: 8     # tp_size=8 → one engine spans a full node
+  inference_num_gpus_per_node: 8
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  sglang:
+    tp_size: 8
+    mem_fraction_static: 0.85
+    dtype: auto                        # FP8 follows the checkpoint weights
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+  enable_hard_pin: true
+
+output_dir: ./outputs/glm52-dspark
+cache_dir: ./cache/glm52-dspark
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  debug_train_only: false
+  debug_inference_only: false
