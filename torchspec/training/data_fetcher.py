@@ -240,9 +240,7 @@ class MooncakeDataset(IterableDataset):
         neutralized_count = 0
         while True:
             if self.usp_enabled:
-                data, neutralized = self._usp_get_sharded_item(
-                    neutralized_count=neutralized_count
-                )
+                data, neutralized = self._usp_get_sharded_item(neutralized_count=neutralized_count)
                 neutralized_count += neutralized
                 if data is None:
                     break
