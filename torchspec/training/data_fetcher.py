@@ -187,45 +187,63 @@ class MooncakeDataset(IterableDataset):
             skip_after_header=self.skip_after_header,
         )
 
-    def _should_skip_for_loss_mask(
-        self, data: Dict[str, Any], mooncake_key: str, skip_count: int
-    ) -> tuple[bool, int]:
-        mask = self._compute_loss_mask(data)
-        if mask is None:
-            skip_count += 1
-            logger.warning(
-                f"Skipping sample with all-zero loss mask "
-                f"(mooncake_key={mooncake_key}, total_skipped={skip_count})"
-            )
-            return True, skip_count
+    @staticmethod
+    def _fallback_mask_len(data: Dict[str, Any]) -> int:
+        """Sequence length for a neutralized sample's zero loss mask."""
+        ids = data.get("input_ids")
+        if isinstance(ids, torch.Tensor) and ids.dim() >= 1:
+            return ids.shape[-1]
+        for key in ("hidden_states", "last_hidden_states", "target"):
+            t = data.get(key)
+            if isinstance(t, torch.Tensor) and t.dim() >= 2:
+                return t.shape[-2]
+        return 1
 
-        if (
+    def _resolve_and_neutralize_loss_mask(
+        self, data: Dict[str, Any], mooncake_key: str, neutralized_count: int
+    ) -> int:
+        """Zero an empty / sub-min_loss_tokens loss mask in place instead of
+        dropping the sample; a per-rank drop desyncs FSDP collectives."""
+        mask = self._compute_loss_mask(data)  # None == all-zero
+        neutralize = mask is None or (
             self._min_loss_tokens > 0
             and isinstance(mask, torch.Tensor)
             and mask.sum() < self._min_loss_tokens
-        ):
-            skip_count += 1
-            logger.warning(
-                f"Skipping sample with too few loss-masked tokens "
-                f"({int(mask.sum())} < {self._min_loss_tokens}, "
-                f"mooncake_key={mooncake_key}, total_skipped={skip_count})"
-            )
-            return True, skip_count
+        )
+        if not neutralize:
+            return neutralized_count
 
-        return False, skip_count
+        if isinstance(mask, torch.Tensor):
+            n_tokens = int(mask.sum())
+            data["loss_mask"] = torch.zeros_like(mask)
+        else:
+            # resolve_loss_mask returns None without setting data["loss_mask"]
+            n_tokens = 0
+            data["loss_mask"] = torch.zeros(self._fallback_mask_len(data), dtype=torch.long)
+
+        neutralized_count += 1
+        logger.warning(
+            f"Neutralized loss mask ({n_tokens} < min_loss_tokens="
+            f"{self._min_loss_tokens}, mooncake_key={mooncake_key}, "
+            f"total_neutralized={neutralized_count})"
+        )
+        return neutralized_count
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         """Iterate over samples synchronously.
 
         Blocks waiting for each item from the queue and loads from mooncake.
-        Skips samples whose loss mask is all zeros to avoid wasted compute.
+        Empty / sub-min_loss_tokens masks are neutralized, not dropped
+        (see _resolve_and_neutralize_loss_mask).
         """
         yield_count = 0
-        skip_count = 0
+        neutralized_count = 0
         while True:
             if self.usp_enabled:
-                data, skipped = self._usp_get_sharded_item(skip_count=skip_count)
-                skip_count += skipped
+                data, neutralized = self._usp_get_sharded_item(
+                    neutralized_count=neutralized_count
+                )
+                neutralized_count += neutralized
                 if data is None:
                     break
                 yield_count += 1
@@ -246,11 +264,9 @@ class MooncakeDataset(IterableDataset):
             logger.debug(f"__iter__: got item, mooncake_key={item.mooncake_key}")
             data = self._load_from_mooncake(item)
 
-            should_skip, skip_count = self._should_skip_for_loss_mask(
-                data, item.mooncake_key, skip_count
+            neutralized_count = self._resolve_and_neutralize_loss_mask(
+                data, item.mooncake_key, neutralized_count
             )
-            if should_skip:
-                continue
 
             # Note: target is computed in the collator from last_hidden_states for sglang mode
 
@@ -358,8 +374,10 @@ class MooncakeDataset(IterableDataset):
         min_tokens = max(1, self._min_loss_tokens)
         return int(full_loss_mask.sum().item()) < min_tokens
 
-    def _usp_get_sharded_item(self, skip_count: int) -> tuple[Dict[str, torch.Tensor] | None, int]:
-        skipped = 0
+    def _usp_get_sharded_item(
+        self, neutralized_count: int
+    ) -> tuple[Dict[str, torch.Tensor] | None, int]:
+        neutralized = 0
         while True:
             try:
                 item = self.ray_queue.get(block=True, timeout=self.timeout)
@@ -368,9 +386,9 @@ class MooncakeDataset(IterableDataset):
                     f"_usp_get_sharded_item: Exception waiting for data: {e}, "
                     f"timeout={self.timeout}"
                 )
-                return None, skipped
+                return None, neutralized
             if item is None:
-                return None, skipped
+                return None, neutralized
 
             metadata = item.metadata or {}
             if not metadata.get("usp_sharded", False):
@@ -405,16 +423,16 @@ class MooncakeDataset(IterableDataset):
             )
 
             if should_skip:
-                skipped += 1
-                total_skipped = skip_count + skipped
+                # Neutralize, don't drop: a per-DP-group drop desyncs FSDP.
+                neutralized += 1
+                tensors["loss_mask"] = torch.zeros_like(tensors["loss_mask"])
                 logger.warning(
-                    f"Skipping USP sharded sample with global all-zero loss mask "
-                    f"(mooncake_key={item.mooncake_key}, sp_rank={self._sp_rank}, "
-                    f"total_skipped={total_skipped})"
+                    f"Neutralized USP sharded sample (loss mask zeroed): "
+                    f"mooncake_key={item.mooncake_key}, sp_rank={self._sp_rank}, "
+                    f"total_neutralized={neutralized_count + neutralized}"
                 )
-                continue
 
-            return tensors, skipped
+            return tensors, neutralized
 
 
 def create_mooncake_dataloader(

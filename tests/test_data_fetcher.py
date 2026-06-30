@@ -143,6 +143,41 @@ class TestMooncakeDataset:
 
         assert len(samples) == 1
 
+    def test_subthreshold_samples_neutralized_not_dropped(self):
+        """Empty / sub-min_loss_tokens samples are kept as zero-mask micro-batches,
+        not dropped — a per-rank drop would desync FSDP collectives."""
+
+        def packed(mask):
+            return serialize_packed_loss_mask(pack_loss_mask(mask))
+
+        ray_queue = MockRayQueue()
+        store = MockMooncakeStore()
+        masks = {
+            "sub": torch.tensor([0, 0, 1, 1, 0, 0, 0, 0], dtype=torch.long),  # sum 2 < 4
+            "valid": torch.tensor([0, 0, 1, 1, 1, 1, 1, 1], dtype=torch.long),  # sum 6
+            "empty": torch.zeros(8, dtype=torch.long),  # sum 0
+        }
+        for key, mask in masks.items():
+            ray_queue.put(
+                TrainSample(
+                    mooncake_key=key,
+                    tensor_shapes={"input_ids": (8,)},
+                    tensor_dtypes={"input_ids": torch.long},
+                    packed_loss_mask=packed(mask),
+                )
+            )
+        ray_queue.put(None)
+
+        dataset = MooncakeDataset(ray_queue, store, torch.device("cpu"), min_loss_tokens=4)
+        samples = list(dataset)
+
+        # Count preserved (lockstep): every dispatched sample yields one micro-batch.
+        assert len(samples) == 3
+        sub, valid, empty = samples
+        assert not sub["loss_mask"].any()
+        assert valid["loss_mask"].any()
+        assert not empty["loss_mask"].any()
+
     def test_usp_sharded_keeps_local_zero_loss_shard_when_global_loss_exists(self):
         """A local all-zero USP shard must not be skipped independently.
 
@@ -195,7 +230,7 @@ class TestMooncakeDataset:
             dataset._sp_rank = sp_rank
             dataset._sp_ring_size = 1
 
-            tensors, skipped = dataset._usp_get_sharded_item(skip_count=0)
+            tensors, skipped = dataset._usp_get_sharded_item(neutralized_count=0)
             outputs.append((tensors, skipped))
 
         rank0_tensors, rank0_skipped = outputs[0]
