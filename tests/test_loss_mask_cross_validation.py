@@ -46,6 +46,11 @@ REFERENCE_MODELS: dict[str, str] = {
     "ling-flash-2.0": "inclusionAI/Ling-lite",
     "deepseek-v32": "deepseek-ai/DeepSeek-V3",
     "minimax-m2": "MiniMaxAI/MiniMax-M2.5",
+    # GLM grammar is a continuous family (4.5 -> 5.2); GLM-4.5 loads cleanly via
+    # AutoTokenizer, while GLM-5.2's tokenizer_config declares the transformers-v5
+    # TokenizersBackend class and would skip here. 4.5 is representative for the
+    # shared glm45 template.
+    "glm45": "zai-org/GLM-4.5",
 }
 
 _tokenizer_cache: dict = {}
