@@ -266,3 +266,13 @@ TEMPLATE_REGISTRY.register(
         image_placeholder="<image>",
     ),
 )
+
+TEMPLATE_REGISTRY.register(
+    name="glm45",
+    template=ChatTemplate(
+        assistant_header="<|assistant|>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+    ),
+)
