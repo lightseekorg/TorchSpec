@@ -50,6 +50,7 @@ class TestTrainingLoopCleanup:
             args=args,
             inference_manager=inference_manager,
             inference_future=inference_future,
+            inference_engines=None,
         )
 
     def test_run_training_loop_finally_runs_cleanup_on_exception(self):
@@ -71,6 +72,7 @@ class TestTrainingLoopCleanup:
             args=args,
             inference_manager=inference_manager,
             inference_future=inference_future,
+            inference_engines=None,
         )
 
 
@@ -184,6 +186,7 @@ def test_setup_eval_dispatch_bs_is_dp_size():
     args = SimpleNamespace(
         eval_interval=50,
         dp_size=2,
+        inference_batch_size=4,
         max_sample_pool_size=64,
         checkpoint_dir=None,
         cache_dir="./cache",
@@ -216,6 +219,7 @@ def test_setup_eval_dispatch_bs_caps_at_dataset_size():
     args = SimpleNamespace(
         eval_interval=50,
         dp_size=8,
+        inference_batch_size=4,
         max_sample_pool_size=64,
         checkpoint_dir=None,
         cache_dir="./cache",
