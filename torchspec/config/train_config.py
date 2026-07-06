@@ -164,6 +164,12 @@ class TrainingConfig:
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
 
+    # Domino-specific parameters (causal-correction head + base-anchored curriculum)
+    domino_gru_hidden_size: int = 1024
+    domino_correction_rank: int = 256
+    # Steps over which the curriculum lambda anneals 1 -> 0 (None = lr_total_steps)
+    domino_curriculum_steps: Optional[int] = None
+
 
 @dataclass
 class DecodeConfig:

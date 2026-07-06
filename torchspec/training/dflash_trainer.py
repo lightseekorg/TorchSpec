@@ -150,6 +150,7 @@ class DFlashTrainer(Trainer):
         )
 
         dflash_model = self._build_training_wrapper(draft_model)
+        dflash_model = self._build_training_wrapper(draft_model)
 
         full_state = dflash_model.state_dict() if dist.get_rank() == 0 else {}
 

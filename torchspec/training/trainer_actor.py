@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig
 from torchspec.models.draft.dflash import DFlashConfig
+from torchspec.models.draft.domino import DominoConfig
 from torchspec.models.draft.dspark import DSparkConfig
 from torchspec.ray.ray_actor import RayActor
 from torchspec.training.eagle3_trainer import Eagle3Trainer
@@ -77,14 +78,19 @@ class TrainerActor(RayActor):
             draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
         # Config-based trainer dispatch.
-        # DSparkConfig subclasses DFlashConfig, so it must be checked first.
-        # - DSparkConfig → DSparkTrainer
-        # - DFlashConfig → DFlashTrainer
+        # DSparkConfig and DominoConfig subclass DFlashConfig, so they must be checked first.
+        # - DSparkConfig -> DSparkTrainer
+        # - DominoConfig -> DominoTrainer
+        # - DFlashConfig -> DFlashTrainer
         # - else Eagle3.
         if isinstance(draft_model_config, DSparkConfig):
             from torchspec.training.dspark_trainer import DSparkTrainer
 
             self._trainer = DSparkTrainer(args)
+        elif isinstance(draft_model_config, DominoConfig):
+            from torchspec.training.domino_trainer import DominoTrainer
+
+            self._trainer = DominoTrainer(args)
         elif isinstance(draft_model_config, DFlashConfig):
             from torchspec.training.dflash_trainer import DFlashTrainer
 
