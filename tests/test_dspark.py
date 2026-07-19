@@ -45,7 +45,7 @@ from torchspec.models.draft.dspark import (
     AcceptRatePredictor,
     DSparkConfig,
     DSparkDraftModel,
-    VanillaMarkov,
+    ClassicalMarkov,
 )
 from torchspec.models.dspark import DSparkModel
 
@@ -75,7 +75,7 @@ def _make_dspark_config(
         target_num_hidden_layers=12,
         mask_token_id=V - 1,
         markov_rank=markov_rank,
-        markov_head_type="vanilla",
+        markov_head_type="classical",
         enable_confidence_head=enable_confidence_head,
         confidence_head_with_markov=confidence_head_with_markov,
     )
@@ -125,7 +125,7 @@ class TestDSparkConfig(unittest.TestCase):
     def test_draft_model_heads(self):
         cfg = _make_dspark_config(H=64, markov_rank=16)
         m = DSparkDraftModel(cfg)
-        self.assertIsInstance(m.markov_head, VanillaMarkov)
+        self.assertIsInstance(m.markov_head, ClassicalMarkov)
         self.assertIsInstance(m.confidence_head, AcceptRatePredictor)
         # confidence input = hidden + markov_rank when fused
         self.assertEqual(m.confidence_head.proj.in_features, 64 + 16)
@@ -212,9 +212,9 @@ class TestDSparkForward(unittest.TestCase):
 
 
 class TestHeadMath(unittest.TestCase):
-    def test_vanilla_markov_is_bigram_bias(self):
+    def test_classical_markov_is_bigram_bias(self):
         torch.manual_seed(0)
-        mk = VanillaMarkov(vocab_size=50, markov_rank=8)
+        mk = ClassicalMarkov(vocab_size=50, markov_rank=8)
         base = torch.randn(2, 3, 4, 50)
         prev = torch.randint(0, 50, (2, 3, 4))
         out = mk.apply_block_logits(base, token_ids=prev)

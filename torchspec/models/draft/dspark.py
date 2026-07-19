@@ -53,7 +53,7 @@ class DSparkConfig(DFlashConfig):
     def __init__(
         self,
         markov_rank: int = 256,
-        markov_head_type: str = "vanilla",
+        markov_head_type: str = "classical",
         enable_confidence_head: bool = True,
         confidence_head_with_markov: bool = True,
         **kwargs,
@@ -65,7 +65,7 @@ class DSparkConfig(DFlashConfig):
         self.confidence_head_with_markov = confidence_head_with_markov
 
 
-class VanillaMarkov(nn.Module):
+class ClassicalMarkov(nn.Module):
     """
     Adapted from DeepSpec's ``deepspec/modeling/dspark/markov_head.py``.
     """
@@ -74,9 +74,9 @@ class VanillaMarkov(nn.Module):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
-        self.markov_head_type = "vanilla"
+        self.markov_head_type = "classical"
         assert self.markov_rank > 0, (
-            f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
+            f"ClassicalMarkov requires markov_rank > 0, got {self.markov_rank}."
         )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         # TODO: markow_w2 out_features should match "draft_vocab_size" if pruning is used.
@@ -121,11 +121,11 @@ def build_markov_head(config) -> Optional[nn.Module]:
     if markov_rank == 0:
         return None
 
-    markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
-    if markov_head_type == "vanilla":
-        return VanillaMarkov(vocab_size=config.vocab_size, markov_rank=markov_rank)
+    markov_head_type = str(getattr(config, "markov_head_type", "classical")).lower()
+    if markov_head_type == "classical":
+        return ClassicalMarkov(vocab_size=config.vocab_size, markov_rank=markov_rank)
     raise NotImplementedError(
-        f"markov_head_type={markov_head_type!r} is not supported yet; only 'vanilla' "
+        f"markov_head_type={markov_head_type!r} is not supported yet; only 'classical' "
         "is implemented in TorchSpec as it is recommended by the authors."
     )
 
