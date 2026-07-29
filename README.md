@@ -2,11 +2,15 @@
 
 TorchSpec is a torch-native speculative decoding training framework. We introduce a disaggregated way of training speculative decoding draft models where inference and training are fully decoupled and stream hidden states directly from inference engine groups to distributed training workers via [Mooncake](https://github.com/kvcache-ai/Mooncake) store, allowing each side to scale independently.
 
-TorchSpec currently includes training flows and examples for:
+## Adoption
 
-- Kimi-K2.5
-- MiniMax-M2.5
-- Qwen3-Coder-Next
+TorchSpec has been adopted by production inference platforms and the vLLM ecosystem:
+
+- [DigitalOcean](https://www.digitalocean.com/blog/how-we-built-fastest-deepseek-minimax-qwen-on-blackwell-ultra) used TorchSpec to train an EAGLE3 draft model for MiniMax-M2.5 on DigitalOcean Serverless Inference.
+- [vLLM](https://vllm.ai/blog/2026-05-11-vllm-tops-artificial-analysis) used TorchSpec and vLLM to train the custom EAGLE3 draft model featured in its Artificial Analysis leaderboard work.
+- [CoreWeave](https://www.coreweave.com/blog/kimi-k2-7-code-now-available-on-serverless-inference-with-leading-benchmark-price-performance) used TorchSpec to train a DFlash speculative decoding model for Kimi K2.7 Code and contributed D-PACE support upstream.
+- [fal](https://blog.fal.ai/how-we-achieved-1000-tok-s-and-16x-throughput-with-dspark-for-ideogram-v4-prompt-expander/) used TorchSpec to train a DSpark speculative decoding model for its Ideogram V4 prompt expander, reporting 16x throughput gains with DSpark.
+- [Tencent Hunyuan](https://x.com/TencentHunyuan/status/2082447023626944936) open-sourced [**AngelSpec**](https://arxiv.org/abs/2607.25852), adopting TorchSpec for training and featuring it in the paper.
 
 ## 🤗 Released Models
 
@@ -21,15 +25,6 @@ Draft models trained with TorchSpec, available on the [LightSeek Foundation](htt
 Draft models trained with TorchSpec, available from other organizations:
 
 - [Inferact/MiniMax-M3-EAGLE3](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3)
-
-## Adoption
-
-TorchSpec has been adopted by production inference platforms and the vLLM ecosystem:
-
-- [DigitalOcean](https://www.digitalocean.com/blog/how-we-built-fastest-deepseek-minimax-qwen-on-blackwell-ultra) used TorchSpec to train an EAGLE3 draft model for MiniMax-M2.5 on DigitalOcean Serverless Inference.
-- [vLLM](https://vllm.ai/blog/2026-05-11-vllm-tops-artificial-analysis) used TorchSpec and vLLM to train the custom EAGLE3 draft model featured in its Artificial Analysis leaderboard work.
-- [CoreWeave](https://www.coreweave.com/blog/kimi-k2-7-code-now-available-on-serverless-inference-with-leading-benchmark-price-performance) used TorchSpec to train a DFlash speculative decoding model for Kimi K2.7 Code and contributed D-PACE support upstream.
-- [fal](https://blog.fal.ai/how-we-achieved-1000-tok-s-and-16x-throughput-with-dspark-for-ideogram-v4-prompt-expander/) used TorchSpec to train a DSpark speculative decoding model for its Ideogram V4 prompt expander, reporting 16x throughput gains with DSpark.
 
 ## 🚀 Blogs
 
