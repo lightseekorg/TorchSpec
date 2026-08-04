@@ -26,7 +26,6 @@ import torch.distributed as dist
 
 from torchspec.training.optimizer import BF16Optimizer
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="fused AdamW found_inf handling requires CUDA",
