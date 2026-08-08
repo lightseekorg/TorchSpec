@@ -278,7 +278,15 @@ class DFlashTrainer(Trainer):
 
     def _forward(
         self, batch: dict
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
         device = torch.device("cuda")
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         hidden_states = batch["hidden_states"].to(device, non_blocking=True)
@@ -295,14 +303,20 @@ class DFlashTrainer(Trainer):
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states
 
-        loss, accuracy, loss_per_position, acc_per_position, count_per_position, loss_components = (
-            self.model(
-                input_ids=input_ids,
-                hidden_states_list=hidden_states_list,
-                loss_mask=loss_mask,
-                lm_head_weight=self.target_lm_head_weight,
-                last_hidden_states=last_hidden_states,
-            )
+        (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            loss_components,
+            loss_terms,
+        ) = self.model(
+            input_ids=input_ids,
+            hidden_states_list=hidden_states_list,
+            loss_mask=loss_mask,
+            lm_head_weight=self.target_lm_head_weight,
+            last_hidden_states=last_hidden_states,
         )
 
         return (
@@ -312,12 +326,49 @@ class DFlashTrainer(Trainer):
             acc_per_position,
             count_per_position,
             loss_components,
+            loss_terms,
         )
 
     def _backward(self, loss: torch.Tensor, accumulation_steps: int = 1) -> torch.Tensor:
         scaled_loss = loss / accumulation_steps
         scaled_loss.backward()
         return loss
+
+    def _normalize_accumulated_gradients(
+        self,
+        local_denominator: torch.Tensor,
+        accumulation_steps: int,
+    ) -> torch.Tensor:
+        """Rescale accumulated gradients into a globally token-pooled mean.
+
+        Backward ran on raw loss numerators, so gradients currently carry
+        ``sum(numerator) / accumulation_steps``, and FSDP additionally *means*
+        them over the shard group — hence the ``world_size * accumulation_steps``
+        factor over the pooled denominator.
+
+        The empty-window case goes through ``torch.where`` rather than a Python
+        branch: a fully masked accumulation window is legal here (see the
+        all-zero ``loss_mask`` fallback in ``DFlashModel``) and must not cost a
+        device-to-host sync on every optimizer step.
+        """
+        denominator = local_denominator.detach().clone()
+        group = getattr(self, "dp_group", None)
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size(group=group)
+            if world_size > 1:
+                dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=group)
+
+        scale = torch.where(
+            denominator > 0,
+            (world_size * accumulation_steps) / denominator.clamp(min=1e-6),
+            torch.zeros_like(denominator),
+        )
+        with torch.no_grad():
+            for parameter in self.optimizer.model_params:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(scale)
+        return denominator
 
     # ------------------------------------------------------------------
     # Eval (no-grad forward on CPU-cached data) — mirrors Eagle3Trainer
@@ -326,9 +377,15 @@ class DFlashTrainer(Trainer):
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position tensors."""
         with torch.no_grad():
-            _, _, loss_per_position, acc_per_position, count_per_position, loss_components = (
-                self._forward(batch)
-            )
+            (
+                _,
+                _,
+                loss_per_position,
+                acc_per_position,
+                count_per_position,
+                loss_components,
+                _,
+            ) = self._forward(batch)
         return {
             "loss_pp": loss_per_position.detach(),
             "acc_pp": acc_per_position.detach(),
@@ -485,13 +542,30 @@ class DFlashTrainer(Trainer):
         evt_bwd_e = torch.cuda.Event(enable_timing=True)
 
         evt_fwd_s.record()
-        loss, accuracy, loss_per_position, acc_per_position, count_per_position, loss_components = (
-            self._forward(batch)
-        )
+        (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            loss_components,
+            loss_terms,
+        ) = self._forward(batch)
         evt_fwd_e.record()
 
+        loss_numerator, loss_denominator = loss_terms
+        if batch_idx == 0:
+            self._accumulated_loss_denominator = loss_denominator.detach().clone()
+        else:
+            self._accumulated_loss_denominator.add_(loss_denominator.detach())
+
         evt_bwd_s.record()
-        total_loss = self._backward(loss, accumulation_steps=accumulation_steps)
+        self._backward(loss_numerator, accumulation_steps=accumulation_steps)
+        if batch_idx == num_batches - 1:
+            self._normalize_accumulated_gradients(
+                self._accumulated_loss_denominator,
+                accumulation_steps,
+            )
         evt_bwd_e.record()
 
         return {
@@ -500,7 +574,7 @@ class DFlashTrainer(Trainer):
             "loss_per_position": loss_per_position.detach(),
             "acc_per_position": acc_per_position.detach(),
             "count_per_position": count_per_position.detach(),
-            "total_loss": total_loss.detach(),
+            "total_loss": loss.detach(),
             "_fwd_events": (evt_fwd_s, evt_fwd_e),
             "_bwd_events": (evt_bwd_s, evt_bwd_e),
             **loss_components,

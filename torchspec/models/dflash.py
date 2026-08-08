@@ -168,13 +168,17 @@ class DFlashModel(nn.Module):
             keep_mask = torch.zeros(bsz, max_n, dtype=torch.bool, device=device)
             return anchors, keep_mask
 
-        valid = loss_mask[:, : max_anchor + 1] > 0.5
+        # An anchor is only usable if its own position and the position right
+        # after it are both supervised: the block's first prediction target is
+        # ``anchor + 1``, so an isolated supervised token yields no gradient.
+        num_candidates = min(max_anchor + 1, seq_len - 1)
+        valid = (loss_mask[:, :num_candidates] > 0.5) & (loss_mask[:, 1 : num_candidates + 1] > 0.5)
         valid_counts = valid.sum(dim=1)
 
-        indices = torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
+        indices = torch.arange(num_candidates, device=device).unsqueeze(0).expand(bsz, -1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
 
-        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
+        random_vals = torch.rand(bsz, num_candidates, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
 
         _, sorted_idx = random_vals.sort(dim=1)
@@ -323,7 +327,15 @@ class DFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         last_hidden_states: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+        Tuple[torch.Tensor, torch.Tensor],
+    ]:
         """
         Full DFlash training forward pass.
 
@@ -338,6 +350,8 @@ class DFlashModel(nn.Module):
                 position before loss decay is applied
             loss_components: dict of extra per-component loss scalars for logging
                 (empty for the base DFlash objective; populated by subclasses).
+            loss_terms: additive objective numerator and denominator. The trainer
+                pools these over the full accumulation window and data-parallel group.
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -437,8 +451,9 @@ class DFlashModel(nn.Module):
             objective_weights = weight_mask * dpace_weights
 
         flat_weights = objective_weights.view(-1)
-        valid_token_count = flat_weights.sum().clamp(min=1e-6)
-        loss = (loss_per_token * flat_weights).sum() / valid_token_count
+        loss_numerator = (loss_per_token * flat_weights).sum()
+        loss_denominator = flat_weights.sum()
+        loss = loss_numerator / loss_denominator.clamp(min=1e-6)
 
         # 10. Accuracy (using binary mask without decay)
         with torch.no_grad():
@@ -469,4 +484,5 @@ class DFlashModel(nn.Module):
             acc_per_position,
             count_per_position,
             loss_components,
+            (loss_numerator, loss_denominator.detach()),
         )

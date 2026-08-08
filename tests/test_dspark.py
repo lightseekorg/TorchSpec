@@ -140,24 +140,26 @@ class TestDSparkConfig(unittest.TestCase):
 
 
 class TestDSparkForward(unittest.TestCase):
-    def test_returns_six_tuple_with_detached_components(self):
+    def test_returns_loss_terms_with_detached_components(self):
         m = _make_dspark_model()
         out = m(**_batch())
-        self.assertEqual(len(out), 6)
-        loss, acc, lpp, app, cpp, comps = out
+        self.assertEqual(len(out), 7)
+        loss, acc, lpp, app, cpp, comps, loss_terms = out
         self.assertEqual(set(comps), {"ce_loss", "l1_loss", "confidence_loss"})
         for v in comps.values():
             self.assertTrue(torch.isfinite(v).all())
             self.assertFalse(v.requires_grad)  # detached for logging
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(lpp.shape[0], m.block_size)
+        numerator, denominator = loss_terms
+        torch.testing.assert_close(loss, numerator / denominator)
 
     def test_internal_loss_identity(self):
-        # At world_size==1 (no process group), the combined loss must equal the
-        # alpha-weighted sum of the logged components — so the components are a
-        # faithful decomposition of what's actually optimized.
+        # The reported loss is a purely local ratio now, so the combined loss must
+        # equal the alpha-weighted sum of the logged components on every rank —
+        # the components are a faithful decomposition of what's optimized.
         m = _make_dspark_model()
-        loss, _, _, _, _, comps = m(**_batch(seed=1))
+        loss, _, _, _, _, comps, _ = m(**_batch(seed=1))
         recomputed = (
             CE_A * comps["ce_loss"] + L1_A * comps["l1_loss"] + CF_A * comps["confidence_loss"]
         )
@@ -167,7 +169,7 @@ class TestDSparkForward(unittest.TestCase):
 
     def test_all_masked_is_zero(self):
         m = _make_dspark_model()
-        loss, _, _, _, _, comps = m(**_batch(all_masked=True))
+        loss, _, _, _, _, comps, _ = m(**_batch(all_masked=True))
         self.assertAlmostEqual(loss.item(), 0.0, places=5)
         for v in comps.values():
             self.assertAlmostEqual(v.item(), 0.0, places=5)
@@ -179,7 +181,7 @@ class TestDSparkForward(unittest.TestCase):
         m = _make_dspark_model(block_size=4, num_anchors=8)
         b = _batch(B=2, S=40)
         b["loss_mask"] = torch.ones(2, 40)
-        _, _, _, _, count_per_position, _ = m(**b)
+        _, _, _, _, count_per_position, _, _ = m(**b)
         self.assertEqual(count_per_position.shape[0], 4)
         self.assertTrue(
             (count_per_position > 0).all(), f"some slot unsupervised: {count_per_position.tolist()}"

@@ -269,6 +269,18 @@ class TestAnchorSampling(unittest.TestCase):
         valid_count = keep_mask.sum(dim=1)
         self.assertLessEqual(valid_count[0].item(), 2)
 
+    def test_requires_adjacent_supervision(self):
+        loss_mask = torch.zeros(1, 32)
+        loss_mask[:, [4, 8, 9, 20]] = 1.0
+        model = _make_dflash_model(block_size=4, num_anchors=4)
+
+        anchors, keep_mask = model._sample_anchor_positions(
+            loss_mask.shape[1], loss_mask, loss_mask.device
+        )
+
+        self.assertEqual(keep_mask.sum().item(), 1)
+        self.assertEqual(anchors[keep_mask].item(), 8)
+
     def test_short_sequence_graceful_fallback(self):
         """Sequences too short for anchor sampling return all-False keep_mask (zero loss)."""
         B = 1
@@ -427,7 +439,7 @@ class TestDFlashModelForward(unittest.TestCase):
         lm_head_weight = torch.randn(self.V, self.H)
 
         with torch.no_grad():
-            loss, acc, loss_pp, acc_pp, count_pp, loss_components = self.model(
+            loss, acc, loss_pp, acc_pp, count_pp, loss_components, loss_terms = self.model(
                 input_ids=input_ids,
                 hidden_states_list=hidden_states_list,
                 loss_mask=loss_mask,
@@ -442,6 +454,8 @@ class TestDFlashModelForward(unittest.TestCase):
         self.assertEqual(acc_pp.shape, (self.model.block_size,))
         self.assertEqual(count_pp.shape, (self.model.block_size,))
         self.assertEqual(loss_components, {})
+        numerator, denominator = loss_terms
+        torch.testing.assert_close(loss, numerator / denominator)
 
     def test_loss_requires_grad(self):
         """Loss should be differentiable through the draft model."""
@@ -697,6 +711,38 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         self.assertAlmostEqual(metrics["eval/avg_acc"], 11.0 / 24.0, places=6)
         self.assertAlmostEqual(metrics["eval/avg_loss"], self._expected_avg_loss(), places=6)
         self.assertAlmostEqual(metrics["eval/simulated_acc_len"], 0.8, places=6)
+
+    def test_global_loss_normalization_scales_accumulated_gradients(self):
+        from torchspec.training import dflash_trainer as trainer_module
+
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        parameter.grad = torch.tensor([8.0])
+        optimizer = mock.Mock(model_params=[parameter])
+        trainer = self._make_trainer()
+        trainer.optimizer = optimizer
+        trainer.dp_group = "dp"
+
+        def add_remote_denominator(tensor, *, op, group):
+            self.assertEqual(op, torch.distributed.ReduceOp.SUM)
+            self.assertEqual(group, "dp")
+            tensor.add_(2.0)
+
+        with (
+            mock.patch.object(trainer_module.dist, "is_initialized", return_value=True),
+            mock.patch.object(trainer_module.dist, "get_world_size", return_value=2),
+            mock.patch.object(
+                trainer_module.dist,
+                "all_reduce",
+                side_effect=add_remote_denominator,
+            ),
+        ):
+            denominator = trainer._normalize_accumulated_gradients(
+                torch.tensor(2.0),
+                accumulation_steps=4,
+            )
+
+        self.assertEqual(denominator.item(), 4.0)
+        torch.testing.assert_close(parameter.grad, torch.tensor([16.0]))
 
 
 class TestMiniTrainingLoop(unittest.TestCase):
