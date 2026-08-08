@@ -225,9 +225,14 @@ class Eagle3Trainer(Trainer):
                 dtype=torch.bfloat16,
                 trust_remote_code=getattr(self.args, "trust_remote_code", True),
             )
+            if self._last_hs_prenorm and self.target_lm_head.norm is None:
+                raise RuntimeError(
+                    "last_hidden_states_prenorm=True requires a loaded verifier norm"
+                )
+            norm_status = "loaded" if self.target_lm_head.norm is not None else "not requested"
             logger.info(
                 f"[Rank 0] TargetLMHead loaded from {target_model_path}"
-                f"{' (with verifier norm)' if self._last_hs_prenorm else ''}"
+                f" (verifier norm: {norm_status})"
             )
         else:
             from transformers import AutoConfig
@@ -250,6 +255,10 @@ class Eagle3Trainer(Trainer):
             [self.target_lm_head.norm is not None], dtype=torch.int32, device="cuda"
         )
         dist.broadcast(has_norm, src=0)
+        if self._last_hs_prenorm and not has_norm.item():
+            raise RuntimeError(
+                "Rank 0 did not load the verifier norm required by last_hidden_states_prenorm=True"
+            )
         if has_norm.item():
             if self.target_lm_head.norm is None:
                 logger.warning(
@@ -273,7 +282,10 @@ class Eagle3Trainer(Trainer):
         for param in self.target_lm_head.parameters():
             dist.broadcast(param.data, src=0)
 
-        logger.info(f"[Rank {self.dp_rank}] TargetLMHead initialized and synced")
+        logger.info(
+            f"[Rank {self.dp_rank}] TargetLMHead initialized and synced "
+            f"(verifier norm loaded: {self.target_lm_head.norm is not None})"
+        )
 
     # ------------------------------------------------------------------
     # Forward / backward

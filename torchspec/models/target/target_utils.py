@@ -20,6 +20,7 @@
 
 import glob
 import json
+import logging
 import os
 from typing import Optional
 
@@ -29,6 +30,24 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig
 
+logger = logging.getLogger(__name__)
+
+
+class _TargetRMSNorm(nn.Module):
+    """Weight-only RMSNorm used when remote model construction is unavailable."""
+
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
 
 class TargetLMHead(nn.Module):
     """
@@ -37,10 +56,17 @@ class TargetLMHead(nn.Module):
 
     When ``load_norm=True``, also loads the final RMSNorm weights so the
     trainer can normalise pre-norm hidden states before the lm_head projection.
+    That load fails closed: an unavailable norm is an error rather than a
+    warning, since silently skipping it trains against the wrong targets.
     """
 
     def __init__(self, config):
         super().__init__()
+        # Both configs are kept: ``model_config`` is what ``AutoModelForCausalLM``
+        # needs to rebuild multimodal architectures (whose remote code expects the
+        # outer wrapper), while ``config`` is the text sub-config carrying the
+        # hidden/vocab sizes this module actually allocates against.
+        self.model_config = config
         self.config = getattr(config, "text_config", config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.norm: nn.Module | None = None
@@ -125,52 +151,81 @@ class TargetLMHead(nn.Module):
         """Create the norm module structure (no weights loaded).
 
         Used by non-rank-0 processes so that ``parameters()`` yields the
-        same count as rank 0 before the broadcast sync.
+        same count as rank 0 before the broadcast sync. A rank that silently
+        ends up with fewer parameters than rank 0 deadlocks that broadcast
+        loop, so a missing norm is fatal here rather than a warning.
         """
-        import logging
-
-        _log = logging.getLogger(__name__)
-
-        try:
-            norm_module = self._extract_norm_from_architecture()
-            if norm_module is None:
-                return
-            self.norm = norm_module.to_empty(device="cpu")
-            torch.nn.init.ones_(self.norm.weight)
-        except Exception as e:
-            _log.warning(f"Failed to create verifier norm structure: {e}")
-            self.norm = None
+        norm_module = self._create_norm_module()
+        if norm_module is None:
+            raise RuntimeError(
+                "No final norm structure is available for "
+                f"model_type={getattr(self.config, 'model_type', 'unknown')}"
+            )
+        self.norm = norm_module.to_empty(device="cpu")
+        torch.nn.init.ones_(self.norm.weight)
 
     def _init_and_load_norm(self, model_path: str, norm_key: str) -> None:
-        """Extract the final norm module from the target model architecture and load its weight.
+        """Create the final norm module and load its checkpoint weight.
 
-        Falls back to no-op if the architecture has no final norm or the
-        weight cannot be loaded — the trainer checks ``self.norm is not None``
-        before applying it.
+        ``load_norm=True`` is a correctness requirement for pre-norm hidden
+        states — training against unnormalised ones silently learns against the
+        wrong targets — so any construction or weight-loading failure is fatal.
         """
-        import logging
-
-        _log = logging.getLogger(__name__)
-
         try:
-            norm_module = self._extract_norm_from_architecture()
+            norm_module = self._create_norm_module()
             if norm_module is None:
-                _log.warning(
-                    "No final norm found in model architecture "
-                    f"(model_type={getattr(self.config, 'model_type', 'unknown')}). "
-                    "last_hidden_states will be used without normalization."
+                raise RuntimeError(
+                    "No final norm found for "
+                    f"model_type={getattr(self.config, 'model_type', 'unknown')}"
                 )
-                return
 
             self.norm = norm_module.to_empty(device="cpu")
             self._load_key_into(model_path, norm_key, self.norm.weight)
 
         except Exception as e:
-            _log.warning(
-                f"Failed to load verifier norm: {e}. "
-                "last_hidden_states will be used without normalization."
-            )
             self.norm = None
+            raise RuntimeError(
+                f"Failed to load verifier norm key {norm_key!r} from {model_path!r}"
+            ) from e
+
+    def _create_norm_module(self) -> "nn.Module | None":
+        """Create the model final norm, with a config-driven RMSNorm fallback.
+
+        Architecture introspection needs the full model to be constructible,
+        which fails for targets whose remote code cannot be instantiated from
+        config alone. Every such architecture seen so far still ends in a plain
+        RMSNorm, so rebuild it from ``hidden_size``/``rms_norm_eps`` instead of
+        dropping normalisation entirely.
+        """
+        architecture_error = None
+        try:
+            norm_module = self._extract_norm_from_architecture()
+        except Exception as exc:
+            architecture_error = exc
+            norm_module = None
+
+        if norm_module is not None:
+            return norm_module
+
+        hidden_size = getattr(self.config, "hidden_size", None)
+        rms_norm_eps = getattr(self.config, "rms_norm_eps", None)
+        if hidden_size is not None and rms_norm_eps is not None:
+            if architecture_error is not None:
+                logger.warning(
+                    "Final-norm architecture extraction failed; using a "
+                    "config-driven RMSNorm fallback (hidden_size=%s, eps=%s): %s",
+                    hidden_size,
+                    rms_norm_eps,
+                    architecture_error,
+                )
+            return _TargetRMSNorm(hidden_size=hidden_size, eps=rms_norm_eps)
+
+        if architecture_error is not None:
+            raise RuntimeError(
+                "Failed to construct the target model final norm"
+            ) from architecture_error
+
+        return None
 
     def _extract_norm_from_architecture(self) -> "nn.Module | None":
         """Instantiate the model on meta device and return the final norm module."""
@@ -178,7 +233,7 @@ class TargetLMHead(nn.Module):
 
         with torch.device("meta"):
             skeleton = AutoModelForCausalLM.from_config(
-                self.config,
+                self.model_config,
                 trust_remote_code=True,
                 attn_implementation="eager",
             )
