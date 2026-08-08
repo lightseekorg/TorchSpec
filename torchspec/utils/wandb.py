@@ -102,6 +102,9 @@ def init_wandb_primary(args):
 
 def _compute_config_for_logging(args):
     output = deepcopy(args.__dict__)
+    # The API key may be supplied through YAML for explicit, reproducible
+    # login, but it must never be copied into W&B run configuration.
+    output["wandb_key"] = None
 
     whitelist_env_vars = [
         "SLURM_JOB_ID",
@@ -152,7 +155,7 @@ def init_wandb_secondary(args, router_addr=None):
         "id": wandb_run_id,
         "entity": args.wandb_team,
         "project": args.wandb_project,
-        "config": args.__dict__,
+        "config": _compute_config_for_logging(args),
         "resume": "allow",
         "reinit": True,
         "settings": wandb.Settings(**settings_kwargs),
