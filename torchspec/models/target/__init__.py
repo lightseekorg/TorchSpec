@@ -23,11 +23,12 @@ from torchspec.models.target.eagle3_target_model import (
     Eagle3TargetOutput,
     HFTargetModel,
 )
-from torchspec.models.target.target_utils import TargetLMHead
+from torchspec.models.target.target_utils import TargetLMHead, load_synced_target_lm_head
 
 __all__ = [
     "Eagle3TargetModel",
     "Eagle3TargetOutput",
     "HFTargetModel",
     "TargetLMHead",
+    "load_synced_target_lm_head",
 ]

@@ -718,18 +718,19 @@ class TestDFlashVerifierNorm(unittest.TestCase):
         trainer.verifier_norm = None
         return trainer
 
-    @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
-    def test_rank_zero_fails_fast_when_the_requested_norm_is_missing(self, _mock_get_rank):
+    def test_init_requests_the_norm_and_wires_it_for_forward(self):
         trainer = self._make_trainer(prenorm=True)
         head = mock.MagicMock()
-        head.norm = None
+        head.norm = mock.sentinel.norm
 
         with mock.patch(
-            "torchspec.models.target.target_utils.TargetLMHead.from_pretrained",
+            "torchspec.models.target.target_utils.load_synced_target_lm_head",
             return_value=head,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "requires a loaded verifier norm"):
-                trainer._init_target_lm_head("/nonexistent/target")
+        ) as mock_load:
+            trainer._init_target_lm_head("/nonexistent/target")
+
+        self.assertTrue(mock_load.call_args.kwargs["load_norm"])
+        self.assertIs(trainer.verifier_norm, mock.sentinel.norm)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_forward_normalizes_last_hidden_states(self):

@@ -25,6 +25,7 @@ import os
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
@@ -287,3 +288,77 @@ class TargetLMHead(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute logits from hidden states."""
         return self.lm_head(hidden_states)
+
+
+def load_synced_target_lm_head(
+    model_path: str,
+    *,
+    load_norm: bool,
+    lm_head_key: str = "lm_head.weight",
+    norm_key: str = "model.norm.weight",
+    trust_remote_code: bool = True,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> "TargetLMHead":
+    """Build a frozen ``TargetLMHead`` on every rank, reading the checkpoint once.
+
+    Rank 0 loads the weights and broadcasts them; the other ranks allocate a
+    matching structure to receive them. ``load_norm`` therefore has to resolve the
+    same way on all of them: each rank either ends up with the final norm or raises,
+    which is what keeps the parameter lists aligned across the broadcast.
+    """
+    rank = dist.get_rank()
+
+    head: Optional[TargetLMHead] = None
+    local_error: Optional[Exception] = None
+    try:
+        if rank == 0:
+            head = TargetLMHead.from_pretrained(
+                model_path=model_path,
+                lm_head_key=lm_head_key,
+                norm_key=norm_key,
+                load_norm=load_norm,
+                device=device,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+            )
+        else:
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+            head = TargetLMHead(config)
+            if load_norm:
+                head._init_norm_structure()
+            head.to(device=device, dtype=dtype)
+            head.eval()
+            head.requires_grad_(False)
+
+        if load_norm and head.norm is None:
+            raise RuntimeError(
+                "last_hidden_states_prenorm=True requires a loaded verifier norm, "
+                f"which is unavailable for {model_path!r}"
+            )
+    except Exception as e:
+        local_error = e
+
+    # Raising straight out of the block above would strand the other ranks in the
+    # parameter broadcast below until the process-group timeout, so agree on failure
+    # first and let every rank report it.
+    initialized = torch.tensor([local_error is None], dtype=torch.int32, device=device)
+    dist.all_reduce(initialized, op=dist.ReduceOp.MIN)
+    if not initialized.item():
+        if local_error is not None:
+            raise local_error
+        raise RuntimeError(
+            f"[Rank {rank}] TargetLMHead initialization failed on another rank; "
+            "see that rank's traceback for the root cause"
+        )
+
+    for param in head.parameters():
+        dist.broadcast(param.data, src=0)
+
+    logger.info(
+        "[Rank %s] TargetLMHead initialized and synced from %s (verifier norm: %s)",
+        rank,
+        model_path,
+        "loaded" if head.norm is not None else "not requested",
+    )
+    return head

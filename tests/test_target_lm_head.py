@@ -5,7 +5,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from torchspec.models.target.target_utils import TargetLMHead
+from torchspec.models.target import target_utils
+from torchspec.models.target.target_utils import TargetLMHead, load_synced_target_lm_head
 
 NORM_KEY = "language_model.model.norm.weight"
 
@@ -107,3 +108,92 @@ def test_architecture_norm_is_preferred_over_the_config_fallback(monkeypatch):
     target._init_norm_structure()
 
     assert isinstance(target.norm, torch.nn.RMSNorm)
+
+
+class _RecordingDist:
+    """Stands in for ``torch.distributed``, recording collectives in order.
+
+    ``peer_failed`` simulates another rank reporting a failed initialization
+    through the status all-reduce.
+    """
+
+    ReduceOp = SimpleNamespace(MIN="min")
+
+    def __init__(self, rank: int, peer_failed: bool = False):
+        self._rank = rank
+        self._peer_failed = peer_failed
+        self.calls: list[str] = []
+
+    def get_rank(self) -> int:
+        return self._rank
+
+    def all_reduce(self, tensor, op=None) -> None:
+        self.calls.append("all_reduce")
+        if self._peer_failed:
+            tensor.zero_()
+
+    def broadcast(self, tensor, src: int = 0) -> None:
+        self.calls.append("broadcast")
+
+
+def _patch_dist(monkeypatch, rank: int, peer_failed: bool = False) -> _RecordingDist:
+    fake_dist = _RecordingDist(rank=rank, peer_failed=peer_failed)
+    monkeypatch.setattr(target_utils, "dist", fake_dist)
+    return fake_dist
+
+
+def _patch_follower_config(monkeypatch) -> None:
+    monkeypatch.setattr(
+        target_utils,
+        "AutoConfig",
+        SimpleNamespace(from_pretrained=lambda *args, **kwargs: _multimodal_config()),
+    )
+
+
+def test_rank_zero_load_failure_is_agreed_before_the_parameter_broadcast(monkeypatch):
+    fake_dist = _patch_dist(monkeypatch, rank=0)
+
+    def _fail(**kwargs):
+        raise RuntimeError("Failed to load verifier norm key 'model.norm.weight'")
+
+    monkeypatch.setattr(TargetLMHead, "from_pretrained", staticmethod(_fail))
+
+    with pytest.raises(RuntimeError, match="Failed to load verifier norm"):
+        load_synced_target_lm_head("/nonexistent/target", load_norm=True, device="cpu")
+
+    # The status all-reduce has to happen even on the failing path, or the peer
+    # ranks sit in it until the process-group timeout.
+    assert fake_dist.calls == ["all_reduce"]
+
+
+def test_rank_zero_missing_norm_fails_closed_after_the_status_all_reduce(monkeypatch):
+    fake_dist = _patch_dist(monkeypatch, rank=0)
+    head = TargetLMHead(_multimodal_config())
+    monkeypatch.setattr(TargetLMHead, "from_pretrained", staticmethod(lambda **kwargs: head))
+
+    with pytest.raises(RuntimeError, match="requires a loaded verifier norm"):
+        load_synced_target_lm_head("/nonexistent/target", load_norm=True, device="cpu")
+
+    assert fake_dist.calls == ["all_reduce"]
+
+
+def test_follower_rank_reports_a_peer_failure_instead_of_broadcasting(monkeypatch):
+    fake_dist = _patch_dist(monkeypatch, rank=1, peer_failed=True)
+    _patch_follower_config(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        load_synced_target_lm_head("/nonexistent/target", load_norm=True, device="cpu")
+
+    assert fake_dist.calls == ["all_reduce"]
+
+
+def test_follower_rank_broadcasts_every_parameter_including_the_norm(monkeypatch):
+    fake_dist = _patch_dist(monkeypatch, rank=1)
+    _patch_follower_config(monkeypatch)
+
+    head = load_synced_target_lm_head(
+        "/nonexistent/target", load_norm=True, device="cpu", dtype=torch.float32
+    )
+
+    assert head.norm is not None
+    assert fake_dist.calls == ["all_reduce", "broadcast", "broadcast"]
