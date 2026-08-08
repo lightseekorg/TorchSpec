@@ -348,7 +348,8 @@ class DFlashModel(nn.Module):
             acc_per_position: [block_size] mean accuracy at each within-block position
             count_per_position: [block_size] valid label count at each within-block
                 position before loss decay is applied
-            loss_components: dict of extra per-component loss scalars for logging
+            loss_components: dict of extra per-component ``(numerator, denominator)``
+                pairs for logging, pooled by the trainer just like ``loss_terms``
                 (empty for the base DFlash objective; populated by subclasses).
             loss_terms: additive objective numerator and denominator. The trainer
                 pools these over the full accumulation window and data-parallel group.

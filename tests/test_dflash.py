@@ -1411,6 +1411,16 @@ class TestExtraLossComponentAggregation(unittest.TestCase):
         trainer.optimizer = self._DummyOptimizer()
         return trainer
 
+    # Components are (numerator, denominator) pairs. The two micro-steps carry
+    # deliberately lopsided denominators (10 vs 30) so a mean-of-local-means would
+    # give a visibly different answer than the token-pooled value asserted below:
+    # local means are 2.0/4.0, whose plain mean is 3.0, but pooling gives
+    # (20 + 120) / (10 + 30) == 3.5.
+    _POOLED_CE = 3.5
+    _POOLED_L1 = 0.55
+    _POOLED_CONF = 0.25
+    _UNPOOLED_CE = 3.0
+
     @staticmethod
     def _steps(loss_key, acc_key, count_key):
         base = {
@@ -1421,15 +1431,15 @@ class TestExtraLossComponentAggregation(unittest.TestCase):
         return [
             {
                 **base,
-                "ce_loss": torch.tensor(2.0),
-                "l1_loss": torch.tensor(0.4),
-                "confidence_loss": torch.tensor(0.1),
+                "ce_loss": (torch.tensor(20.0), torch.tensor(10.0)),
+                "l1_loss": (torch.tensor(4.0), torch.tensor(10.0)),
+                "confidence_loss": (torch.tensor(1.0), torch.tensor(10.0)),
             },
             {
                 **base,
-                "ce_loss": torch.tensor(4.0),
-                "l1_loss": torch.tensor(0.6),
-                "confidence_loss": torch.tensor(0.3),
+                "ce_loss": (torch.tensor(120.0), torch.tensor(30.0)),
+                "l1_loss": (torch.tensor(18.0), torch.tensor(30.0)),
+                "confidence_loss": (torch.tensor(9.0), torch.tensor(30.0)),
             },
         ]
 
@@ -1462,9 +1472,11 @@ class TestExtraLossComponentAggregation(unittest.TestCase):
             step=1,
             grad_norm=torch.tensor(1.0),
         )
-        self.assertAlmostEqual(metrics["train/ce_loss"], 3.0, places=6)
-        self.assertAlmostEqual(metrics["train/l1_loss"], 0.5, places=6)
-        self.assertAlmostEqual(metrics["train/confidence_loss"], 0.2, places=6)
+        self.assertAlmostEqual(metrics["train/ce_loss"], self._POOLED_CE, places=6)
+        self.assertAlmostEqual(metrics["train/l1_loss"], self._POOLED_L1, places=6)
+        self.assertAlmostEqual(metrics["train/confidence_loss"], self._POOLED_CONF, places=6)
+        # Guard against regressing to a mean of per-micro-batch means.
+        self.assertNotAlmostEqual(metrics["train/ce_loss"], self._UNPOOLED_CE, places=2)
 
     @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
     @mock.patch(
@@ -1474,9 +1486,35 @@ class TestExtraLossComponentAggregation(unittest.TestCase):
     def test_components_in_eval_metrics(self, _mock_all_reduce, _mock_get_rank):
         trainer = self._make_dspark_trainer()
         metrics = trainer._aggregate_eval_metrics(self._steps("loss_pp", "acc_pp", "count_pp"))
-        self.assertAlmostEqual(metrics["eval/ce_loss"], 3.0, places=6)
-        self.assertAlmostEqual(metrics["eval/l1_loss"], 0.5, places=6)
-        self.assertAlmostEqual(metrics["eval/confidence_loss"], 0.2, places=6)
+        self.assertAlmostEqual(metrics["eval/ce_loss"], self._POOLED_CE, places=6)
+        self.assertAlmostEqual(metrics["eval/l1_loss"], self._POOLED_L1, places=6)
+        self.assertAlmostEqual(metrics["eval/confidence_loss"], self._POOLED_CONF, places=6)
+
+    def test_components_pooled_across_ranks(self):
+        from torchspec.training import dflash_trainer as trainer_module
+
+        trainer = self._make_dspark_trainer()
+
+        def add_sparser_rank(tensor, *, op):
+            self.assertEqual(op, torch.distributed.ReduceOp.SUM)
+            # A second rank with far fewer supervised tokens: ce numerator 10 over
+            # denominator 10, i.e. a local mean of 1.0.
+            tensor[0].add_(torch.tensor([10.0, 10.0]))
+
+        with (
+            mock.patch.object(trainer_module.dist, "is_initialized", return_value=True),
+            mock.patch.object(trainer_module.dist, "get_world_size", return_value=2),
+            mock.patch.object(trainer_module.dist, "all_reduce", side_effect=add_sparser_rank),
+        ):
+            out = trainer._reduce_loss_components(
+                self._steps("loss_per_position", "acc_per_position", "count_per_position"),
+                "train/",
+            )
+
+        # (20 + 120 + 10) / (10 + 30 + 10) == 3.0. A mean of per-rank means would
+        # instead give (3.5 + 1.0) / 2 == 2.25.
+        self.assertAlmostEqual(out["train/ce_loss"], 3.0, places=6)
+        self.assertNotAlmostEqual(out["train/ce_loss"], 2.25, places=2)
 
 
 class TestDFlashL1Loss(unittest.TestCase):

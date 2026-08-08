@@ -146,9 +146,10 @@ class TestDSparkForward(unittest.TestCase):
         self.assertEqual(len(out), 7)
         loss, acc, lpp, app, cpp, comps, loss_terms = out
         self.assertEqual(set(comps), {"ce_loss", "l1_loss", "confidence_loss"})
-        for v in comps.values():
-            self.assertTrue(torch.isfinite(v).all())
-            self.assertFalse(v.requires_grad)  # detached for logging
+        for pair in comps.values():
+            for v in pair:  # (numerator, denominator), pooled by the trainer
+                self.assertTrue(torch.isfinite(v).all())
+                self.assertFalse(v.requires_grad)  # detached for logging
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(lpp.shape[0], m.block_size)
         numerator, denominator = loss_terms
@@ -160,9 +161,12 @@ class TestDSparkForward(unittest.TestCase):
         # the components are a faithful decomposition of what's optimized.
         m = _make_dspark_model()
         loss, _, _, _, _, comps, _ = m(**_batch(seed=1))
+        denominator = comps["ce_loss"][1]
         recomputed = (
-            CE_A * comps["ce_loss"] + L1_A * comps["l1_loss"] + CF_A * comps["confidence_loss"]
-        )
+            CE_A * comps["ce_loss"][0]
+            + L1_A * comps["l1_loss"][0]
+            + CF_A * comps["confidence_loss"][0]
+        ) / denominator
         self.assertTrue(
             torch.allclose(loss, recomputed, atol=1e-4), f"{loss.item()} vs {recomputed.item()}"
         )
@@ -171,8 +175,10 @@ class TestDSparkForward(unittest.TestCase):
         m = _make_dspark_model()
         loss, _, _, _, _, comps, _ = m(**_batch(all_masked=True))
         self.assertAlmostEqual(loss.item(), 0.0, places=5)
-        for v in comps.values():
-            self.assertAlmostEqual(v.item(), 0.0, places=5)
+        for numerator, denominator in comps.values():
+            self.assertAlmostEqual(numerator.item(), 0.0, places=5)
+            # Zero denominator too, so the trainer's pooling must guard it.
+            self.assertAlmostEqual(denominator.item(), 0.0, places=5)
 
     def test_next_token_convention_all_slots_supervised(self):
         # Fix 1: every within-block slot predicts a real token (B predictions),

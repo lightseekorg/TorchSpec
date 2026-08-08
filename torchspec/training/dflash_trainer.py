@@ -438,20 +438,45 @@ class DFlashTrainer(Trainer):
         return avg_loss, avg_acc
 
     def _reduce_loss_components(self, all_step_metrics: list[dict], prefix: str) -> dict:
+        """Reduce extra loss components into ``{prefix}{key}`` token-pooled means.
+
+        Components arrive as ``(numerator, denominator)`` pairs and are pooled the
+        same way the optimized objective is: sum both sides over the accumulation
+        window and the data-parallel group, then divide once. Averaging pre-divided
+        per-micro-batch means instead would weight a sparsely supervised
+        micro-batch the same as a dense one, so the component curves could diverge
+        from the loss actually being optimized.
+
+        All keys share one all-reduce and one host sync.
         """
-        Reduce extra scalar loss components into ``{prefix}{key}`` global means.
-        """
-        out: dict = {}
+        keys: list[str] = []
+        totals: list[torch.Tensor] = []
         for key in self._extra_loss_component_keys:
-            vals = [m[key] for m in all_step_metrics if key in m]
-            if not vals:
+            pairs = [m[key] for m in all_step_metrics if key in m]
+            if not pairs:
                 continue
-            value = torch.stack([v.float() for v in vals]).mean()
-            if dist.is_initialized() and dist.get_world_size() > 1:
-                dist.all_reduce(value, op=dist.ReduceOp.SUM)
-                value = value / dist.get_world_size()
-            out[f"{prefix}{key}"] = value.item()
-        return out
+            keys.append(key)
+            totals.append(
+                torch.stack(
+                    [
+                        torch.stack(
+                            (
+                                numerator.detach().float().reshape(()),
+                                denominator.detach().float().reshape(()),
+                            )
+                        )
+                        for numerator, denominator in pairs
+                    ]
+                ).sum(dim=0)
+            )
+        if not keys:
+            return {}
+
+        packed = torch.stack(totals)
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        pooled = (packed[:, 0] / packed[:, 1].clamp(min=1e-6)).tolist()
+        return {f"{prefix}{key}": value for key, value in zip(keys, pooled, strict=True)}
 
     def eval_from_cache(self) -> dict:
         """Run forward-only eval over all CPU-cached eval samples.

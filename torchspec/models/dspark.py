@@ -102,12 +102,12 @@ class DSparkModel(DFlashModel):
     ]:
         """DSpark training forward.
 
-        Returns DFlashModel.forward's metrics plus a dict of
-        detached per-component loss scalars (ce_loss / l1_loss / confidence_loss,
-        per-rank local means) and additive loss terms. ``loss`` is the combined
-        ce+l1+confidence objective; the per-position metrics are cross-entropy
-        based (acceptance proxy). DSparkTrainer unpacks the extra elements; the rest
-        of DFlash's aggregation is reused unchanged.
+        Returns DFlashModel.forward's metrics plus a dict of detached per-component
+        ``(numerator, denominator)`` pairs (ce_loss / l1_loss / confidence_loss) and
+        the additive loss terms. ``loss`` is the combined ce+l1+confidence
+        objective; the per-position metrics are cross-entropy based (acceptance
+        proxy). DSparkTrainer unpacks the extra elements; the rest of DFlash's
+        aggregation is reused unchanged.
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -229,13 +229,16 @@ class DSparkModel(DFlashModel):
         )
         loss = loss_numerator / local_den.clamp(min=1e-6)
 
-        # Per-component loss values (per-rank local means) for logging only —
-        # lets you watch L1 fall while the greedy-CE proxy plateaus.
-        local_den_eps = local_den + 1e-6
+        # Per-component terms for logging only — lets you watch L1 fall while the
+        # greedy-CE proxy plateaus. Reported as numerator/denominator rather than a
+        # local mean so the trainer can pool them over the same window as the
+        # objective; averaging per-micro-batch means would let these curves drift
+        # away from the loss actually optimized.
+        component_denominator = local_den.detach()
         loss_components = {
-            "ce_loss": (ce_num / local_den_eps).detach(),
-            "l1_loss": (l1_num / local_den_eps).detach(),
-            "confidence_loss": (conf_num / local_den_eps).detach(),
+            "ce_loss": (ce_num.detach(), component_denominator),
+            "l1_loss": (l1_num.detach(), component_denominator),
+            "confidence_loss": (conf_num.detach(), component_denominator),
         }
 
         # ---- Metrics (cross-entropy based; all block_size slots are productive) ----
