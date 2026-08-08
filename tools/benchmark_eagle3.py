@@ -127,7 +127,7 @@ def run_eagle3_forward(model, batch):
             eagle3.length,
         )
 
-    plosses, _, acces = model(
+    plosses, _, acces, _, _ = model(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
         target=target,

@@ -25,7 +25,11 @@ from torchspec.models.ops.flex_attention import (
     eagle3_block_mask,
     generate_eagle3_mask,
 )
-from torchspec.models.ops.loss import compiled_forward_kl_loss
+from torchspec.models.ops.loss import (
+    compiled_forward_kl_loss,
+    compiled_lk_alpha_loss,
+    compiled_lk_lambda_loss,
+)
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 __all__ = [
@@ -35,5 +39,7 @@ __all__ = [
     "eagle3_block_mask",
     "generate_eagle3_mask",
     "compiled_forward_kl_loss",
+    "compiled_lk_alpha_loss",
+    "compiled_lk_lambda_loss",
     "compute_assistant_loss_mask",
 ]

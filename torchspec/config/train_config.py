@@ -112,7 +112,9 @@ class TrainingConfig:
 
     gradient_checkpointing: bool = False
     learning_rate: float = 1e-4
+    lk_eta: float = 3.0
     load_path: Optional[str] = None
+    loss_type: str = "forward_kl"  # "forward_kl", "lk_alpha", or "lk_lambda" (Eagle3 only)
     lr_decay_style: str = "cosine"
     lr_wsd_decay_ratio: float = 0.2
     lr_wsd_decay_style: str = "cosine"

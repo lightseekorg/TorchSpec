@@ -32,6 +32,19 @@ def _softmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
     return torch.exp(logits_f32 - torch.logsumexp(logits_f32, dim=-1, keepdim=True))
 
 
+def _rmsnorm_logits(
+    hs_flat: torch.Tensor,
+    norm_weight: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor:
+    hs_f32 = hs_flat.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs_flat.dtype) * norm_weight
+    return F.linear(norm_hs, lm_head_weight)
+
+
 @torch.compile(dynamic=None)
 def compiled_sum_forward_kl_loss(
     prenorm_hidden_states_flat,
@@ -96,6 +109,69 @@ def compiled_forward_kl_loss(
 
 
 @torch.compile(dynamic=None)
+def compiled_lk_alpha_loss(
+    prenorm_hidden_states_flat,
+    target_p_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    norm_eps,
+):
+    """LK^alpha loss: -log(acceptance_rate), summed over valid positions.
+
+    Directly optimizes the (log) acceptance rate alpha_i = sum_x min(p_i(x), q_i(x))
+    from "LK Losses: Direct Acceptance Rate Optimization for Speculative Decoding"
+    (arXiv:2602.23881). Returns (loss_sum, correct_sum, count, alpha_sum) — the same
+    sum/count convention as ``compiled_forward_kl_loss`` plus a trailing alpha sum.
+    """
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    tp = target_p_flat.index_select(0, valid_idx)
+
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    q = _softmax_from_logits(logits)
+
+    alpha = torch.min(tp, q).sum(-1)
+    token_loss = -torch.log(alpha.clamp(min=1e-8))
+    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count, alpha.sum()
+
+
+@torch.compile(dynamic=None)
+def compiled_lk_lambda_loss(
+    prenorm_hidden_states_flat,
+    target_p_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    norm_eps,
+    eta,
+):
+    """LK^lambda loss: lambda*KL(p||q) + (1-lambda)*TV(p,q), lambda = exp(-eta*sg[alpha]).
+
+    Returns (loss_sum, correct_sum, count, alpha_sum), matching
+    ``compiled_lk_alpha_loss``'s convention.
+    """
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    tp = target_p_flat.index_select(0, valid_idx)
+
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    q = _softmax_from_logits(logits)
+    log_q = F.log_softmax(logits.float(), dim=-1)
+
+    alpha = torch.min(tp, q).sum(-1)
+    lam = torch.exp(-eta * alpha.detach())
+
+    kl = F.kl_div(log_q, tp, reduction="none").sum(-1)
+    tv = 0.5 * (tp - q).abs().sum(-1)
+    token_loss = lam * kl + (1.0 - lam) * tv
+
+    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count, alpha.sum()
+
+
+@torch.compile(dynamic=None)
 def compiled_sum_forward_kl_loss_from_hs(
     prenorm_hidden_states_flat,
     target_hidden_states_flat,
@@ -121,6 +197,67 @@ def compiled_sum_forward_kl_loss_from_hs(
     correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
     return token_loss.sum(), correct.sum(), count
+
+
+@torch.compile(dynamic=None)
+def compiled_lk_alpha_loss_from_hs(
+    prenorm_hidden_states_flat,
+    target_hidden_states_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    target_lm_head_weight,
+    norm_eps,
+):
+    """LK^alpha loss from hidden states (LazyTarget path). See ``compiled_lk_alpha_loss``."""
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    ths = target_hidden_states_flat.index_select(0, valid_idx)
+
+    target_logits = F.linear(ths, target_lm_head_weight)
+    tp = _softmax_from_logits(target_logits)
+
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    q = _softmax_from_logits(logits)
+
+    alpha = torch.min(tp, q).sum(-1)
+    token_loss = -torch.log(alpha.clamp(min=1e-8))
+    correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count, alpha.sum()
+
+
+@torch.compile(dynamic=None)
+def compiled_lk_lambda_loss_from_hs(
+    prenorm_hidden_states_flat,
+    target_hidden_states_flat,
+    valid_idx,
+    norm_weight,
+    lm_head_weight,
+    target_lm_head_weight,
+    norm_eps,
+    eta,
+):
+    """LK^lambda loss from hidden states (LazyTarget path). See ``compiled_lk_lambda_loss``."""
+    hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
+    ths = target_hidden_states_flat.index_select(0, valid_idx)
+
+    target_logits = F.linear(ths, target_lm_head_weight)
+    tp = _softmax_from_logits(target_logits)
+
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    q = _softmax_from_logits(logits)
+    log_q = F.log_softmax(logits.float(), dim=-1)
+
+    alpha = torch.min(tp, q).sum(-1)
+    lam = torch.exp(-eta * alpha.detach())
+
+    kl = F.kl_div(log_q, tp, reduction="none").sum(-1)
+    tv = 0.5 * (tp - q).abs().sum(-1)
+    token_loss = lam * kl + (1.0 - lam) * tv
+
+    correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()
+    count = torch.ones_like(token_loss, dtype=torch.float32).sum()
+    return token_loss.sum(), correct.sum(), count, alpha.sum()
 
 
 @torch.compile(dynamic=None)

@@ -111,6 +111,8 @@ class Eagle3Trainer(Trainer):
             length=self.args.ttt_length,
             attention_backend=self.args.attention_backend,
             gradient_checkpointing=getattr(self.args, "gradient_checkpointing", True),
+            loss_type=getattr(self.args, "loss_type", "forward_kl"),
+            lk_eta=getattr(self.args, "lk_eta", 3.0),
         )
 
         full_state = eagle3_model.state_dict() if dist.get_rank() == 0 else {}
@@ -277,7 +279,15 @@ class Eagle3Trainer(Trainer):
     # Forward / backward
     # ------------------------------------------------------------------
 
-    def _forward(self, batch: dict) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _forward(
+        self, batch: dict
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+        List[torch.Tensor],
+    ]:
         input_ids = padding(batch["input_ids"], left=False).cuda()
         target_hidden_states = padding(batch["last_hidden_states"], left=False).cuda()
 
@@ -306,7 +316,7 @@ class Eagle3Trainer(Trainer):
             )
         del target_hidden_states
 
-        plosses, vlosses, acces, acc_counts = self.model(
+        plosses, vlosses, acces, acc_counts, alphas = self.model(
             input_ids=input_ids,
             attention_mask=batch["attention_mask"].cuda(),
             target=target,
@@ -316,7 +326,7 @@ class Eagle3Trainer(Trainer):
             if batch.get("position_ids") is not None
             else None,
         )
-        return plosses, vlosses, acces, acc_counts
+        return plosses, vlosses, acces, acc_counts, alphas
 
     def _backward(self, plosses: List[torch.Tensor], accumulation_steps: int = 1) -> torch.Tensor:
         ploss = (
@@ -333,11 +343,12 @@ class Eagle3Trainer(Trainer):
     def eval_forward(self, batch: dict) -> dict:
         """Single forward pass without backward — returns per-position metrics."""
         with torch.no_grad():
-            _plosses, vlosses, acces, acc_counts = self._forward(batch)
+            _plosses, vlosses, acces, acc_counts, alphas = self._forward(batch)
         return {
             "vlosses": torch.stack(vlosses).detach(),
             "acces": torch.stack(acces).detach(),
             "acc_counts": torch.stack(acc_counts).detach(),
+            "alphas": torch.stack(alphas).detach(),
         }
 
     def eval_from_cache(self) -> dict:
@@ -372,12 +383,29 @@ class Eagle3Trainer(Trainer):
             return {}
 
         avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
-        avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
+        # Weight by acc_counts (valid-token count per eval-cache chunk) rather than
+        # averaging per-chunk accuracies directly — chunks can have very different
+        # numbers of loss positions, so a naive mean-of-means over- or under-weights
+        # small chunks relative to a true token-weighted mean.
+        acc_counts = torch.stack([m["acc_counts"] for m in all_step_metrics]).sum(dim=0)
+        acc_correct = torch.stack([m["acces"] * m["acc_counts"] for m in all_step_metrics]).sum(
+            dim=0
+        )
+        alpha_weighted = torch.stack([m["alphas"] * m["acc_counts"] for m in all_step_metrics]).sum(
+            dim=0
+        )
 
         dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
-        dist.all_reduce(avg_acces, op=dist.ReduceOp.AVG)
+        dist.all_reduce(acc_counts, op=dist.ReduceOp.SUM)
+        dist.all_reduce(acc_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(alpha_weighted, op=dist.ReduceOp.SUM)
+
+        denom = acc_counts.clamp_min(1.0)
+        avg_acces = acc_correct / denom
+        avg_alphas = alpha_weighted / denom
 
         avg_acc_scalar = avg_acces.mean().item()
+        avg_alpha_scalar = avg_alphas.mean().item()
 
         cumulative = 1.0
         simulated_acc_len = 0.0
@@ -396,11 +424,13 @@ class Eagle3Trainer(Trainer):
         metrics: dict = {
             "eval/avg_loss": weighted_avg_loss,
             "eval/avg_acc": avg_acc_scalar,
+            "eval/avg_alpha": avg_alpha_scalar,
             "eval/simulated_acc_len": simulated_acc_len,
         }
         for i in range(avg_vlosses.shape[0]):
             metrics[f"eval/ploss_{i}"] = avg_vlosses[i].item()
             metrics[f"eval/acc_{i}"] = avg_acces[i].item()
+            metrics[f"eval/alpha_{i}"] = avg_alphas[i].item()
 
         if dist.get_rank() == 0:
             logger.info(
@@ -422,7 +452,7 @@ class Eagle3Trainer(Trainer):
         batch_idx: int,
         num_batches: int,
     ) -> dict:
-        plosses, vlosses, acces, acc_counts = self._forward(batch)
+        plosses, vlosses, acces, acc_counts, alphas = self._forward(batch)
         total_loss = self._backward(plosses, accumulation_steps=accumulation_steps)
 
         return {
@@ -430,6 +460,7 @@ class Eagle3Trainer(Trainer):
             "vlosses": torch.stack(vlosses).detach(),
             "acces": torch.stack(acces).detach(),
             "acc_counts": torch.stack(acc_counts).detach(),
+            "alphas": torch.stack(alphas).detach(),
             "plosses_raw": [p.detach() for p in plosses],
             "acces_raw": [a.detach() for a in acces],
             "total_loss": total_loss.detach(),
@@ -464,11 +495,22 @@ class Eagle3Trainer(Trainer):
             return {}
 
         avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
-        avg_acces = torch.stack([m["acces"] for m in all_step_metrics]).mean(dim=0)
+        # Weight by acc_counts instead of averaging per-accumulation-step accuracies
+        # directly: microbatches can carry very different numbers of loss positions,
+        # so a mean-of-means over/under-weights small microbatches relative to a true
+        # token-weighted mean across both gradient-accumulation steps and DP ranks.
+        acc_counts_sum = torch.stack([m["acc_counts"] for m in all_step_metrics]).sum(dim=0)
+        acc_correct_sum = torch.stack([m["acces"] * m["acc_counts"] for m in all_step_metrics]).sum(
+            dim=0
+        )
+        alpha_weighted_sum = torch.stack(
+            [m["alphas"] * m["acc_counts"] for m in all_step_metrics]
+        ).sum(dim=0)
 
         num_depths = avg_vlosses.shape[0]
-        reduced_metrics = torch.cat((avg_vlosses, avg_acces))
-        dist.all_reduce(reduced_metrics, op=dist.ReduceOp.AVG)
+        weighted_counts = torch.cat((acc_correct_sum, acc_counts_sum, alpha_weighted_sum))
+        dist.all_reduce(avg_vlosses, op=dist.ReduceOp.AVG)
+        dist.all_reduce(weighted_counts, op=dist.ReduceOp.SUM)
 
         grad_norm_value = (
             grad_norm.to(device=avg_vlosses.device, dtype=avg_vlosses.dtype)
@@ -478,7 +520,8 @@ class Eagle3Trainer(Trainer):
         packed_metrics = (
             torch.cat(
                 (
-                    reduced_metrics,
+                    avg_vlosses,
+                    weighted_counts,
                     grad_norm_value.reshape(1),
                 )
             )
@@ -530,14 +573,26 @@ class Eagle3Trainer(Trainer):
         learning_rate: float,
     ) -> dict:
         ploss_values = metric_values[:num_depths]
-        acc_values = metric_values[num_depths : 2 * num_depths]
+        acc_correct_values = metric_values[num_depths : 2 * num_depths]
+        acc_counts_values = metric_values[2 * num_depths : 3 * num_depths]
+        alpha_weighted_values = metric_values[3 * num_depths : 4 * num_depths]
         grad_norm_scalar = metric_values[-1]
+
+        acc_values = [
+            correct / max(count, 1.0)
+            for correct, count in zip(acc_correct_values, acc_counts_values)
+        ]
+        alpha_values = [
+            alpha / max(count, 1.0)
+            for alpha, count in zip(alpha_weighted_values, acc_counts_values)
+        ]
 
         weighted_avg_loss_value = (
             sum(loss * weight for loss, weight in zip(ploss_values, self._ploss_weights))
             / self._ploss_weight_sum
         )
         avg_acc_scalar = sum(acc_values) / num_depths
+        avg_alpha_scalar = sum(alpha_values) / num_depths
         cumulative = 1.0
         simulated_acc_len_value = 0.0
         for acc in acc_values:
@@ -547,6 +602,7 @@ class Eagle3Trainer(Trainer):
         metrics = {
             "train/avg_loss": weighted_avg_loss_value,
             "train/avg_acc": avg_acc_scalar,
+            "train/avg_alpha": avg_alpha_scalar,
             "train/simulated_acc_len": simulated_acc_len_value,
             "train/grad_norm": grad_norm_scalar,
             "train/global_step": metric_step,
@@ -557,6 +613,7 @@ class Eagle3Trainer(Trainer):
         for i in range(num_depths):
             metrics[f"train/ploss_{i}"] = ploss_values[i]
             metrics[f"train/acc_{i}"] = acc_values[i]
+            metrics[f"train/alpha_{i}"] = alpha_values[i]
 
         if dist.get_rank() == 0:
             logger.debug(f"step {metric_step}: {metrics}")

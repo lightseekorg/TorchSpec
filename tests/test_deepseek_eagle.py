@@ -322,7 +322,7 @@ class TestEagle3ModelTTT(unittest.TestCase):
 
         precomputed = PrecomputedTarget(target_p_padded)
         with torch.no_grad():
-            plosses_pre, _, acces_pre = model(
+            plosses_pre, _, acces_pre, _, _ = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 target=precomputed,
@@ -336,7 +336,7 @@ class TestEagle3ModelTTT(unittest.TestCase):
             length,
         )
         with torch.no_grad():
-            plosses_lazy, _, acces_lazy = model(
+            plosses_lazy, _, acces_lazy, _, _ = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 target=lazy,
@@ -407,7 +407,7 @@ class TestFlexAttentionTTT(unittest.TestCase):
 
         precomputed = PrecomputedTarget(target_p_padded)
         with torch.no_grad():
-            plosses, _, acces = model(
+            plosses, _, acces, _, _ = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 target=precomputed,
@@ -441,7 +441,7 @@ class TestFlexAttentionTTT(unittest.TestCase):
 
             precomputed = PrecomputedTarget(target_p_padded)
             with torch.no_grad():
-                plosses, _, _ = model(
+                plosses, _, _, _, _ = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     target=precomputed,

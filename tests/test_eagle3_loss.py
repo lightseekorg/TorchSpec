@@ -2,10 +2,11 @@
 
 Verifies that:
 1. compiled_forward_kl_loss matches a naive reference implementation.
-2. compute_target_p_padded produces correct shapes and valid probabilities
+2. compiled_lk_alpha_loss and compiled_lk_lambda_loss match reference implementations.
+3. compute_target_p_padded produces correct shapes and valid probabilities
    for both pruning and non-pruning paths.
-3. The lazy target path (non-pruning, target_p_padded=None) produces identical
-   losses to the pre-computed target_p_padded path.
+4. The lazy target path (non-pruning, target_p_padded=None) produces identical
+   losses to the pre-computed target_p_padded path for all loss types.
 """
 
 import unittest
@@ -24,6 +25,8 @@ from torchspec.models.eagle3 import (
 from torchspec.models.ops.loss import (
     compiled_forward_kl_loss,
     compiled_forward_kl_loss_from_hs,
+    compiled_lk_alpha_loss,
+    compiled_lk_lambda_loss,
 )
 
 
@@ -39,6 +42,44 @@ def _reference_forward_kl_loss(hs_flat, target_p_flat, norm_weight, lm_head_weig
     loss = -(target_p_flat * log_p).sum(-1).mean()
     acc = (logits.argmax(-1) == target_p_flat.argmax(-1)).float().mean()
     return loss, acc
+
+
+def _reference_lk_alpha_loss(hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps):
+    """Pure-Python reference for LK^alpha loss."""
+    hs_f32 = hs_flat.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs_flat.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)
+    q = F.softmax(logits.float(), dim=-1)
+
+    alpha = torch.min(target_p_flat, q).sum(-1)
+    loss = -torch.log(alpha.clamp(min=1e-8)).mean()
+    acc = (logits.argmax(-1) == target_p_flat.argmax(-1)).float().mean()
+    return loss, acc, alpha.mean()
+
+
+def _reference_lk_lambda_loss(hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps, eta):
+    """Pure-Python reference for LK^lambda loss."""
+    hs_f32 = hs_flat.float()
+    variance = hs_f32.pow(2).mean(-1, keepdim=True)
+    rstd = torch.rsqrt(variance + norm_eps)
+    norm_hs = (hs_f32 * rstd).to(hs_flat.dtype) * norm_weight
+
+    logits = F.linear(norm_hs, lm_head_weight)
+    q = F.softmax(logits.float(), dim=-1)
+    log_q = F.log_softmax(logits.float(), dim=-1)
+
+    alpha = torch.min(target_p_flat, q).sum(-1)
+    lam = torch.exp(-eta * alpha.detach())
+
+    kl = F.kl_div(log_q, target_p_flat, reduction="none").sum(-1)
+    tv = 0.5 * (target_p_flat - q).abs().sum(-1)
+
+    loss = (lam * kl + (1.0 - lam) * tv).mean()
+    acc = (logits.argmax(-1) == target_p_flat.argmax(-1)).float().mean()
+    return loss, acc, alpha.mean()
 
 
 def _make_config(H=128, V=256, draft_V=None, num_heads=4, num_kv_heads=2):
@@ -59,13 +100,22 @@ def _make_config(H=128, V=256, draft_V=None, num_heads=4, num_kv_heads=2):
     return config
 
 
-def _make_model(config, length=3, attention_backend="sdpa", device="cpu"):
+def _make_model(
+    config,
+    length=3,
+    attention_backend="sdpa",
+    device="cpu",
+    loss_type="forward_kl",
+    lk_eta=3.0,
+):
     draft_model = LlamaForCausalLMEagle3(config, attention_backend=attention_backend)
     draft_model = draft_model.to(device=device, dtype=torch.bfloat16)
     model = Eagle3Model(
         draft_model,
         length=length,
         attention_backend=attention_backend,
+        loss_type=loss_type,
+        lk_eta=lk_eta,
     )
     model.eval()
     return model
@@ -161,6 +211,161 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         self.assertLessEqual(acc.item(), 1.0)
 
 
+class TestCompiledLkAlphaLoss(unittest.TestCase):
+    """compiled_lk_alpha_loss should match the reference implementation."""
+
+    def test_matches_reference(self):
+        torch.manual_seed(42)
+        N, H, V = 32, 128, 256
+        hs = torch.randn(N, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        norm_eps = 1e-6
+        valid_idx = torch.arange(N)
+
+        raw_logits = F.linear(hs.float(), lm_head_weight.float())
+        target_p = F.softmax(raw_logits + torch.randn_like(raw_logits) * 0.5, dim=-1)
+
+        loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
+        )
+        loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
+        ref_loss, ref_acc, ref_alpha = _reference_lk_alpha_loss(
+            hs, target_p, norm_weight, lm_head_weight, norm_eps
+        )
+
+        torch.testing.assert_close(loss, ref_loss, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(acc, ref_acc, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(alpha, ref_alpha, atol=1e-3, rtol=1e-3)
+
+    def test_perfect_prediction_loss_zero(self):
+        """When draft == target, alpha=1 so -log(alpha)=0."""
+        torch.manual_seed(0)
+        N, H, V = 16, 64, 32
+        norm_weight = torch.ones(H, dtype=torch.float32)
+        lm_head_weight = torch.randn(V, H, dtype=torch.float32)
+        norm_eps = 1e-6
+        valid_idx = torch.arange(N)
+
+        hs = torch.randn(N, H, dtype=torch.float32)
+        variance = hs.pow(2).mean(-1, keepdim=True)
+        rstd = torch.rsqrt(variance + norm_eps)
+        norm_hs = hs * rstd * norm_weight
+        logits = F.linear(norm_hs, lm_head_weight)
+        target_p = F.softmax(logits, dim=-1)
+
+        loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
+        )
+        loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
+        self.assertAlmostEqual(loss.item(), 0.0, places=3)
+        self.assertAlmostEqual(alpha.item(), 1.0, places=3)
+        self.assertAlmostEqual(acc.item(), 1.0, places=2)
+
+    def test_loss_finite_and_alpha_in_range(self):
+        torch.manual_seed(0)
+        N, H, V = 16, 64, 32
+        hs = torch.randn(N, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        target_p = F.softmax(torch.randn(N, V), dim=-1)
+        valid_idx = torch.arange(N)
+
+        loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6
+        )
+        loss, alpha = loss_sum / count, alpha_sum / count
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(alpha.item(), 0.0)
+        self.assertLessEqual(alpha.item(), 1.0)
+
+
+class TestCompiledLkLambdaLoss(unittest.TestCase):
+    """compiled_lk_lambda_loss should match the reference implementation."""
+
+    def test_matches_reference(self):
+        torch.manual_seed(42)
+        N, H, V = 32, 128, 256
+        hs = torch.randn(N, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        norm_eps = 1e-6
+        eta = 3.0
+        valid_idx = torch.arange(N)
+
+        raw_logits = F.linear(hs.float(), lm_head_weight.float())
+        target_p = F.softmax(raw_logits + torch.randn_like(raw_logits) * 0.5, dim=-1)
+
+        loss_sum, correct, count, alpha_sum = compiled_lk_lambda_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, eta
+        )
+        loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
+        ref_loss, ref_acc, ref_alpha = _reference_lk_lambda_loss(
+            hs, target_p, norm_weight, lm_head_weight, norm_eps, eta
+        )
+
+        torch.testing.assert_close(loss, ref_loss, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(acc, ref_acc, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(alpha, ref_alpha, atol=1e-3, rtol=1e-3)
+
+    def test_eta_sensitivity(self):
+        """Different eta values should produce different losses."""
+        torch.manual_seed(42)
+        N, H, V = 32, 128, 256
+        hs = torch.randn(N, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        target_p = F.softmax(torch.randn(N, V), dim=-1)
+        valid_idx = torch.arange(N)
+
+        loss_eta3, _, count3, _ = compiled_lk_lambda_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, 3.0
+        )
+        loss_eta10, _, count10, _ = compiled_lk_lambda_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, 10.0
+        )
+        self.assertFalse(torch.allclose(loss_eta3 / count3, loss_eta10 / count10))
+
+    def test_perfect_prediction_loss_zero(self):
+        """When draft == target, KL=0 and TV=0 so loss=0."""
+        torch.manual_seed(0)
+        N, H, V = 16, 64, 32
+        norm_weight = torch.ones(H, dtype=torch.float32)
+        lm_head_weight = torch.randn(V, H, dtype=torch.float32)
+        norm_eps = 1e-6
+        valid_idx = torch.arange(N)
+
+        hs = torch.randn(N, H, dtype=torch.float32)
+        variance = hs.pow(2).mean(-1, keepdim=True)
+        rstd = torch.rsqrt(variance + norm_eps)
+        norm_hs = hs * rstd * norm_weight
+        logits = F.linear(norm_hs, lm_head_weight)
+        target_p = F.softmax(logits, dim=-1)
+
+        loss_sum, _correct, count, alpha_sum = compiled_lk_lambda_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, 3.0
+        )
+        loss, alpha = loss_sum / count, alpha_sum / count
+        self.assertAlmostEqual(loss.item(), 0.0, places=3)
+        self.assertAlmostEqual(alpha.item(), 1.0, places=3)
+
+    def test_loss_finite(self):
+        torch.manual_seed(0)
+        N, H, V = 16, 64, 32
+        hs = torch.randn(N, H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
+        target_p = F.softmax(torch.randn(N, V), dim=-1)
+        valid_idx = torch.arange(N)
+
+        loss_sum, _correct, count, _alpha_sum = compiled_lk_lambda_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, 3.0
+        )
+        loss = loss_sum / count
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(loss.item(), 0.0)
+
+
 class TestComputeTargetPPadded(unittest.TestCase):
     """compute_target_p_padded: shape, dtype, and probability correctness."""
 
@@ -218,12 +423,14 @@ class TestComputeTargetPPadded(unittest.TestCase):
 class TestLazyVsPrecomputedTarget(unittest.TestCase):
     """The lazy path (target_p_padded=None) must produce identical losses."""
 
-    def _run_both_paths(self, device="cpu"):
+    def _run_both_paths(self, device="cpu", loss_type="forward_kl", lk_eta=3.0):
         torch.manual_seed(42)
         H, V, B, T, length = 128, 256, 1, 32, 3
 
         config = _make_config(H=H, V=V)
-        model = _make_model(config, length=length, device=device)
+        model = _make_model(
+            config, length=length, device=device, loss_type=loss_type, lk_eta=lk_eta
+        )
         batch = _make_batch(B, T, H, V, device=device)
 
         draft_model = model.draft_model
@@ -236,7 +443,7 @@ class TestLazyVsPrecomputedTarget(unittest.TestCase):
 
         precomputed = PrecomputedTarget(target_p_padded)
         with torch.no_grad():
-            plosses_pre, _, acces_pre, _ = model(
+            plosses_pre, _, acces_pre, _, alphas_pre = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 target=precomputed,
@@ -250,7 +457,7 @@ class TestLazyVsPrecomputedTarget(unittest.TestCase):
             length,
         )
         with torch.no_grad():
-            plosses_lazy, _, acces_lazy, _ = model(
+            plosses_lazy, _, acces_lazy, _, alphas_lazy = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 target=lazy,
@@ -258,46 +465,56 @@ class TestLazyVsPrecomputedTarget(unittest.TestCase):
                 hidden_states=batch["hidden_states"],
             )
 
-        return plosses_pre, acces_pre, plosses_lazy, acces_lazy
+        return plosses_pre, acces_pre, alphas_pre, plosses_lazy, acces_lazy, alphas_lazy
 
-    def test_losses_match_cpu(self):
-        plosses_pre, acces_pre, plosses_lazy, acces_lazy = self._run_both_paths("cpu")
+    def _assert_paths_match(self, device, loss_type="forward_kl", lk_eta=3.0, atol=1e-4, rtol=1e-4):
+        results = self._run_both_paths(device, loss_type=loss_type, lk_eta=lk_eta)
+        plosses_pre, acces_pre, alphas_pre, plosses_lazy, acces_lazy, alphas_lazy = results
         for i, (pre, lazy) in enumerate(zip(plosses_pre, plosses_lazy)):
             torch.testing.assert_close(
                 pre,
                 lazy,
-                atol=1e-4,
-                rtol=1e-4,
-                msg=f"Loss mismatch at position {i}",
+                atol=atol,
+                rtol=rtol,
+                msg=f"Loss mismatch at position {i} (loss_type={loss_type})",
             )
         for i, (pre, lazy) in enumerate(zip(acces_pre, acces_lazy)):
             torch.testing.assert_close(
                 pre,
                 lazy,
-                atol=1e-4,
-                rtol=1e-4,
-                msg=f"Accuracy mismatch at position {i}",
+                atol=atol,
+                rtol=rtol,
+                msg=f"Accuracy mismatch at position {i} (loss_type={loss_type})",
             )
+        for i, (pre, lazy) in enumerate(zip(alphas_pre, alphas_lazy)):
+            torch.testing.assert_close(
+                pre,
+                lazy,
+                atol=atol,
+                rtol=rtol,
+                msg=f"Alpha mismatch at position {i} (loss_type={loss_type})",
+            )
+
+    def test_forward_kl_losses_match_cpu(self):
+        self._assert_paths_match("cpu", loss_type="forward_kl")
+
+    def test_lk_alpha_losses_match_cpu(self):
+        self._assert_paths_match("cpu", loss_type="lk_alpha")
+
+    def test_lk_lambda_losses_match_cpu(self):
+        self._assert_paths_match("cpu", loss_type="lk_lambda")
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
-    def test_losses_match_cuda(self):
-        plosses_pre, acces_pre, plosses_lazy, acces_lazy = self._run_both_paths("cuda")
-        for i, (pre, lazy) in enumerate(zip(plosses_pre, plosses_lazy)):
-            torch.testing.assert_close(
-                pre,
-                lazy,
-                atol=1e-3,
-                rtol=1e-3,
-                msg=f"Loss mismatch at position {i}",
-            )
-        for i, (pre, lazy) in enumerate(zip(acces_pre, acces_lazy)):
-            torch.testing.assert_close(
-                pre,
-                lazy,
-                atol=1e-3,
-                rtol=1e-3,
-                msg=f"Accuracy mismatch at position {i}",
-            )
+    def test_forward_kl_losses_match_cuda(self):
+        self._assert_paths_match("cuda", loss_type="forward_kl", atol=1e-3, rtol=1e-3)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_lk_alpha_losses_match_cuda(self):
+        self._assert_paths_match("cuda", loss_type="lk_alpha", atol=1e-3, rtol=1e-3)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_lk_lambda_losses_match_cuda(self):
+        self._assert_paths_match("cuda", loss_type="lk_lambda", atol=1e-3, rtol=1e-3)
 
 
 class TestRotaryConfigWiring(unittest.TestCase):
@@ -449,6 +666,83 @@ class TestValidIdxSubsetting(unittest.TestCase):
         torch.testing.assert_close(loss, loss_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(acc, acc_ref, atol=1e-5, rtol=1e-5)
 
+    def _check_lk_alpha(self, valid_idx):
+        torch.manual_seed(7)
+        hs_flat = torch.randn(self.BT, self.H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(self.H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
+        tp_flat = F.softmax(torch.randn(self.BT, self.V), dim=-1)
+        norm_eps = 1e-6
+
+        loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
+            hs_flat,
+            tp_flat,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+        )
+        loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
+
+        hs_valid = hs_flat[valid_idx]
+        tp_valid = tp_flat[valid_idx]
+        all_idx = torch.arange(hs_valid.shape[0])
+        loss_sum_ref, correct_ref, count_ref, alpha_sum_ref = compiled_lk_alpha_loss(
+            hs_valid,
+            tp_valid,
+            all_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+        )
+        loss_ref = loss_sum_ref / count_ref
+        acc_ref = correct_ref / count_ref
+        alpha_ref = alpha_sum_ref / count_ref
+
+        torch.testing.assert_close(loss, loss_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(acc, acc_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(alpha, alpha_ref, atol=1e-5, rtol=1e-5)
+
+    def _check_lk_lambda(self, valid_idx):
+        torch.manual_seed(7)
+        hs_flat = torch.randn(self.BT, self.H, dtype=torch.bfloat16)
+        norm_weight = torch.randn(self.H, dtype=torch.bfloat16)
+        lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
+        tp_flat = F.softmax(torch.randn(self.BT, self.V), dim=-1)
+        norm_eps = 1e-6
+        eta = 3.0
+
+        loss_sum, correct, count, alpha_sum = compiled_lk_lambda_loss(
+            hs_flat,
+            tp_flat,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+            eta,
+        )
+        loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
+
+        hs_valid = hs_flat[valid_idx]
+        tp_valid = tp_flat[valid_idx]
+        all_idx = torch.arange(hs_valid.shape[0])
+        loss_sum_ref, correct_ref, count_ref, alpha_sum_ref = compiled_lk_lambda_loss(
+            hs_valid,
+            tp_valid,
+            all_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+            eta,
+        )
+        loss_ref = loss_sum_ref / count_ref
+        acc_ref = correct_ref / count_ref
+        alpha_ref = alpha_sum_ref / count_ref
+
+        torch.testing.assert_close(loss, loss_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(acc, acc_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(alpha, alpha_ref, atol=1e-5, rtol=1e-5)
+
 
 # Dynamically generate one test method per mask pattern per loss function.
 for _name, _vidx in _make_mask_patterns(TestValidIdxSubsetting.BT):
@@ -465,8 +759,22 @@ for _name, _vidx in _make_mask_patterns(TestValidIdxSubsetting.BT):
 
         return test
 
+    def _make_lk_alpha(vidx=_vidx):
+        def test(self):
+            self._check_lk_alpha(vidx)
+
+        return test
+
+    def _make_lk_lambda(vidx=_vidx):
+        def test(self):
+            self._check_lk_lambda(vidx)
+
+        return test
+
     setattr(TestValidIdxSubsetting, f"test_forward_kl_{_name}", _make_kl())
     setattr(TestValidIdxSubsetting, f"test_forward_kl_from_hs_{_name}", _make_kl_from_hs())
+    setattr(TestValidIdxSubsetting, f"test_lk_alpha_{_name}", _make_lk_alpha())
+    setattr(TestValidIdxSubsetting, f"test_lk_lambda_{_name}", _make_lk_lambda())
 
 
 if __name__ == "__main__":
