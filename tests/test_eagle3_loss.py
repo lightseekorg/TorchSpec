@@ -10,6 +10,7 @@ Verifies that:
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,7 @@ from torchspec.models.ops.loss import (
     compiled_forward_kl_loss_from_hs,
     compiled_lk_alpha_loss,
     compiled_lk_lambda_loss,
+    compiled_lk_lambda_loss_from_hs,
 )
 
 
@@ -72,13 +74,22 @@ def _reference_lk_alpha_loss(
 
 
 def _reference_lk_lambda_loss(
-    hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps, eta, coverage_flat=None
+    hs_flat,
+    target_p_flat,
+    norm_weight,
+    lm_head_weight,
+    norm_eps,
+    eta,
+    coverage_flat=None,
+    external_mean_alpha=None,
 ):
     """Pure-Python reference for LK^lambda loss.
 
     ``lambda`` is computed once from the mean acceptance rate across the whole
     call (i.e. one EAGLE-3 depth), matching the paper's schedule rather than a
     per-token value. See ``_reference_lk_alpha_loss`` for ``coverage_flat``.
+    ``external_mean_alpha`` overrides the local mean, mirroring the SP-reduced
+    mean-alpha override used under USP in ``compiled_lk_lambda_loss``.
     """
     hs_f32 = hs_flat.float()
     variance = hs_f32.pow(2).mean(-1, keepdim=True)
@@ -94,7 +105,8 @@ def _reference_lk_lambda_loss(
     target_p_true = target_p_flat * coverage_flat.unsqueeze(-1)
 
     alpha = torch.min(target_p_true, q).sum(-1)
-    lam = torch.exp(-eta * alpha.mean().detach())
+    mean_alpha = external_mean_alpha if external_mean_alpha is not None else alpha.mean()
+    lam = torch.exp(-eta * mean_alpha.detach())
 
     kl = F.kl_div(log_q, target_p_flat, reduction="none").sum(-1)
     tv = 0.5 * (target_p_true - q).abs().sum(-1)
@@ -355,7 +367,7 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, eta
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, eta
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
         ref_loss, ref_acc, ref_alpha = _reference_lk_lambda_loss(
@@ -378,10 +390,10 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_eta3, _, count3, _ = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, None, 3.0
         )
         loss_eta10, _, count10, _ = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, 10.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, None, 10.0
         )
         self.assertFalse(torch.allclose(loss_eta3 / count3, loss_eta10 / count10))
 
@@ -401,7 +413,15 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.rand(N) * 0.5 + 0.3
 
         loss_sum, _, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, eta
+            hs,
+            target_p_tilde,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+            coverage,
+            None,
+            eta,
         )
         ref_loss, _, ref_alpha = _reference_lk_lambda_loss(
             hs, target_p_tilde, norm_weight, lm_head_weight, norm_eps, eta, coverage
@@ -434,7 +454,7 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, _, _count, _alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, eta
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, eta
         )
 
         variance = hs.pow(2).mean(-1, keepdim=True)
@@ -456,6 +476,57 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         torch.testing.assert_close(loss_sum, shared_loss_sum, atol=1e-4, rtol=1e-4)
         self.assertGreater((loss_sum - per_token_loss_sum).abs().item(), 1e-4)
 
+    def test_external_mean_alpha_overrides_local_mean(self):
+        """Under USP, the caller SP-reduces alpha across the sequence-parallel
+        group before forming lambda and passes the result in as
+        ``external_mean_alpha`` — this must override this call's local mean
+        alpha entirely (not just blend with it), since the local shard alone
+        does not span the depth's full batch/sequence (arXiv:2602.23881)."""
+        torch.manual_seed(6)
+        N, H, V = 4, 32, 24
+        hs = torch.randn(N, H, dtype=torch.float32)
+        norm_weight = torch.randn(H, dtype=torch.float32)
+        lm_head_weight = torch.randn(V, H, dtype=torch.float32)
+        norm_eps = 1e-6
+        eta = 4.0
+        valid_idx = torch.arange(N)
+        target_p = F.softmax(torch.randn(N, V) * 2.0, dim=-1)
+        coverage = torch.ones(N)
+
+        loss_local, _, count, alpha_sum = compiled_lk_lambda_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, eta
+        )
+        local_mean_alpha = alpha_sum / count
+
+        # A deliberately different external mean (as if peer SP shards were
+        # much easier/harder) must change the loss relative to the local-only
+        # computation, and must match a reference that uses it directly.
+        external_mean_alpha = (local_mean_alpha + 0.3).clamp(max=0.99).detach()
+        loss_external, _, _, _ = compiled_lk_lambda_loss(
+            hs,
+            target_p,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+            coverage,
+            external_mean_alpha,
+            eta,
+        )
+        ref_loss, _, _ = _reference_lk_lambda_loss(
+            hs,
+            target_p,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+            eta,
+            coverage,
+            external_mean_alpha=external_mean_alpha,
+        )
+
+        self.assertGreater((loss_local - loss_external).abs().item(), 1e-4)
+        torch.testing.assert_close(loss_external / count, ref_loss, atol=1e-4, rtol=1e-4)
+
     def test_perfect_prediction_loss_zero(self):
         """When draft == target, KL=0 and TV=0 so loss=0."""
         torch.manual_seed(0)
@@ -474,7 +545,7 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, _correct, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, 3.0
         )
         loss, alpha = loss_sum / count, alpha_sum / count
         self.assertAlmostEqual(loss.item(), 0.0, places=3)
@@ -491,11 +562,226 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, _correct, count, _alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, None, 3.0
         )
         loss = loss_sum / count
         self.assertTrue(torch.isfinite(loss))
         self.assertGreaterEqual(loss.item(), 0.0)
+
+
+class TestUspLambdaAlphaReduction(unittest.TestCase):
+    """Under USP, lk_lambda's schedule must use alpha aggregated across the SP
+    group (the depth's full sequence/batch), not just this rank's local
+    shard — the SP all-reduce must happen before lambda is formed inside
+    ``_calculate_loss``, not only in the later, separate metrics all-reduce in
+    ``forward``. See arXiv:2602.23881 (the schedule is defined per depth over
+    the whole batch/sequence, not per shard)."""
+
+    def _make_usp_model_and_inputs(self, B=1, T=8, H=32, V=24, length=1, all_valid=True):
+        torch.manual_seed(11)
+        config = _make_config(H=H, V=V)
+        model = _make_model(config, length=length, loss_type="lk_lambda", lk_eta=4.0)
+        # No real distributed process group is initialized in this test; use a
+        # sentinel so `self._usp_sp_group is not None` triggers the SP-reduce
+        # path, and mock `dist.all_reduce` below instead of using a real group.
+        model._usp_sp_group = "fake-sp-group"
+        # Post-backbone hidden states (matching norm_weight/lm_head_weight's
+        # input dim H) — _calculate_loss operates downstream of the backbone,
+        # unlike the raw (H*3) concat fed into the full model forward.
+        hidden_states = torch.randn(B, T, H, dtype=torch.bfloat16)
+        target_p = F.softmax(torch.randn(B, T, V), dim=-1)
+        target = PrecomputedTarget(F.pad(target_p, (0, 0, 0, length)))
+        mask = torch.ones(B, T) if all_valid else torch.zeros(B, T)
+        norm_weight, lm_head_weight, norm_eps = model.draft_model.get_lm_head_params()
+        return model, hidden_states, target, mask, norm_weight, lm_head_weight, norm_eps
+
+    def test_lambda_uses_sp_reduced_alpha_not_local_shard_alone(self):
+        model, hidden_states, target, mask, norm_weight, lm_head_weight, norm_eps = (
+            self._make_usp_model_and_inputs()
+        )
+        seq_length = mask.shape[1]
+
+        # Simulate a peer SP shard with a much higher local alpha (e.g. an
+        # "easy" chunk of the sequence): the mocked all-reduce adds its
+        # (alpha_sum, count) on top of this rank's real local contribution.
+        peer_alpha_sum = torch.tensor(50.0)
+        peer_count = torch.tensor(10.0)
+
+        def fake_all_reduce(tensor, op, group):
+            self.assertEqual(group, "fake-sp-group")
+            tensor[0] += peer_alpha_sum
+            tensor[1] += peer_count
+
+        with patch(
+            "torchspec.models.eagle3.dist.all_reduce", side_effect=fake_all_reduce
+        ) as mock_reduce:
+            loss_sum, _correct_sum, _count, _alpha_sum = model._calculate_loss(
+                hidden_states=hidden_states,
+                target=target,
+                mask=mask,
+                idx=0,
+                seq_length=seq_length,
+                norm_weight=norm_weight,
+                lm_head_weight=lm_head_weight,
+                norm_eps=norm_eps,
+            )
+        mock_reduce.assert_called_once()
+
+        hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        tp_flat = target.target_p_padded[:, :seq_length, :].reshape(
+            -1, target.target_p_padded.shape[-1]
+        )
+        valid_idx = mask.flatten().nonzero().squeeze(-1)
+        coverage_flat = tp_flat.new_ones(tp_flat.shape[0])
+
+        # Without the fix (local mean alpha only), the loss would differ,
+        # since the peer's alpha materially shifts the schedule.
+        local_only_loss_sum, _, local_only_count, local_only_alpha_sum = compiled_lk_lambda_loss(
+            hs_flat,
+            tp_flat,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+            coverage_flat,
+            None,
+            model.lk_eta,
+        )
+        self.assertGreater((loss_sum - local_only_loss_sum).abs().item(), 1e-4)
+
+        # The actual result must match forming lambda from the true SP-wide
+        # (local + peer) mean alpha.
+        expected_mean_alpha = (
+            (local_only_alpha_sum + peer_alpha_sum) / (local_only_count + peer_count)
+        ).detach()
+        expected_loss_sum, _, _, _ = compiled_lk_lambda_loss(
+            hs_flat,
+            tp_flat,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            norm_eps,
+            coverage_flat,
+            expected_mean_alpha,
+            model.lk_eta,
+        )
+        torch.testing.assert_close(loss_sum, expected_loss_sum, atol=1e-4, rtol=1e-4)
+
+    def test_zero_valid_tokens_still_participates_in_sp_reduce(self):
+        """A rank with no local valid tokens at this depth must still call the
+        SP all-reduce (with a zero contribution) so peer ranks with valid
+        tokens don't hang waiting for it."""
+        model, hidden_states, target, mask, norm_weight, lm_head_weight, norm_eps = (
+            self._make_usp_model_and_inputs(all_valid=False)
+        )
+
+        with patch("torchspec.models.eagle3.dist.all_reduce") as mock_reduce:
+            loss_sum, correct_sum, count, alpha_sum = model._calculate_loss(
+                hidden_states=hidden_states,
+                target=target,
+                mask=mask,
+                idx=0,
+                seq_length=mask.shape[1],
+                norm_weight=norm_weight,
+                lm_head_weight=lm_head_weight,
+                norm_eps=norm_eps,
+            )
+
+        mock_reduce.assert_called_once()
+        (zero_stats_arg,), kwargs = mock_reduce.call_args
+        self.assertEqual(kwargs["group"], "fake-sp-group")
+        torch.testing.assert_close(zero_stats_arg, torch.zeros(2))
+        self.assertEqual(loss_sum.item(), 0.0)
+
+    def test_lazy_target_path_also_uses_sp_reduced_alpha(self):
+        """Same fix, LazyTarget (non-vocab-pruned) path: compiled_lk_lambda_loss_from_hs
+        must also use the SP-reduced mean alpha, not this rank's local shard alone."""
+        torch.manual_seed(12)
+        B, T, H, V, length = 1, 8, 32, 24, 1
+        config = _make_config(H=H, V=V)
+        model = _make_model(config, length=length, loss_type="lk_lambda", lk_eta=4.0)
+        model._usp_sp_group = "fake-sp-group"
+        norm_weight, lm_head_weight, norm_eps = model.draft_model.get_lm_head_params()
+
+        hidden_states = torch.randn(B, T, H, dtype=torch.bfloat16)
+        target_hidden_states = torch.randn(B, T, H, dtype=torch.bfloat16)
+        target = compute_lazy_target_padded(target_hidden_states, lm_head_weight, length)
+        mask = torch.ones(B, T)
+        seq_length = T
+
+        peer_alpha_sum = torch.tensor(50.0)
+        peer_count = torch.tensor(10.0)
+
+        def fake_all_reduce(tensor, op, group):
+            tensor[0] += peer_alpha_sum
+            tensor[1] += peer_count
+
+        with patch("torchspec.models.eagle3.dist.all_reduce", side_effect=fake_all_reduce):
+            loss_sum, _, _, _ = model._calculate_loss(
+                hidden_states=hidden_states,
+                target=target,
+                mask=mask,
+                idx=0,
+                seq_length=seq_length,
+                norm_weight=norm_weight,
+                lm_head_weight=lm_head_weight,
+                norm_eps=norm_eps,
+            )
+
+        hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        ths_flat = target.hidden_states_padded[:, :seq_length, :].reshape(-1, H)
+        valid_idx = mask.flatten().nonzero().squeeze(-1)
+        local_only_loss_sum, _, local_only_count, local_only_alpha_sum = (
+            compiled_lk_lambda_loss_from_hs(
+                hs_flat,
+                ths_flat,
+                valid_idx,
+                norm_weight,
+                lm_head_weight,
+                target.lm_head_weight,
+                norm_eps,
+                None,
+                model.lk_eta,
+            )
+        )
+        self.assertGreater((loss_sum - local_only_loss_sum).abs().item(), 1e-4)
+
+        expected_mean_alpha = (
+            (local_only_alpha_sum + peer_alpha_sum) / (local_only_count + peer_count)
+        ).detach()
+        expected_loss_sum, _, _, _ = compiled_lk_lambda_loss_from_hs(
+            hs_flat,
+            ths_flat,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            target.lm_head_weight,
+            norm_eps,
+            expected_mean_alpha,
+            model.lk_eta,
+        )
+        torch.testing.assert_close(loss_sum, expected_loss_sum, atol=1e-4, rtol=1e-4)
+
+    def test_non_usp_lambda_unaffected(self):
+        """Without a USP SP group, _calculate_loss must not call all_reduce at
+        all for lk_lambda (i.e. this fix must be a no-op outside USP)."""
+        model, hidden_states, target, mask, norm_weight, lm_head_weight, norm_eps = (
+            self._make_usp_model_and_inputs()
+        )
+        model._usp_sp_group = None
+
+        with patch("torchspec.models.eagle3.dist.all_reduce") as mock_reduce:
+            model._calculate_loss(
+                hidden_states=hidden_states,
+                target=target,
+                mask=mask,
+                idx=0,
+                seq_length=mask.shape[1],
+                norm_weight=norm_weight,
+                lm_head_weight=lm_head_weight,
+                norm_eps=norm_eps,
+            )
+        mock_reduce.assert_not_called()
 
 
 class TestComputeTargetPPadded(unittest.TestCase):
@@ -896,6 +1182,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             lm_head_weight,
             norm_eps,
             coverage_flat,
+            None,
             eta,
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
@@ -912,6 +1199,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             lm_head_weight,
             norm_eps,
             coverage_valid,
+            None,
             eta,
         )
         loss_ref = loss_sum_ref / count_ref

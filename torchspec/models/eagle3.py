@@ -116,6 +116,32 @@ class Eagle3Model(nn.Module):
         coverage_step = target.coverage_padded[:, idx : idx + seq_length]
         return coverage_step.reshape(-1)
 
+    def _usp_reduced_mean_alpha(
+        self,
+        alpha_probe_fn,
+        probe_args: tuple,
+    ) -> torch.Tensor:
+        """SP-group-reduced mean acceptance rate for this depth.
+
+        The LK^lambda schedule is defined per depth using alpha aggregated
+        across the *full* batch and sequence (arXiv:2602.23881), but under USP
+        the sequence is sharded across ranks, so a single rank's local alpha
+        only covers its shard. This runs a cheap no-grad probe (reusing the
+        LK^alpha loss fn, which already computes alpha_sum/count) and
+        all-reduces across the SP group before lambda is formed elsewhere.
+
+        Every rank in the SP group must call this (or the zero-contribution
+        path in ``_calculate_loss``'s empty-``valid_idx`` branch) exactly once
+        per depth when ``loss_type == "lk_lambda"`` under USP, so the
+        collective never hangs waiting for a rank that skipped it.
+        """
+        with torch.no_grad():
+            _, _, probe_count, probe_alpha_sum = alpha_probe_fn(*probe_args)
+            stats = torch.stack((probe_alpha_sum.float(), probe_count.float()))
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM, group=self._usp_sp_group)
+            reduced_alpha_sum, reduced_count = stats.unbind()
+            return (reduced_alpha_sum / reduced_count.clamp_min(1.0)).detach()
+
     def _calculate_loss(
         self,
         hidden_states: torch.Tensor,
@@ -132,8 +158,17 @@ class Eagle3Model(nn.Module):
         ``alpha_sum`` (the LK acceptance-rate numerator) is a detached zero for
         ``loss_type="forward_kl"``, which does not compute it.
         """
+        needs_usp_lambda_reduce = self.loss_type == "lk_lambda" and self._usp_sp_group is not None
         valid_idx = mask.flatten().nonzero().squeeze(-1)
         if valid_idx.numel() == 0:
+            if needs_usp_lambda_reduce:
+                # This rank has nothing to contribute at this depth, but must
+                # still participate in the SP-wide alpha all-reduce (with a
+                # zero contribution) so peer ranks with valid tokens at this
+                # depth don't hang waiting for it — see
+                # ``_usp_reduced_mean_alpha``.
+                zero_stats = torch.zeros(2, device=hidden_states.device, dtype=torch.float32)
+                dist.all_reduce(zero_stats, op=dist.ReduceOp.SUM, group=self._usp_sp_group)
             # FSDP requires every trainable param to participate in gradient
             # all-reduce/reduce-scatter.
             total = sum(p.reshape(-1)[0] for p in self.parameters() if p.requires_grad)
@@ -152,11 +187,23 @@ class Eagle3Model(nn.Module):
                 fn = compiled_lk_alpha_loss
                 args = args + (self._coverage_flat(target, idx, seq_length, tp_flat),)
             elif self.loss_type == "lk_lambda":
-                fn = compiled_lk_lambda_loss
-                args = args + (
-                    self._coverage_flat(target, idx, seq_length, tp_flat),
-                    self.lk_eta,
+                coverage_flat = self._coverage_flat(target, idx, seq_length, tp_flat)
+                probe_args = (
+                    hs_flat,
+                    tp_flat,
+                    valid_idx,
+                    norm_weight,
+                    lm_head_weight,
+                    norm_eps,
+                    coverage_flat,
                 )
+                external_mean_alpha = (
+                    self._usp_reduced_mean_alpha(compiled_lk_alpha_loss, probe_args)
+                    if needs_usp_lambda_reduce
+                    else None
+                )
+                fn = compiled_lk_lambda_loss
+                args = args + (coverage_flat, external_mean_alpha, self.lk_eta)
             else:
                 fn = compiled_forward_kl_loss
             if self.gradient_checkpointing and self.training:
@@ -180,7 +227,12 @@ class Eagle3Model(nn.Module):
             if self.loss_type == "lk_alpha":
                 fn = compiled_lk_alpha_loss_from_hs
             elif self.loss_type == "lk_lambda":
-                args = args + (self.lk_eta,)
+                external_mean_alpha = (
+                    self._usp_reduced_mean_alpha(compiled_lk_alpha_loss_from_hs, args)
+                    if needs_usp_lambda_reduce
+                    else None
+                )
+                args = args + (external_mean_alpha, self.lk_eta)
                 fn = compiled_lk_lambda_loss_from_hs
             else:
                 fn = (

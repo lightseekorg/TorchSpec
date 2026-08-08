@@ -155,6 +155,7 @@ def compiled_lk_lambda_loss(
     lm_head_weight,
     norm_eps,
     coverage_flat,
+    external_mean_alpha,
     eta,
 ):
     """LK^lambda loss: lambda*KL(p||q) + (1-lambda)*TV(p,q), lambda = exp(-eta*sg[alpha]).
@@ -166,6 +167,15 @@ def compiled_lk_lambda_loss(
     ``compiled_lk_alpha_loss`` for ``coverage_flat``'s role in vocab pruning: the
     KL term still uses the renormalized ``tp_tilde`` (raw ``p`` would make KL
     diverge for out-of-draft-vocab mass), but alpha/TV use the true ``tp``.
+
+    ``external_mean_alpha``, if not None, overrides the locally-computed mean
+    alpha used to form lambda. This is required under sequence parallelism
+    (USP): a single call only sees this rank's shard of the depth's sequence,
+    but the schedule is defined over the *full* batch and sequence for the
+    depth (arXiv:2602.23881), so the caller must all-reduce alpha across the
+    SP group before forming lambda and pass the result in here. Pass None
+    when there is no sequence sharding, in which case the local mean already
+    covers the whole depth.
     """
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     tp_tilde = target_p_flat.index_select(0, valid_idx)
@@ -177,7 +187,8 @@ def compiled_lk_lambda_loss(
 
     tp = tp_tilde * coverage.unsqueeze(-1)
     alpha = torch.min(tp, q).sum(-1)
-    lam = torch.exp(-eta * alpha.mean().detach())
+    mean_alpha = external_mean_alpha if external_mean_alpha is not None else alpha.mean()
+    lam = torch.exp(-eta * mean_alpha.detach())
 
     kl = F.kl_div(log_q, tp_tilde, reduction="none").sum(-1)
     tv = 0.5 * (tp - q).abs().sum(-1)
@@ -252,9 +263,11 @@ def compiled_lk_lambda_loss_from_hs(
     lm_head_weight,
     target_lm_head_weight,
     norm_eps,
+    external_mean_alpha,
     eta,
 ):
-    """LK^lambda loss from hidden states (LazyTarget path). See ``compiled_lk_lambda_loss``."""
+    """LK^lambda loss from hidden states (LazyTarget path). See
+    ``compiled_lk_lambda_loss`` for ``external_mean_alpha``'s role under USP."""
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
     ths = target_hidden_states_flat.index_select(0, valid_idx)
 
@@ -268,8 +281,10 @@ def compiled_lk_lambda_loss_from_hs(
     alpha = torch.min(tp, q).sum(-1)
     # lambda is computed once per call (i.e. once per EAGLE-3 depth) from the
     # mean acceptance rate across batch and sequence, matching the paper's
-    # schedule — not per token.
-    lam = torch.exp(-eta * alpha.mean().detach())
+    # schedule — not per token (and, under USP, from external_mean_alpha —
+    # the SP-group-reduced mean — rather than this rank's local shard alone).
+    mean_alpha = external_mean_alpha if external_mean_alpha is not None else alpha.mean()
+    lam = torch.exp(-eta * mean_alpha.detach())
 
     kl = F.kl_div(log_q, tp, reduction="none").sum(-1)
     tv = 0.5 * (tp - q).abs().sum(-1)
