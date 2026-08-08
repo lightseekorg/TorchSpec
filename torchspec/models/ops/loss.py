@@ -116,6 +116,7 @@ def compiled_lk_alpha_loss(
     norm_weight,
     lm_head_weight,
     norm_eps,
+    coverage_flat,
 ):
     """LK^alpha loss: -log(acceptance_rate), summed over valid positions.
 
@@ -123,16 +124,24 @@ def compiled_lk_alpha_loss(
     from "LK Losses: Direct Acceptance Rate Optimization for Speculative Decoding"
     (arXiv:2602.23881). Returns (loss_sum, correct_sum, count, alpha_sum) — the same
     sum/count convention as ``compiled_forward_kl_loss`` plus a trailing alpha sum.
+
+    ``target_p_flat`` is the target distribution renormalized over the (possibly
+    pruned) draft vocab; ``coverage_flat`` rescales it back to the true,
+    un-renormalized target probabilities before computing alpha, per §4.4 of the
+    paper (out-of-draft-vocab mass must contribute 0, not be redistributed).
+    ``coverage_flat`` is 1 when there is no vocab pruning, leaving ``tp`` unchanged.
     """
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
-    tp = target_p_flat.index_select(0, valid_idx)
+    tp_tilde = target_p_flat.index_select(0, valid_idx)
+    coverage = coverage_flat.index_select(0, valid_idx)
 
     logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
     q = _softmax_from_logits(logits)
 
+    tp = tp_tilde * coverage.unsqueeze(-1)
     alpha = torch.min(tp, q).sum(-1)
     token_loss = -torch.log(alpha.clamp(min=1e-8))
-    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    correct = (logits.argmax(-1) == tp_tilde.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
     return token_loss.sum(), correct.sum(), count, alpha.sum()
 
@@ -145,28 +154,36 @@ def compiled_lk_lambda_loss(
     norm_weight,
     lm_head_weight,
     norm_eps,
+    coverage_flat,
     eta,
 ):
     """LK^lambda loss: lambda*KL(p||q) + (1-lambda)*TV(p,q), lambda = exp(-eta*sg[alpha]).
 
     Returns (loss_sum, correct_sum, count, alpha_sum), matching
-    ``compiled_lk_alpha_loss``'s convention.
+    ``compiled_lk_alpha_loss``'s convention. ``lambda`` is computed once per call
+    (i.e. once per EAGLE-3 depth) from the mean acceptance rate across the batch
+    and sequence, matching the paper's schedule — not per token. See
+    ``compiled_lk_alpha_loss`` for ``coverage_flat``'s role in vocab pruning: the
+    KL term still uses the renormalized ``tp_tilde`` (raw ``p`` would make KL
+    diverge for out-of-draft-vocab mass), but alpha/TV use the true ``tp``.
     """
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
-    tp = target_p_flat.index_select(0, valid_idx)
+    tp_tilde = target_p_flat.index_select(0, valid_idx)
+    coverage = coverage_flat.index_select(0, valid_idx)
 
     logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
     q = _softmax_from_logits(logits)
     log_q = F.log_softmax(logits.float(), dim=-1)
 
+    tp = tp_tilde * coverage.unsqueeze(-1)
     alpha = torch.min(tp, q).sum(-1)
-    lam = torch.exp(-eta * alpha.detach())
+    lam = torch.exp(-eta * alpha.mean().detach())
 
-    kl = F.kl_div(log_q, tp, reduction="none").sum(-1)
+    kl = F.kl_div(log_q, tp_tilde, reduction="none").sum(-1)
     tv = 0.5 * (tp - q).abs().sum(-1)
     token_loss = lam * kl + (1.0 - lam) * tv
 
-    correct = (logits.argmax(-1) == tp.argmax(-1)).float()
+    correct = (logits.argmax(-1) == tp_tilde.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
     return token_loss.sum(), correct.sum(), count, alpha.sum()
 
@@ -249,7 +266,10 @@ def compiled_lk_lambda_loss_from_hs(
     log_q = F.log_softmax(logits.float(), dim=-1)
 
     alpha = torch.min(tp, q).sum(-1)
-    lam = torch.exp(-eta * alpha.detach())
+    # lambda is computed once per call (i.e. once per EAGLE-3 depth) from the
+    # mean acceptance rate across batch and sequence, matching the paper's
+    # schedule — not per token.
+    lam = torch.exp(-eta * alpha.mean().detach())
 
     kl = F.kl_div(log_q, tp, reduction="none").sum(-1)
     tv = 0.5 * (tp - q).abs().sum(-1)

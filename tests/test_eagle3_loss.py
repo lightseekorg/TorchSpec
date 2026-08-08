@@ -44,8 +44,15 @@ def _reference_forward_kl_loss(hs_flat, target_p_flat, norm_weight, lm_head_weig
     return loss, acc
 
 
-def _reference_lk_alpha_loss(hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps):
-    """Pure-Python reference for LK^alpha loss."""
+def _reference_lk_alpha_loss(
+    hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps, coverage_flat=None
+):
+    """Pure-Python reference for LK^alpha loss.
+
+    ``coverage_flat`` rescales the (possibly draft-vocab-renormalized)
+    ``target_p_flat`` back to true target probabilities; defaults to 1 (no
+    rescaling) for the common no-vocab-pruning case.
+    """
     hs_f32 = hs_flat.float()
     variance = hs_f32.pow(2).mean(-1, keepdim=True)
     rstd = torch.rsqrt(variance + norm_eps)
@@ -54,14 +61,25 @@ def _reference_lk_alpha_loss(hs_flat, target_p_flat, norm_weight, lm_head_weight
     logits = F.linear(norm_hs, lm_head_weight)
     q = F.softmax(logits.float(), dim=-1)
 
-    alpha = torch.min(target_p_flat, q).sum(-1)
+    if coverage_flat is None:
+        coverage_flat = torch.ones(target_p_flat.shape[0])
+    target_p_true = target_p_flat * coverage_flat.unsqueeze(-1)
+
+    alpha = torch.min(target_p_true, q).sum(-1)
     loss = -torch.log(alpha.clamp(min=1e-8)).mean()
     acc = (logits.argmax(-1) == target_p_flat.argmax(-1)).float().mean()
     return loss, acc, alpha.mean()
 
 
-def _reference_lk_lambda_loss(hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps, eta):
-    """Pure-Python reference for LK^lambda loss."""
+def _reference_lk_lambda_loss(
+    hs_flat, target_p_flat, norm_weight, lm_head_weight, norm_eps, eta, coverage_flat=None
+):
+    """Pure-Python reference for LK^lambda loss.
+
+    ``lambda`` is computed once from the mean acceptance rate across the whole
+    call (i.e. one EAGLE-3 depth), matching the paper's schedule rather than a
+    per-token value. See ``_reference_lk_alpha_loss`` for ``coverage_flat``.
+    """
     hs_f32 = hs_flat.float()
     variance = hs_f32.pow(2).mean(-1, keepdim=True)
     rstd = torch.rsqrt(variance + norm_eps)
@@ -71,11 +89,15 @@ def _reference_lk_lambda_loss(hs_flat, target_p_flat, norm_weight, lm_head_weigh
     q = F.softmax(logits.float(), dim=-1)
     log_q = F.log_softmax(logits.float(), dim=-1)
 
-    alpha = torch.min(target_p_flat, q).sum(-1)
-    lam = torch.exp(-eta * alpha.detach())
+    if coverage_flat is None:
+        coverage_flat = torch.ones(target_p_flat.shape[0])
+    target_p_true = target_p_flat * coverage_flat.unsqueeze(-1)
+
+    alpha = torch.min(target_p_true, q).sum(-1)
+    lam = torch.exp(-eta * alpha.mean().detach())
 
     kl = F.kl_div(log_q, target_p_flat, reduction="none").sum(-1)
-    tv = 0.5 * (target_p_flat - q).abs().sum(-1)
+    tv = 0.5 * (target_p_true - q).abs().sum(-1)
 
     loss = (lam * kl + (1.0 - lam) * tv).mean()
     acc = (logits.argmax(-1) == target_p_flat.argmax(-1)).float().mean()
@@ -225,18 +247,51 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
 
         raw_logits = F.linear(hs.float(), lm_head_weight.float())
         target_p = F.softmax(raw_logits + torch.randn_like(raw_logits) * 0.5, dim=-1)
+        coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
         ref_loss, ref_acc, ref_alpha = _reference_lk_alpha_loss(
-            hs, target_p, norm_weight, lm_head_weight, norm_eps
+            hs, target_p, norm_weight, lm_head_weight, norm_eps, coverage
         )
 
         torch.testing.assert_close(loss, ref_loss, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(acc, ref_acc, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(alpha, ref_alpha, atol=1e-3, rtol=1e-3)
+
+    def test_coverage_rescales_alpha_for_vocab_pruning(self):
+        """With coverage < 1 (vocab pruning), alpha should use the true,
+        un-renormalized target probabilities rather than the draft-vocab-
+        renormalized ones — see arXiv:2602.23881 §4.4."""
+        torch.manual_seed(3)
+        N, H, V = 8, 32, 16
+        hs = torch.randn(N, H, dtype=torch.float32)
+        norm_weight = torch.randn(H, dtype=torch.float32)
+        lm_head_weight = torch.randn(V, H, dtype=torch.float32)
+        norm_eps = 1e-6
+        valid_idx = torch.arange(N)
+        target_p_tilde = F.softmax(torch.randn(N, V), dim=-1)
+        coverage = torch.rand(N) * 0.5 + 0.3  # in [0.3, 0.8): meaningful vocab pruning
+
+        _, _, _, alpha_sum_no_coverage = compiled_lk_alpha_loss(
+            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, torch.ones(N)
+        )
+        _, _, _, alpha_sum_with_coverage = compiled_lk_alpha_loss(
+            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
+        )
+        # Rescaling by coverage < 1 can only shrink (never inflate) alpha,
+        # since it shrinks every component of the min(p, q) sum.
+        self.assertLess(alpha_sum_with_coverage.item(), alpha_sum_no_coverage.item())
+        ref_loss, _, ref_alpha = _reference_lk_alpha_loss(
+            hs, target_p_tilde, norm_weight, lm_head_weight, norm_eps, coverage
+        )
+        loss_sum, _, count, alpha_sum = compiled_lk_alpha_loss(
+            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
+        )
+        torch.testing.assert_close(loss_sum / count, ref_loss, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(alpha_sum / count, ref_alpha, atol=1e-4, rtol=1e-4)
 
     def test_perfect_prediction_loss_zero(self):
         """When draft == target, alpha=1 so -log(alpha)=0."""
@@ -253,9 +308,10 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
         norm_hs = hs * rstd * norm_weight
         logits = F.linear(norm_hs, lm_head_weight)
         target_p = F.softmax(logits, dim=-1)
+        coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
         self.assertAlmostEqual(loss.item(), 0.0, places=3)
@@ -270,9 +326,10 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
         lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
         target_p = F.softmax(torch.randn(N, V), dim=-1)
         valid_idx = torch.arange(N)
+        coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage
         )
         loss, alpha = loss_sum / count, alpha_sum / count
         self.assertTrue(torch.isfinite(loss))
@@ -295,13 +352,14 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
 
         raw_logits = F.linear(hs.float(), lm_head_weight.float())
         target_p = F.softmax(raw_logits + torch.randn_like(raw_logits) * 0.5, dim=-1)
+        coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, eta
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, eta
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
         ref_loss, ref_acc, ref_alpha = _reference_lk_lambda_loss(
-            hs, target_p, norm_weight, lm_head_weight, norm_eps, eta
+            hs, target_p, norm_weight, lm_head_weight, norm_eps, eta, coverage
         )
 
         torch.testing.assert_close(loss, ref_loss, atol=1e-3, rtol=1e-3)
@@ -317,14 +375,86 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
         target_p = F.softmax(torch.randn(N, V), dim=-1)
         valid_idx = torch.arange(N)
+        coverage = torch.ones(N)
 
         loss_eta3, _, count3, _ = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, 3.0
         )
         loss_eta10, _, count10, _ = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, 10.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, 10.0
         )
         self.assertFalse(torch.allclose(loss_eta3 / count3, loss_eta10 / count10))
+
+    def test_coverage_rescales_alpha_and_tv_but_not_kl(self):
+        """With coverage < 1 (vocab pruning): alpha/TV use the true, rescaled
+        target probabilities, but the KL term keeps the draft-vocab-
+        renormalized ones (raw p would make KL diverge) — arXiv:2602.23881 §4.4."""
+        torch.manual_seed(4)
+        N, H, V = 8, 32, 16
+        hs = torch.randn(N, H, dtype=torch.float32)
+        norm_weight = torch.randn(H, dtype=torch.float32)
+        lm_head_weight = torch.randn(V, H, dtype=torch.float32)
+        norm_eps = 1e-6
+        eta = 3.0
+        valid_idx = torch.arange(N)
+        target_p_tilde = F.softmax(torch.randn(N, V), dim=-1)
+        coverage = torch.rand(N) * 0.5 + 0.3
+
+        loss_sum, _, count, alpha_sum = compiled_lk_lambda_loss(
+            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, eta
+        )
+        ref_loss, _, ref_alpha = _reference_lk_lambda_loss(
+            hs, target_p_tilde, norm_weight, lm_head_weight, norm_eps, eta, coverage
+        )
+        torch.testing.assert_close(loss_sum / count, ref_loss, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(alpha_sum / count, ref_alpha, atol=1e-4, rtol=1e-4)
+
+        # Coverage=1 (no pruning) reference must differ, since rescaling by
+        # coverage<1 changes both the KL-vs-TV blend (via mean alpha) and TV
+        # itself — otherwise this test wouldn't be exercising the rescale path.
+        ref_loss_no_coverage, _, ref_alpha_no_coverage = _reference_lk_lambda_loss(
+            hs, target_p_tilde, norm_weight, lm_head_weight, norm_eps, eta
+        )
+        self.assertGreater((ref_alpha - ref_alpha_no_coverage).abs().item(), 1e-4)
+        self.assertGreater((ref_loss - ref_loss_no_coverage).abs().item(), 1e-4)
+
+    def test_lambda_uses_mean_alpha_not_per_token_alpha(self):
+        """Guards against regressing to a per-token lambda schedule: with
+        per-token alphas that vary meaningfully, the loss must match a
+        shared-lambda (mean-alpha) schedule and disagree with a per-token one."""
+        torch.manual_seed(5)
+        N, H, V = 2, 32, 24
+        hs = torch.randn(N, H, dtype=torch.float32)
+        norm_weight = torch.randn(H, dtype=torch.float32)
+        lm_head_weight = torch.randn(V, H, dtype=torch.float32)
+        norm_eps = 1e-6
+        eta = 5.0
+        valid_idx = torch.arange(N)
+        target_p = F.softmax(torch.randn(N, V) * 2.0, dim=-1)  # spread out alphas
+        coverage = torch.ones(N)
+
+        loss_sum, _, _count, _alpha_sum = compiled_lk_lambda_loss(
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, eta
+        )
+
+        variance = hs.pow(2).mean(-1, keepdim=True)
+        rstd = torch.rsqrt(variance + norm_eps)
+        norm_hs = hs * rstd * norm_weight
+        logits = F.linear(norm_hs, lm_head_weight)
+        q = F.softmax(logits, dim=-1)
+        log_q = F.log_softmax(logits, dim=-1)
+        alpha = torch.min(target_p, q).sum(-1)
+        kl = F.kl_div(log_q, target_p, reduction="none").sum(-1)
+        tv = 0.5 * (target_p - q).abs().sum(-1)
+
+        lam_per_token = torch.exp(-eta * alpha.detach())
+        per_token_loss_sum = (lam_per_token * kl + (1.0 - lam_per_token) * tv).sum()
+
+        lam_shared = torch.exp(-eta * alpha.mean().detach())
+        shared_loss_sum = (lam_shared * kl + (1.0 - lam_shared) * tv).sum()
+
+        torch.testing.assert_close(loss_sum, shared_loss_sum, atol=1e-4, rtol=1e-4)
+        self.assertGreater((loss_sum - per_token_loss_sum).abs().item(), 1e-4)
 
     def test_perfect_prediction_loss_zero(self):
         """When draft == target, KL=0 and TV=0 so loss=0."""
@@ -341,9 +471,10 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         norm_hs = hs * rstd * norm_weight
         logits = F.linear(norm_hs, lm_head_weight)
         target_p = F.softmax(logits, dim=-1)
+        coverage = torch.ones(N)
 
         loss_sum, _correct, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, 3.0
         )
         loss, alpha = loss_sum / count, alpha_sum / count
         self.assertAlmostEqual(loss.item(), 0.0, places=3)
@@ -357,9 +488,10 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         lm_head_weight = torch.randn(V, H, dtype=torch.bfloat16)
         target_p = F.softmax(torch.randn(N, V), dim=-1)
         valid_idx = torch.arange(N)
+        coverage = torch.ones(N)
 
         loss_sum, _correct, count, _alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, 3.0
         )
         loss = loss_sum / count
         self.assertTrue(torch.isfinite(loss))
@@ -396,8 +528,46 @@ class TestComputeTargetPPadded(unittest.TestCase):
         sums = result.target_p_padded[:, :T, :].sum(dim=-1)
         torch.testing.assert_close(sums, torch.ones_like(sums), atol=1e-4, rtol=1e-4)
 
+    def test_coverage_matches_true_full_vocab_probability_mass(self):
+        """coverage_padded should equal the draft-vocab probability mass under
+        the true full-vocab softmax, so that target_p_padded * coverage_padded
+        recovers true (un-renormalized) target probabilities — see
+        ``PrecomputedTarget.coverage_padded`` and arXiv:2602.23881 §4.4."""
+        torch.manual_seed(1)
+        B, T, D = 2, 12, 64
+        V_target, V_draft = 96, 24
+        length = 2
+        hs = torch.randn(B, T, D, dtype=torch.float32)
+        weight = torch.randn(V_target, D, dtype=torch.float32)
+        loss_mask = torch.ones(B, T)
+
+        t2d = torch.zeros(V_target, dtype=torch.bool)
+        t2d[:V_draft] = True
+
+        result = compute_target_p_padded(
+            hs,
+            weight,
+            t2d=t2d,
+            loss_mask=loss_mask,
+            length=length,
+        )
+
+        self.assertIsNotNone(result.coverage_padded)
+        self.assertEqual(result.coverage_padded.shape, (B, T + length))
+        coverage = result.coverage_padded[:, :T]
+        self.assertTrue((coverage >= 0).all())
+        self.assertTrue((coverage <= 1 + 1e-4).all())
+
+        full_p = F.softmax(F.linear(hs, weight).float(), dim=-1)
+        expected_coverage = full_p[..., t2d].sum(-1)
+        torch.testing.assert_close(coverage, expected_coverage, atol=1e-4, rtol=1e-4)
+
+        true_p = result.target_p_padded[:, :T, :] * coverage.unsqueeze(-1)
+        expected_true_p = full_p[..., t2d]
+        torch.testing.assert_close(true_p, expected_true_p, atol=1e-4, rtol=1e-4)
+
     def test_loss_mask_respected_in_position_mask(self):
-        """Masked positions should have position_mask == 0."""
+        """Masked positions should have position_mask == 0 and coverage == 0."""
         torch.manual_seed(0)
         B, T, D = 1, 32, 64
         V_target, V_draft = 128, 32
@@ -418,6 +588,7 @@ class TestComputeTargetPPadded(unittest.TestCase):
         )
 
         self.assertTrue((result.position_mask[:, : T // 2] == 0).all())
+        self.assertTrue((result.coverage_padded[:, : T // 2] == 0).all())
 
 
 class TestLazyVsPrecomputedTarget(unittest.TestCase):
@@ -672,6 +843,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
         norm_weight = torch.randn(self.H, dtype=torch.bfloat16)
         lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
         tp_flat = F.softmax(torch.randn(self.BT, self.V), dim=-1)
+        coverage_flat = torch.rand(self.BT) * 0.5 + 0.5
         norm_eps = 1e-6
 
         loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
@@ -681,11 +853,13 @@ class TestValidIdxSubsetting(unittest.TestCase):
             norm_weight,
             lm_head_weight,
             norm_eps,
+            coverage_flat,
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
 
         hs_valid = hs_flat[valid_idx]
         tp_valid = tp_flat[valid_idx]
+        coverage_valid = coverage_flat[valid_idx]
         all_idx = torch.arange(hs_valid.shape[0])
         loss_sum_ref, correct_ref, count_ref, alpha_sum_ref = compiled_lk_alpha_loss(
             hs_valid,
@@ -694,6 +868,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             norm_weight,
             lm_head_weight,
             norm_eps,
+            coverage_valid,
         )
         loss_ref = loss_sum_ref / count_ref
         acc_ref = correct_ref / count_ref
@@ -709,6 +884,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
         norm_weight = torch.randn(self.H, dtype=torch.bfloat16)
         lm_head_weight = torch.randn(self.V, self.H, dtype=torch.bfloat16)
         tp_flat = F.softmax(torch.randn(self.BT, self.V), dim=-1)
+        coverage_flat = torch.rand(self.BT) * 0.5 + 0.5
         norm_eps = 1e-6
         eta = 3.0
 
@@ -719,12 +895,14 @@ class TestValidIdxSubsetting(unittest.TestCase):
             norm_weight,
             lm_head_weight,
             norm_eps,
+            coverage_flat,
             eta,
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
 
         hs_valid = hs_flat[valid_idx]
         tp_valid = tp_flat[valid_idx]
+        coverage_valid = coverage_flat[valid_idx]
         all_idx = torch.arange(hs_valid.shape[0])
         loss_sum_ref, correct_ref, count_ref, alpha_sum_ref = compiled_lk_lambda_loss(
             hs_valid,
@@ -733,6 +911,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             norm_weight,
             lm_head_weight,
             norm_eps,
+            coverage_valid,
             eta,
         )
         loss_ref = loss_sum_ref / count_ref

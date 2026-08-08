@@ -48,8 +48,14 @@ from torchspec.utils.tensor import padding
 class PrecomputedTarget:
     """Pre-computed target probabilities (used with vocab pruning)."""
 
-    target_p_padded: torch.Tensor  # (B, T + length, V_draft)
+    target_p_padded: torch.Tensor  # (B, T + length, V_draft), renormalized over the draft vocab
     position_mask: Optional[torch.Tensor] = None  # (B, T)
+    # (B, T + length) draft-vocab probability mass under the *true*, full-vocab
+    # softmax (S = sum_{v in draft} p(v)). LK losses need the true, un-renormalized
+    # target probabilities (target_p_padded * coverage_padded) so that out-of-draft
+    # mass contributes 0 rather than being redistributed — see arXiv:2602.23881 §4.4.
+    # None when not computed (e.g. hand-built targets in tests); treated as 1.
+    coverage_padded: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -92,6 +98,24 @@ class Eagle3Model(nn.Module):
             else 1
         )
 
+    @staticmethod
+    def _coverage_flat(
+        target: PrecomputedTarget,
+        idx: int,
+        seq_length: int,
+        tp_flat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Flattened (B*T,) coverage for this depth's slice of ``target``.
+
+        Falls back to all-ones (no rescaling) when ``coverage_padded`` wasn't
+        computed, which is only the case for hand-built targets that don't
+        involve vocab pruning.
+        """
+        if target.coverage_padded is None:
+            return tp_flat.new_ones(tp_flat.shape[0])
+        coverage_step = target.coverage_padded[:, idx : idx + seq_length]
+        return coverage_step.reshape(-1)
+
     def _calculate_loss(
         self,
         hidden_states: torch.Tensor,
@@ -126,9 +150,13 @@ class Eagle3Model(nn.Module):
             args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
             if self.loss_type == "lk_alpha":
                 fn = compiled_lk_alpha_loss
+                args = args + (self._coverage_flat(target, idx, seq_length, tp_flat),)
             elif self.loss_type == "lk_lambda":
                 fn = compiled_lk_lambda_loss
-                args = args + (self.lk_eta,)
+                args = args + (
+                    self._coverage_flat(target, idx, seq_length, tp_flat),
+                    self.lk_eta,
+                )
             else:
                 fn = compiled_forward_kl_loss
             if self.gradient_checkpointing and self.training:
@@ -383,18 +411,36 @@ def compute_target_p_padded(
         device=target_hidden_states.device,
         dtype=torch.float,
     )
+    # Draft-vocab probability mass under the *true* full-vocab softmax at each
+    # valid position (S = sum_{v in draft} p(v)); lets LK losses undo the
+    # renormalization below and recover true, un-renormalized target
+    # probabilities. See ``PrecomputedTarget.coverage_padded``.
+    coverage_flat = torch.zeros(
+        bsz * seq_len,
+        device=target_hidden_states.device,
+        dtype=torch.float,
+    )
     for i in range(0, valid_hs.shape[0], chunk_size):
         chunk_hs = valid_hs[i : i + chunk_size]
-        chunk_argmax = F.linear(chunk_hs, target_lm_head_weight).argmax(-1)
+        chunk_full_logits = F.linear(chunk_hs, target_lm_head_weight)
+        chunk_argmax = chunk_full_logits.argmax(-1)
         in_draft = t2d[chunk_argmax]
         position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
+
+        chunk_full_logits_f32 = chunk_full_logits.float()
+        full_logsumexp = torch.logsumexp(chunk_full_logits_f32, dim=-1)
+        pruned_logsumexp = torch.logsumexp(chunk_full_logits_f32[:, t2d], dim=-1)
+        coverage_flat[valid_flat_idx[i : i + chunk_size]] = torch.exp(
+            pruned_logsumexp - full_logsumexp
+        )
     position_mask = position_mask_flat.reshape(bsz, seq_len)
+    coverage_padded = F.pad(coverage_flat.reshape(bsz, seq_len), (0, length), value=0.0)
 
     target_logits_pruned = F.linear(target_hidden_states, pruned_weight)
     target_p = F.softmax(target_logits_pruned.float(), dim=-1)
     target_p_padded = F.pad(target_p, (0, 0, 0, length), value=0.0)
 
-    return PrecomputedTarget(target_p_padded, position_mask)
+    return PrecomputedTarget(target_p_padded, position_mask, coverage_padded)
 
 
 def compute_lazy_target_padded(
