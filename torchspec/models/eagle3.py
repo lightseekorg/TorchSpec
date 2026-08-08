@@ -427,9 +427,14 @@ def compute_target_p_padded(
         in_draft = t2d[chunk_argmax]
         position_mask_flat[valid_flat_idx[i : i + chunk_size]] = in_draft.float()
 
-        chunk_full_logits_f32 = chunk_full_logits.float()
-        full_logsumexp = torch.logsumexp(chunk_full_logits_f32, dim=-1)
-        pruned_logsumexp = torch.logsumexp(chunk_full_logits_f32[:, t2d], dim=-1)
+        # Reuse the already-materialized dense `pruned_weight` (boolean-indexed
+        # once, above) instead of boolean-masking `chunk_full_logits` by `t2d`
+        # here — masking a CUDA tensor by a bool index forces a device-to-host
+        # sync to read back the True-count, and that would otherwise happen
+        # once per chunk instead of once per call.
+        chunk_pruned_logits = F.linear(chunk_hs, pruned_weight)
+        full_logsumexp = torch.logsumexp(chunk_full_logits.float(), dim=-1)
+        pruned_logsumexp = torch.logsumexp(chunk_pruned_logits.float(), dim=-1)
         coverage_flat[valid_flat_idx[i : i + chunk_size]] = torch.exp(
             pruned_logsumexp - full_logsumexp
         )
