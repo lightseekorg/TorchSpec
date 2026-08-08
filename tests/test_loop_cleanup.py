@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from omegaconf import OmegaConf
 
 from torchspec.controller import eval as eval_utils
 from torchspec.controller import loop
@@ -398,3 +399,69 @@ def test_setup_eval_dispatch_bs_caps_at_dataset_size():
     assert state.eval_dispatch_bs == 4
     assert state.initial_eval_submit_count == 4
     controller.submit_eval_chunk.remote.assert_called_once_with(0, 4)
+
+
+def test_setup_eval_cache_key_includes_aux_hidden_state_layers():
+    controller = mock.MagicMock()
+    train_group = mock.MagicMock()
+    train_group.load_eval_cache.return_value = [0]
+    controller.submit_eval_chunk.remote.return_value = 1
+
+    args = SimpleNamespace(
+        eval_interval=50,
+        dp_size=1,
+        inference_batch_size=1,
+        checkpoint_dir=None,
+        cache_dir="./cache",
+        eval_data_path="eval.jsonl",
+        target_model_path="model",
+        max_seq_length=4096,
+        aux_hidden_states_layers=[1, 17, 32],
+    )
+
+    with mock.patch("torchspec.controller.eval.ray.get", side_effect=lambda x: x):
+        first = eval_utils.setup_eval(
+            controller=controller,
+            train_group=train_group,
+            args=args,
+            eval_dataset_size=1,
+        )
+        args.aux_hidden_states_layers = [1, 8, 16, 24, 32]
+        second = eval_utils.setup_eval(
+            controller=controller,
+            train_group=train_group,
+            args=args,
+            eval_dataset_size=1,
+        )
+
+    assert first.eval_cache_path != second.eval_cache_path
+
+
+def test_setup_eval_cache_key_accepts_omegaconf_list():
+    controller = mock.MagicMock()
+    train_group = mock.MagicMock()
+    train_group.load_eval_cache.return_value = [0]
+    controller.submit_eval_chunk.remote.return_value = 1
+
+    args = SimpleNamespace(
+        eval_interval=50,
+        dp_size=1,
+        inference_batch_size=1,
+        checkpoint_dir=None,
+        cache_dir="./cache",
+        eval_data_path="eval.jsonl",
+        target_model_path="model",
+        max_seq_length=4096,
+        aux_hidden_states_layers=OmegaConf.create([2, 46, 90, 93]),
+    )
+
+    with mock.patch("torchspec.controller.eval.ray.get", side_effect=lambda x: x):
+        state = eval_utils.setup_eval(
+            controller=controller,
+            train_group=train_group,
+            args=args,
+            eval_dataset_size=1,
+        )
+
+    assert state.eval_enabled is True
+    train_group.load_eval_cache.assert_called_once()

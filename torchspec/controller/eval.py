@@ -21,6 +21,7 @@
 """Eval-specific setup and runtime helpers for the controller loop."""
 
 import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -185,10 +186,16 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
             if getattr(args, "inference_engine_type", None) == "offline"
             else getattr(args, "eval_data_path", "")
         )
+        aux_hidden_states_layers = getattr(args, "aux_hidden_states_layers", None)
+        if aux_hidden_states_layers is not None:
+            # Hydra exposes YAML sequences as OmegaConf ListConfig objects,
+            # which json.dumps cannot serialize directly.
+            aux_hidden_states_layers = list(aux_hidden_states_layers)
         cache_key = hashlib.md5(
             f"{data_source}|"
             f"{getattr(args, 'target_model_path', '')}|"
-            f"{getattr(args, 'max_seq_length', 0)}".encode()
+            f"{getattr(args, 'max_seq_length', 0)}|"
+            f"{json.dumps(aux_hidden_states_layers, separators=(',', ':'))}".encode()
         ).hexdigest()[:12]
         eval_cache_path = os.path.join(cache_dir, "eval_cache", cache_key)
 
