@@ -80,6 +80,8 @@ class DFlashTrainer(Trainer):
         self.loss_decay_gamma = getattr(args, "dflash_loss_decay_gamma", 7.0)
         self.ce_loss_alpha = getattr(args, "dflash_ce_loss_alpha", 1.0)
         self.l1_loss_alpha = getattr(args, "dflash_l1_loss_alpha", 0.0)
+        self._last_hs_prenorm = getattr(args, "last_hidden_states_prenorm", False)
+        self.verifier_norm: Optional[torch.nn.Module] = None
 
     def init_model(
         self,
@@ -238,11 +240,21 @@ class DFlashTrainer(Trainer):
             self.target_lm_head = TargetLMHead.from_pretrained(
                 model_path=target_model_path,
                 lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+                norm_key=getattr(self.args, "norm_key", "model.norm.weight"),
+                load_norm=self._last_hs_prenorm,
                 device="cuda",
                 dtype=torch.bfloat16,
                 trust_remote_code=getattr(self.args, "trust_remote_code", True),
             )
-            logger.info(f"[Rank 0] TargetLMHead loaded from {target_model_path}")
+            if self._last_hs_prenorm and self.target_lm_head.norm is None:
+                raise RuntimeError(
+                    "last_hidden_states_prenorm=True requires a loaded verifier norm"
+                )
+            norm_status = "loaded" if self.target_lm_head.norm is not None else "not requested"
+            logger.info(
+                f"[Rank 0] TargetLMHead loaded from {target_model_path}"
+                f" (verifier norm: {norm_status})"
+            )
         else:
             from transformers import AutoConfig
 
@@ -251,16 +263,49 @@ class DFlashTrainer(Trainer):
                 trust_remote_code=getattr(self.args, "trust_remote_code", True),
             )
             self.target_lm_head = TargetLMHead(config)
+            if self._last_hs_prenorm:
+                self.target_lm_head._init_norm_structure()
             self.target_lm_head.to(device="cuda", dtype=torch.bfloat16)
             self.target_lm_head.eval()
             self.target_lm_head.requires_grad_(False)
+
+        # Sync norm status from rank 0 so all ranks have the same parameter count
+        # before the broadcast loop (a mismatch deadlocks it).
+        has_norm = torch.tensor(
+            [self.target_lm_head.norm is not None], dtype=torch.int32, device="cuda"
+        )
+        dist.broadcast(has_norm, src=0)
+        if self._last_hs_prenorm and not has_norm.item():
+            raise RuntimeError(
+                "Rank 0 did not load the verifier norm required by last_hidden_states_prenorm=True"
+            )
+        if has_norm.item():
+            if self.target_lm_head.norm is None:
+                logger.warning(
+                    f"[Rank {self.dp_rank}] Rank 0 has norm but this rank does not — "
+                    "this indicates _init_norm_structure failed; attempting recovery"
+                )
+                self.target_lm_head._init_norm_structure()
+                self.target_lm_head.norm = self.target_lm_head.norm.to(
+                    device="cuda", dtype=torch.bfloat16
+                )
+        elif self.target_lm_head.norm is not None:
+            logger.warning(
+                f"[Rank {self.dp_rank}] Rank 0 does not have norm — "
+                "removing norm on this rank to match"
+            )
+            self.target_lm_head.norm = None
 
         dist.barrier()
 
         for param in self.target_lm_head.parameters():
             dist.broadcast(param.data, src=0)
 
-        logger.info(f"[Rank {self.dp_rank}] TargetLMHead initialized and synced")
+        self.verifier_norm = self.target_lm_head.norm
+        logger.info(
+            f"[Rank {self.dp_rank}] TargetLMHead initialized and synced "
+            f"(verifier norm loaded: {self.verifier_norm is not None})"
+        )
 
     # ------------------------------------------------------------------
     # Forward / backward
@@ -291,6 +336,9 @@ class DFlashTrainer(Trainer):
         last_hidden_states = batch.get("last_hidden_states", None)
         if last_hidden_states is not None:
             last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+            if self.verifier_norm is not None:
+                with torch.no_grad():
+                    last_hidden_states = self.verifier_norm(last_hidden_states)
 
         hidden_states_list = self._split_hidden_states(hidden_states)
         del hidden_states

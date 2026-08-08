@@ -10,6 +10,7 @@ Covers:
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -697,6 +698,95 @@ class TestDFlashTrainerAggregation(unittest.TestCase):
         self.assertAlmostEqual(metrics["eval/avg_acc"], 11.0 / 24.0, places=6)
         self.assertAlmostEqual(metrics["eval/avg_loss"], self._expected_avg_loss(), places=6)
         self.assertAlmostEqual(metrics["eval/simulated_acc_len"], 0.8, places=6)
+
+
+class TestDFlashVerifierNorm(unittest.TestCase):
+    """``last_hidden_states_prenorm`` support on the DFlash path."""
+
+    @staticmethod
+    def _make_trainer(prenorm: bool):
+        from torchspec.training.dflash_trainer import DFlashTrainer
+
+        trainer = object.__new__(DFlashTrainer)
+        trainer.args = SimpleNamespace(
+            lm_head_key="lm_head.weight",
+            norm_key="model.norm.weight",
+            trust_remote_code=True,
+        )
+        trainer.dp_rank = 0
+        trainer._last_hs_prenorm = prenorm
+        trainer.verifier_norm = None
+        return trainer
+
+    @mock.patch("torchspec.training.dflash_trainer.dist.get_rank", return_value=0)
+    def test_rank_zero_fails_fast_when_the_requested_norm_is_missing(self, _mock_get_rank):
+        trainer = self._make_trainer(prenorm=True)
+        head = mock.MagicMock()
+        head.norm = None
+
+        with mock.patch(
+            "torchspec.models.target.target_utils.TargetLMHead.from_pretrained",
+            return_value=head,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires a loaded verifier norm"):
+                trainer._init_target_lm_head("/nonexistent/target")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_forward_normalizes_last_hidden_states(self):
+        trainer = self._make_trainer(prenorm=True)
+        trainer.num_target_layers = 1
+        trainer.target_lm_head_weight = torch.randn(8, 4, device="cuda")
+        trainer.verifier_norm = torch.nn.RMSNorm(4, eps=1e-5).cuda()
+        with torch.no_grad():
+            trainer.verifier_norm.weight.copy_(torch.linspace(0.5, 1.5, 4, device="cuda"))
+
+        seen = {}
+
+        def _capture(**kwargs):
+            seen["last_hidden_states"] = kwargs["last_hidden_states"]
+            zero = torch.zeros((), device="cuda")
+            return zero, zero, zero, zero, zero, {}
+
+        trainer.model = _capture
+        last_hidden_states = torch.randn(1, 3, 4, device="cuda")
+        trainer._forward(
+            {
+                "input_ids": torch.zeros(1, 3, dtype=torch.long, device="cuda"),
+                "hidden_states": torch.randn(1, 3, 4, device="cuda"),
+                "loss_mask": torch.ones(1, 3, device="cuda"),
+                "last_hidden_states": last_hidden_states,
+            }
+        )
+
+        torch.testing.assert_close(
+            seen["last_hidden_states"], trainer.verifier_norm(last_hidden_states)
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_forward_leaves_last_hidden_states_untouched_without_a_norm(self):
+        trainer = self._make_trainer(prenorm=False)
+        trainer.num_target_layers = 1
+        trainer.target_lm_head_weight = torch.randn(8, 4, device="cuda")
+
+        seen = {}
+
+        def _capture(**kwargs):
+            seen["last_hidden_states"] = kwargs["last_hidden_states"]
+            zero = torch.zeros((), device="cuda")
+            return zero, zero, zero, zero, zero, {}
+
+        trainer.model = _capture
+        last_hidden_states = torch.randn(1, 3, 4, device="cuda")
+        trainer._forward(
+            {
+                "input_ids": torch.zeros(1, 3, dtype=torch.long, device="cuda"),
+                "hidden_states": torch.randn(1, 3, 4, device="cuda"),
+                "loss_mask": torch.ones(1, 3, device="cuda"),
+                "last_hidden_states": last_hidden_states,
+            }
+        )
+
+        self.assertIs(seen["last_hidden_states"], last_hidden_states)
 
 
 class TestMiniTrainingLoop(unittest.TestCase):
