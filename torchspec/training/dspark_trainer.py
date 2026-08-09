@@ -27,7 +27,12 @@ forward, train step, and metric aggregation) via subclass hooks.
 
 from argparse import Namespace
 
-from torchspec.models.draft.dspark import DSparkConfig, DSparkDraftModel
+from torchspec.models.draft.dspark import (
+    DSparkConfig,
+    DSparkDraftModel,
+    K3DSparkConfig,
+    K3DSparkModel,
+)
 from torchspec.models.dspark import DSparkModel
 from torchspec.training.dflash_trainer import DFlashTrainer
 
@@ -56,6 +61,8 @@ class DSparkTrainer(DFlashTrainer):
     # ------------------------------------------------------------------
 
     def _build_draft_model(self, config):
+        if isinstance(config, K3DSparkConfig):
+            return K3DSparkModel(config)
         return DSparkDraftModel(config)
 
     def _build_training_wrapper(self, draft_model):

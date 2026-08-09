@@ -35,6 +35,7 @@ Pins the DSpark wiring so future refactors can't silently break the objective:
    DFlashConfig since it subclasses it).
 """
 
+import math
 import unittest
 
 import torch
@@ -45,8 +46,11 @@ from torchspec.models.draft.dspark import (
     AcceptRatePredictor,
     DSparkConfig,
     DSparkDraftModel,
+    K3DSparkConfig,
+    K3DSparkModel,
     VanillaMarkov,
 )
+from torchspec.models.draft.llama3_eagle import LlamaYarnRotaryEmbedding, yarn_get_mscale
 from torchspec.models.dspark import DSparkModel
 
 CE_A, L1_A, CF_A = 0.1, 0.9, 1.0
@@ -59,6 +63,7 @@ def _make_dspark_config(
     markov_rank=16,
     enable_confidence_head=True,
     confidence_head_with_markov=True,
+    fc_norm=False,
 ):
     return DSparkConfig(
         hidden_size=H,
@@ -78,6 +83,7 @@ def _make_dspark_config(
         markov_head_type="vanilla",
         enable_confidence_head=enable_confidence_head,
         confidence_head_with_markov=confidence_head_with_markov,
+        fc_norm=fc_norm,
     )
 
 
@@ -127,6 +133,27 @@ class TestDSparkConfig(unittest.TestCase):
         self.assertEqual(cfg.model_type, "qwen3_dspark")
         self.assertEqual(cfg.markov_rank, 32)
         self.assertTrue(cfg.enable_confidence_head)
+        self.assertFalse(cfg.fc_norm)
+
+    def test_optional_fc_norm_normalizes_each_target_layer_before_projection(self):
+        cfg = _make_dspark_config(H=16, num_target_layers=3, fc_norm=True)
+        model = DSparkDraftModel(cfg).to(dtype=torch.float32)
+        self.assertIsNotNone(model.fc_norm)
+        self.assertEqual(len(model.fc_norm), 3)
+
+        hidden_states = [torch.randn(2, 5, 16) * scale for scale in (1.0, 15.0, 20.0)]
+        projected_inputs = []
+        handle = model.context_proj.register_forward_pre_hook(
+            lambda _module, args: projected_inputs.append(args[0].detach())
+        )
+        try:
+            model.extract_context_feature(hidden_states)
+        finally:
+            handle.remove()
+
+        normalized_chunks = projected_inputs[0].chunk(3, dim=-1)
+        for norm, raw, actual in zip(model.fc_norm, hidden_states, normalized_chunks, strict=True):
+            torch.testing.assert_close(actual, norm(raw))
 
     def test_draft_model_heads(self):
         cfg = _make_dspark_config(H=64, markov_rank=16)
@@ -295,6 +322,153 @@ class TestDSparkTargetHiddenStates(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
 
 
+# yarn block in the shape published by Inferact/Kimi-K3-DSpark (rope_theta nested)
+K3_ROPE_PARAMETERS = {
+    "rope_type": "yarn",
+    "factor": 32.0,
+    "original_max_position_embeddings": 64,
+    "rope_theta": 50000.0,
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "mscale": 1.0,
+    "mscale_all_dim": 1.0,
+}
+
+
+def _make_k3_config(H=64, V=128, **over):
+    base = dict(
+        hidden_size=H,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        q_lora_rank=32,
+        kv_lora_rank=16,
+        qk_nope_head_dim=16,
+        qk_rope_head_dim=8,
+        v_head_dim=16,
+        vocab_size=V,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,  # stale legacy value; rope_parameters must win
+        num_target_layers=2,
+        target_hidden_size=H,
+        target_num_hidden_layers=12,
+        mask_token_id=V - 1,
+        markov_rank=16,
+        markov_head_type="vanilla",
+        enable_confidence_head=True,
+        confidence_head_with_markov=True,
+        rope_parameters=dict(K3_ROPE_PARAMETERS),
+    )
+    base.update(over)
+    return K3DSparkConfig(**base)
+
+
+def _make_k3_model(block_size=4, num_anchors=6, **cfg_kw):
+    config = _make_k3_config(**cfg_kw)
+    draft = K3DSparkModel(config).to(dtype=torch.float32)
+    draft.freeze_embedding()
+    return DSparkModel(
+        draft_model=draft,
+        block_size=block_size,
+        num_anchors=num_anchors,
+        loss_decay_gamma=4.0,
+        ce_loss_alpha=CE_A,
+        l1_loss_alpha=L1_A,
+        confidence_head_alpha=CF_A,
+    )
+
+
+class TestK3DSparkConfig(unittest.TestCase):
+    def test_rope_parameters_normalized_into_rope_scaling(self):
+        cfg = _make_k3_config()
+        self.assertEqual(cfg.model_type, "k3_dspark")
+        self.assertEqual(cfg.rope_theta, 50000.0)  # nested value overrides legacy
+        self.assertIsNotNone(cfg.rope_scaling)
+        self.assertEqual(cfg.rope_scaling["rope_type"], "yarn")
+        self.assertEqual(cfg.rope_scaling["factor"], 32.0)
+        self.assertEqual(cfg.rope_scaling["mscale_all_dim"], 1.0)
+        # transformers 5.x aliases the two names to a single attribute; the
+        # nested rope_theta survives for serving-config round trips.
+        self.assertIs(cfg.rope_scaling, cfg.rope_parameters)
+        self.assertEqual(cfg.rope_parameters, K3_ROPE_PARAMETERS)
+
+    def test_explicit_rope_scaling_wins(self):
+        scaling = {"rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 64}
+        cfg = _make_k3_config(rope_scaling=scaling)
+        self.assertEqual(cfg.rope_scaling["factor"], 2.0)
+
+    def test_yarn_defaults_filled_for_partial_block(self):
+        cfg = _make_k3_config(
+            rope_parameters={
+                "rope_type": "yarn",
+                "factor": 32.0,
+                "original_max_position_embeddings": 64,
+            }
+        )
+        self.assertEqual(cfg.rope_scaling["beta_fast"], 32.0)
+        self.assertEqual(cfg.rope_scaling["mscale_all_dim"], 0.0)
+
+
+class TestK3DSparkModel(unittest.TestCase):
+    def test_mla_layout_matches_published_checkpoint(self):
+        m = K3DSparkModel(_make_k3_config())
+        sd = m.state_dict()
+        for name in (
+            "layers.0.self_attn.q_a_proj.weight",
+            "layers.0.self_attn.q_a_layernorm.weight",
+            "layers.0.self_attn.q_b_proj.weight",
+            "layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            "layers.0.self_attn.kv_a_layernorm.weight",
+            "layers.0.self_attn.kv_b_proj.weight",
+            "layers.0.self_attn.o_proj.weight",
+            "layers.1.self_attn.o_proj.weight",
+            "context_proj.weight",
+            "markov_head.markov_w1.weight",
+            "confidence_head.proj.weight",
+        ):
+            self.assertIn(name, sd)
+        # no Qwen3-style per-head norms and no output gate in the MLA layout
+        self.assertNotIn("layers.0.self_attn.q_norm.weight", sd)
+        self.assertNotIn("layers.0.self_attn.k_norm.weight", sd)
+        # H=4 heads, qk_head_dim=24, v_head_dim=16, hidden=64
+        self.assertEqual(sd["layers.0.self_attn.q_b_proj.weight"].shape, (4 * 24, 32))
+        self.assertEqual(sd["layers.0.self_attn.kv_a_proj_with_mqa.weight"].shape, (16 + 8, 64))
+        self.assertEqual(sd["layers.0.self_attn.kv_b_proj.weight"].shape, (4 * (16 + 16), 16))
+        self.assertEqual(sd["layers.0.self_attn.o_proj.weight"].shape, (64, 4 * 16))
+
+    def test_yarn_rope_and_softmax_scale(self):
+        m = K3DSparkModel(_make_k3_config())
+        attn = m.layers[0].self_attn
+        self.assertIsInstance(attn.rotary_emb, LlamaYarnRotaryEmbedding)
+        self.assertEqual(attn.rotary_emb.dim, 8)  # rope side dims only
+        mscale = yarn_get_mscale(32.0, 1.0)
+        expected = (mscale * mscale) / math.sqrt(24)
+        self.assertAlmostEqual(attn.softmax_scale, expected, places=8)
+
+    def test_output_gate_unsupported(self):
+        with self.assertRaises(NotImplementedError):
+            K3DSparkModel(_make_k3_config(mla_use_output_gate=True))
+
+    def test_forward_backward_through_dspark_wrapper(self):
+        m = _make_k3_model()
+        loss, acc, lpp, app, cpp, comps, loss_terms = m(**_batch())
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(set(comps), {"ce_loss", "l1_loss", "confidence_loss"})
+        numerator, denominator = loss_terms
+        torch.testing.assert_close(loss, numerator / denominator)
+
+        loss.backward()
+        draft = m.draft_model
+        attn = draft.layers[0].self_attn
+        for p in (attn.q_a_proj.weight, attn.kv_b_proj.weight, attn.o_proj.weight):
+            self.assertIsNotNone(p.grad)
+            self.assertGreater(p.grad.abs().sum().item(), 0)
+        self.assertIsNotNone(draft.markov_head.markov_w2.weight.grad)
+        self.assertIsNone(draft.embed_tokens.weight.grad)  # frozen
+
+
 class TestDispatch(unittest.TestCase):
     def test_json_resolves_to_dspark_config(self):
         cfg = AutoDraftModelConfig.from_dict(
@@ -313,6 +487,32 @@ class TestDispatch(unittest.TestCase):
         # Subclass of DFlashConfig -> any isinstance(DFlashConfig) dispatch must
         # test DSparkConfig first (trainer_actor / train_entry rely on this).
         self.assertIsInstance(cfg, DFlashConfig)
+
+    def test_k3_json_resolves_to_k3_config(self):
+        cfg = AutoDraftModelConfig.from_dict(
+            {
+                "architectures": ["K3DSparkModel"],
+                "model_type": "k3_dspark",
+                "hidden_size": 64,
+                "vocab_size": 128,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "q_lora_rank": 32,
+                "kv_lora_rank": 16,
+                "qk_nope_head_dim": 16,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 16,
+                "num_target_layers": 2,
+                "markov_rank": 16,
+                "enable_confidence_head": True,
+                "rope_parameters": dict(K3_ROPE_PARAMETERS),
+            }
+        )
+        self.assertIsInstance(cfg, K3DSparkConfig)
+        # trainer_actor's isinstance(DSparkConfig) dispatch must pick DSparkTrainer
+        self.assertIsInstance(cfg, DSparkConfig)
+        self.assertEqual(cfg.rope_scaling["rope_type"], "yarn")
+        self.assertEqual(cfg.rope_theta, 50000.0)
 
 
 if __name__ == "__main__":
