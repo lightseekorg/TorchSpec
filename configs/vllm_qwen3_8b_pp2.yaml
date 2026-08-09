@@ -1,0 +1,71 @@
+# Configuration for train_entry.py with a pipeline-parallel vLLM target
+#
+# GPU allocation:
+#   - 2 GPUs for inference: one engine split across 2 pipeline stages
+#   - 2 GPUs for training (DP/FSDP: model sharded across 2 GPUs)
+#   - Total: 4 GPUs
+#
+# Requires a vLLM built from patches/vllm/<image-tag>/, because every pipeline
+# stage has to return the aux hidden states it owns; released vLLM captures on
+# the last stage only. See docker/vllm/<image-tag>/Dockerfile.
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/vllm_qwen3_8b_pp2.yaml
+
+model:
+  target_model_path: Qwen/Qwen3-8B
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../examples/data/sample_conversations.jsonl
+  eval_data_path: ../examples/data/eval_conversations.jsonl
+  eval_interval: 100
+  chat_template: qwen
+  prompt_key: conversations
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 16384
+  num_epochs: 1
+  seed: 42
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+  ttt_length: 7
+  save_per_epoch: true
+  warmup_ratio: 0.015
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 2
+  inference_num_gpus_per_node: 4
+  max_sample_pool_size: 64
+  inference_buffer_threshold: 32
+  inference_batch_size: 8
+  vllm:
+    # The engine's TP degree is derived as
+    # inference_num_gpus_per_engine / pp_size, so 2 GPUs at pp_size=2 run
+    # tp_size=1 with two pipeline stages.
+    pp_size: 2
+    mem_fraction_static: 0.7
+    extra_args:
+      max_num_batched_tokens: 8192
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 32GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/qwen3-8b-pp2
+cache_dir: ./cache
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
