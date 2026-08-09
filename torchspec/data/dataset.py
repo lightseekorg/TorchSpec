@@ -37,12 +37,14 @@ from torchspec.data.preprocessing import _normalize_conversation, preprocess_con
 from torchspec.data.renderers import RENDERER_REGISTRY
 from torchspec.data.template import TEMPLATE_REGISTRY
 from torchspec.data.utils import (
+    deserialize_packed_loss_mask,
     estimate_row_count,
     extract_media_urls,
     flatten_multimodal_content,
     load_hf_dataset,
     pack_loss_mask,
     serialize_packed_loss_mask,
+    unpack_loss_mask,
 )
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import load_tokenizer
@@ -50,6 +52,127 @@ from torchspec.utils.processing import load_tokenizer
 _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
 
 _worker_state = {}
+
+# Columns the pretokenized loader consumes or can re-derive itself. Everything
+# else in the row is treated as caller-defined provenance metadata.
+_PRETOKENIZED_CONTRACT_COLUMNS = frozenset(
+    {
+        "data_id",
+        "id",
+        "input_ids",
+        "loss_mask",
+        "packed_loss_mask",
+        "seq_len",
+        "loss_tokens",
+    }
+)
+
+
+def _is_pretokenized_dataset(dataset) -> bool:
+    """Return whether an HF dataset exposes the offline token/mask contract."""
+    columns = set(getattr(dataset, "column_names", None) or ())
+    has_ids = "input_ids" in columns
+    has_mask = bool(columns & {"packed_loss_mask", "loss_mask"})
+    if has_ids != has_mask:
+        raise ValueError(
+            "Pretokenized datasets must provide input_ids together with "
+            "packed_loss_mask or loss_mask"
+        )
+    return has_ids
+
+
+def _pretokenized_metadata(sample) -> dict:
+    """Carry through the row's own provenance columns untouched.
+
+    Offline tokenization pipelines record their own bookkeeping (source corpus,
+    supervision policy, row fingerprints). The loader does not interpret any of
+    it, so pass every non-contract column through instead of enumerating names.
+    Non-scalar values are skipped so a stray tensor column cannot be pinned in
+    memory for the lifetime of the dataset.
+    """
+    return {
+        key: value
+        for key, value in sample.items()
+        if key not in _PRETOKENIZED_CONTRACT_COLUMNS
+        and value is not None
+        and isinstance(value, (str, int, float, bool))
+    }
+
+
+def _load_pretokenized_dataset(dataset, *, max_length: int, total=None):
+    """Load already-rendered rows without applying a chat template again."""
+    prompts = []
+    seen_ids = set()
+    for idx, sample in enumerate(tqdm(dataset, desc="Loading pretokenized dataset", total=total)):
+        input_ids = sample.get("input_ids")
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if not isinstance(input_ids, list) or any(not isinstance(v, int) for v in input_ids):
+            raise ValueError(f"Pretokenized sample {idx} has invalid input_ids")
+        if not input_ids:
+            raise ValueError(f"Pretokenized sample {idx} has empty input_ids")
+        # Truncating here would drop supervised tokens the producer counted on,
+        # so an over-length row is a corpus/config mismatch, not something to fix
+        # silently.
+        if len(input_ids) > max_length:
+            raise ValueError(
+                f"Pretokenized sample {idx} has seq_len={len(input_ids)} above "
+                f"max_seq_length={max_length}; retokenize the corpus at this limit "
+                f"or raise max_seq_length instead of truncating"
+            )
+        stored_seq_len = sample.get("seq_len")
+        if stored_seq_len is not None and int(stored_seq_len) != len(input_ids):
+            raise ValueError(f"Pretokenized sample {idx} seq_len metadata does not match input_ids")
+
+        packed_loss_mask = sample.get("packed_loss_mask")
+        explicit_loss_mask = sample.get("loss_mask")
+        if hasattr(explicit_loss_mask, "tolist"):
+            explicit_loss_mask = explicit_loss_mask.tolist()
+        if packed_loss_mask is None:
+            if not isinstance(explicit_loss_mask, list):
+                raise ValueError(f"Pretokenized sample {idx} is missing its loss mask")
+            packed_loss_mask = serialize_packed_loss_mask(
+                pack_loss_mask(torch.tensor(explicit_loss_mask, dtype=torch.long))
+            )
+        segments = deserialize_packed_loss_mask(packed_loss_mask)
+        if any(length < 0 for length in segments) or sum(segments) != len(input_ids):
+            raise ValueError(
+                f"Pretokenized sample {idx} packed_loss_mask length does not match input_ids"
+            )
+        packed_loss_tokens = sum(segments[1::2])
+        if packed_loss_tokens <= 0:
+            raise ValueError(f"Pretokenized sample {idx} has no supervised tokens")
+        # Both mask encodings may be present; disagreement means the producer
+        # wrote them from different states and neither can be trusted.
+        if explicit_loss_mask is not None:
+            if (
+                not isinstance(explicit_loss_mask, list)
+                or explicit_loss_mask != unpack_loss_mask(packed_loss_mask).tolist()
+            ):
+                raise ValueError(
+                    f"Pretokenized sample {idx} explicit loss_mask disagrees with packed mask"
+                )
+        stored_loss_tokens = sample.get("loss_tokens")
+        if stored_loss_tokens is not None and int(stored_loss_tokens) != packed_loss_tokens:
+            raise ValueError(
+                f"Pretokenized sample {idx} loss_tokens metadata disagrees with packed mask"
+            )
+
+        data_id = str(sample.get("data_id") or sample.get("id") or f"sample_{idx}")
+        if data_id in seen_ids:
+            raise ValueError(f"Duplicate pretokenized data_id: {data_id}")
+        seen_ids.add(data_id)
+        prompts.append(
+            {
+                "data_id": data_id,
+                "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "packed_loss_mask": packed_loss_mask,
+                "formatted_prompt": None,
+                "multimodal_inputs": None,
+                "metadata": _pretokenized_metadata(sample),
+            }
+        )
+    return prompts
 
 
 def _init_tokenize_worker(
@@ -190,6 +313,11 @@ def load_conversation_dataset(args):
     set, a registered :class:`ConversationRenderer` that owns both prompt
     construction and loss-mask derivation.
 
+    A dataset that already carries ``input_ids`` plus a loss mask is loaded
+    directly and is never rendered or truncated again. Detection needs a typed
+    schema, so this covers Parquet/Arrow paths and Hub repos; a JSONL file is
+    always treated as raw conversations.
+
     Returns list of dicts. Fields depend on mode:
         defer_tokenization=True:  data_id, formatted_prompt, multimodal_inputs, metadata
         defer_tokenization=False: data_id, input_ids, packed_loss_mask, formatted_prompt, multimodal_inputs, metadata
@@ -212,6 +340,18 @@ def load_conversation_dataset(args):
 
     custom_template = TEMPLATE_REGISTRY.get(chat_template_name) if not renderer_name else None
     hf_dataset = load_hf_dataset(args.train_data_path)
+
+    if _is_pretokenized_dataset(hf_dataset):
+        if defer_tokenization:
+            raise ValueError("Pretokenized datasets require defer_tokenization=False")
+        logger.info("Detected offline pretokenized input_ids/loss-mask dataset")
+        prompts = _load_pretokenized_dataset(
+            hf_dataset,
+            max_length=max_length,
+            total=estimate_row_count(args.train_data_path),
+        )
+        logger.info(f"Loaded {len(prompts)} pretokenized samples without re-rendering")
+        return prompts
 
     dataset_name = os.path.basename(args.train_data_path)
     file_stat = ""

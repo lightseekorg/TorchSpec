@@ -530,7 +530,12 @@ def load_hf_dataset(data_path: str):
     )
     try:
         ds = load_dataset(data_path, split="train", streaming=True)
-        drop_cols = [c for c in (ds.column_names or []) if c not in _KEEP_COLUMNS]
+        columns = ds.column_names or []
+        # A pretokenized repo's provenance columns cannot be enumerated ahead of
+        # time, and dropping input_ids would silently demote it to raw text.
+        if "input_ids" in columns:
+            return ds
+        drop_cols = [c for c in columns if c not in _KEEP_COLUMNS]
         if drop_cols:
             ds = ds.remove_columns(drop_cols)
         return ds
