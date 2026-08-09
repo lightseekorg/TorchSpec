@@ -23,7 +23,7 @@
 import os
 import warnings
 from collections import Counter
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numba
 import numpy as np
@@ -51,7 +51,7 @@ from torchspec.utils.logging import logger
 from torchspec.utils.tensor import padding
 
 # define a type called conversation
-Conversation = List[Dict[str, str]]
+Conversation = List[Dict[str, Any]]
 
 ROLE_MAPPING = {
     "human": "user",
@@ -59,11 +59,14 @@ ROLE_MAPPING = {
     "system": "system",
 }
 
+_REASONING_FIELDS = ("thinking", "thinking_content", "reasoning_content", "reasoning")
+
 
 def _normalize_conversation(conversation: Conversation) -> Conversation:
     """
     Normalize conversation format to use role/content keys.
     Handles ShareGPT format (from/value) and converts to standard format (role/content).
+    Extended fields such as tool_calls, name, and tool_call_id are preserved.
     """
     if not conversation:
         return conversation
@@ -76,8 +79,13 @@ def _normalize_conversation(conversation: Conversation) -> Conversation:
         normalized = []
         for msg in conversation:
             role = ROLE_MAPPING.get(msg["from"], msg["from"])
-            entry = {"role": role, "content": msg["value"]}
-            for field in ("thinking", "thinking_content", "reasoning_content", "reasoning"):
+            entry = {
+                key: value
+                for key, value in msg.items()
+                if key not in {"from", "value", *_REASONING_FIELDS}
+            }
+            entry.update(role=role, content=msg["value"])
+            for field in _REASONING_FIELDS:
                 if msg.get(field):
                     entry["reasoning_content"] = msg[field]
                     break
