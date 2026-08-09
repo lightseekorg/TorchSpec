@@ -1,0 +1,137 @@
+# Kimi-K3 DSpark draft training — 8-node setup
+#
+# Node layout (40 GPUs across 8 nodes):
+#   - 4 nodes (32 GPUs) for inference: two vLLM engines, each TP=8 across 2
+#     pipeline stages
+#   - 2 nodes (8 GPUs) for training (FSDP FULL_SHARD)
+#
+# Pipeline-parallel inference requires a vLLM built from
+# patches/vllm/<image-tag>/, because every pipeline stage has to return the aux
+# hidden states it owns; released vLLM captures on the last stage only. See
+# docker/vllm/<image-tag>/Dockerfile.
+#
+# Usage:
+#   python -m torchspec.train_entry --config configs/vllm_kimi_k3_dspark_stage1.yaml
+
+model:
+  target_model_path: ???  # set to your Kimi-K3 checkpoint (local dir or HF hub id)
+  draft_model_config: configs/draft_models/kimi_k3_dspark_mla.json
+  target_model_backend: vllm
+  trust_remote_code: true
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  norm_key: language_model.model.norm.weight
+
+dataset:
+  train_data_path: ???  # set to your dataset path (HF hub id, local dir, or jsonl)
+  eval_data_path: ???  # set to your eval dataset path, or null to skip eval
+  eval_interval: 50
+  eval_prompt_key: conversations
+  prompt_key: conversations
+  renderer: kimi-k3
+  chat_template: null
+  defer_tokenization: false
+  last_turn_loss_only: true
+  shuffle_dataset: true
+  length_group_size: 1
+  # DSpark needs at least two complete seven-token diffusion blocks.
+  min_loss_tokens: 14
+
+training:
+  max_seq_length: 32768
+  seed: 42
+  micro_batch_size: 1
+  # Eight training ranks x one sequence x 16 microbatches = 128.
+  draft_accumulation_steps: 16
+  learning_rate: 5.0e-5
+  warmup_ratio: 0.04
+  lr_decay_style: cosine
+  min_lr: 0.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  ttt_length: 7
+  num_epochs: 5
+  save_interval: 1000
+  save_per_epoch: true
+  max_concurrent_batches: 1
+  gradient_checkpointing: true
+  attention_backend: flex_attention
+  training_num_nodes: 2
+  training_num_gpus_per_node: 4
+  fsdp_strategy: FULL_SHARD
+  distributed_timeout_minutes: 60
+  # Set the socket interfaces to your cluster's NICs. The MNNVL/IMEX entries are
+  # only needed on NVLink-switched multi-node systems.
+  # train_env_vars: '{"NCCL_SOCKET_IFNAME":"<iface>","GLOO_SOCKET_IFNAME":"<iface>","NCCL_MNNVL_ENABLE":"1","NCCL_CUMEM_ENABLE":"1","NVIDIA_IMEX_CHANNELS":"all"}'
+
+  dflash_block_size: 7
+  dspark_num_anchors: 512
+  dspark_num_target_layers: 5
+  dspark_loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+
+  # Keeping both checkpoint inputs disabled prevents an accidental warm start.
+  load_path: null
+  continual_training: false
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 32
+  inference_num_gpus_per_engine: 16
+  inference_num_gpus_per_node: 4
+  inference_batch_size: 4
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 8
+  max_sample_pool_size: 32
+  store_last_hidden_states: true
+  # Must match target_layer_ids in the draft config above.
+  aux_hidden_states_layers: [7, 31, 47, 63, 87]
+  last_hidden_states_prenorm: true
+
+  vllm:
+    # 16 GPUs per engine at pp_size=2 gives tp_size=8 with two pipeline stages.
+    tp_size: 8
+    pp_size: 2
+    nnodes: 4
+    init_timeout: 3600
+    dist_timeout: 1800
+    mem_fraction_static: 0.85
+    extra_args:
+      load_format: fastsafetensors
+      max_num_batched_tokens: 32768
+      enable_chunked_prefill: true
+      async_scheduling: true
+      enforce_eager: true
+      kv_cache_memory_bytes: 34359738368
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: rdma  # tcp works but is much slower for hidden-state transfer
+  # device_name: mlx5_0,mlx5_1  # Please change this to correct network devices.
+  enable_gpu_direct: false
+  hidden_dim: 7168
+  enable_hard_pin: true
+  kv_lease_ttl_s: 180.0
+  get_retry_max_wait_seconds: 180.0
+  global_segment_size: 512GB
+  local_buffer_size: 16GB
+
+output_dir: ./outputs/kimi-k3-dspark-stage1
+cache_dir: ./cache/kimi-k3-dspark-stage1
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  enable_perf_metrics: true
+
+logging:
+  report_to: none
+  wandb_key: null
+  wandb_project: train_kimi_k3_dspark
+  wandb_team: null
+  wandb_group: null
+  wandb_mode: online
+  wandb_random_suffix: true
