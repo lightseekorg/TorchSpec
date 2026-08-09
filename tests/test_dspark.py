@@ -447,6 +447,29 @@ class TestK3DSparkModel(unittest.TestCase):
         expected = (mscale * mscale) / math.sqrt(24)
         self.assertAlmostEqual(attn.softmax_scale, expected, places=8)
 
+    def test_yarn_rope_uses_config_theta(self):
+        # The shared yarn branch omitted base=, so it silently fell back to 10000
+        # and every RoPE-enabled K3 run trained on the wrong rotary frequencies
+        # even though K3DSparkConfig lifts the nested rope_theta.
+        attn = K3DSparkModel(_make_k3_config()).layers[0].self_attn
+        self.assertEqual(attn.rotary_emb.base, 50000.0)
+
+        def reference(base):
+            return LlamaYarnRotaryEmbedding(
+                8,
+                max_position_embeddings=2048,
+                base=base,
+                original_max_position_embeddings=64,
+                scaling_factor=32.0,
+                beta_fast=32,
+                beta_slow=1,
+                mscale=1.0,
+                mscale_all_dim=1.0,
+            )
+
+        torch.testing.assert_close(attn.rotary_emb.inv_freq, reference(50000.0).inv_freq)
+        self.assertFalse(torch.allclose(attn.rotary_emb.inv_freq, reference(10000.0).inv_freq))
+
     def test_output_gate_unsupported(self):
         with self.assertRaises(NotImplementedError):
             K3DSparkModel(_make_k3_config(mla_use_output_gate=True))
