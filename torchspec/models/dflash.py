@@ -131,6 +131,10 @@ class DFlashModel(nn.Module):
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
 
+    @property
+    def uses_target_hidden_states(self) -> bool:
+        return self.l1_loss_alpha > 0
+
     def _sample_anchor_positions(
         self,
         seq_len: int,
@@ -395,7 +399,7 @@ class DFlashModel(nn.Module):
         ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
 
         loss_per_token = self.ce_loss_alpha * ce_per_token
-        if self.l1_loss_alpha > 0:
+        if self.uses_target_hidden_states:
             if last_hidden_states is None:
                 raise ValueError(
                     "DFlash L1 distillation (l1_loss_alpha > 0) requires target "

@@ -236,9 +236,19 @@ class DFlashTrainer(Trainer):
     def _init_target_lm_head(self, target_model_path: str) -> None:
         from torchspec.models.target.target_utils import load_synced_target_lm_head
 
+        # The norm exists to make the target's pre-norm hidden states usable, so a
+        # run whose objective never reads them must not fail on loading it.
+        load_norm = self._last_hs_prenorm and self.dflash.uses_target_hidden_states
+        if self._last_hs_prenorm and not load_norm:
+            logger.info(
+                "[Rank %s] last_hidden_states_prenorm is set, but the objective does not read "
+                "the target's last hidden states; skipping the verifier norm",
+                self.dp_rank,
+            )
+
         self.target_lm_head = load_synced_target_lm_head(
             target_model_path,
-            load_norm=self._last_hs_prenorm,
+            load_norm=load_norm,
             lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
             norm_key=getattr(self.args, "norm_key", "model.norm.weight"),
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
@@ -271,9 +281,12 @@ class DFlashTrainer(Trainer):
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.to(device, non_blocking=True)
 
-        last_hidden_states = batch.get("last_hidden_states", None)
-        if last_hidden_states is not None:
-            last_hidden_states = last_hidden_states.to(device, non_blocking=True)
+        # Gated on the same predicate as the norm load: feeding the loss an
+        # unnormalised pre-norm tensor is silently wrong, so a run that skipped
+        # the norm must not consume these at all.
+        last_hidden_states = None
+        if self.dflash.uses_target_hidden_states and batch.get("last_hidden_states") is not None:
+            last_hidden_states = batch["last_hidden_states"].to(device, non_blocking=True)
             if self.verifier_norm is not None:
                 with torch.no_grad():
                     last_hidden_states = self.verifier_norm(last_hidden_states)

@@ -75,6 +75,14 @@ class DSparkModel(DFlashModel):
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
 
+    @property
+    def uses_target_hidden_states(self) -> bool:
+        # The confidence head regresses onto an accept rate derived from the
+        # verifier distribution, so the L1 weight alone does not cover it.
+        return super().uses_target_hidden_states or (
+            self.draft_model.confidence_head is not None and self.confidence_head_alpha > 0
+        )
+
     def _decay_weights(self, device: torch.device) -> torch.Tensor:
         """exp(-k/gamma) over within-block position k (DeepSpec convention).
 
@@ -171,10 +179,7 @@ class DSparkModel(DFlashModel):
         # ---- L1 distribution distillation + accept rate ----
         l1_num = base_logits.new_zeros((), dtype=torch.float32)
         accept_rate = None
-        need_target = (self.l1_loss_alpha > 0) or (
-            self.draft_model.confidence_head is not None and self.confidence_head_alpha > 0
-        )
-        if need_target:
+        if self.uses_target_hidden_states:
             if last_hidden_states is None:
                 raise ValueError(
                     "DSpark L1/confidence losses require target last_hidden_states; set "

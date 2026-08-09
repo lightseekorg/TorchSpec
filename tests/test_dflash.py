@@ -704,7 +704,7 @@ class TestDFlashVerifierNorm(unittest.TestCase):
     """``last_hidden_states_prenorm`` support on the DFlash path."""
 
     @staticmethod
-    def _make_trainer(prenorm: bool):
+    def _make_trainer(prenorm: bool, uses_target_hidden_states: bool = True):
         from torchspec.training.dflash_trainer import DFlashTrainer
 
         trainer = object.__new__(DFlashTrainer)
@@ -715,6 +715,7 @@ class TestDFlashVerifierNorm(unittest.TestCase):
         )
         trainer.dp_rank = 0
         trainer._last_hs_prenorm = prenorm
+        trainer.dflash = SimpleNamespace(uses_target_hidden_states=uses_target_hidden_states)
         trainer.verifier_norm = None
         return trainer
 
@@ -731,6 +732,20 @@ class TestDFlashVerifierNorm(unittest.TestCase):
 
         self.assertTrue(mock_load.call_args.kwargs["load_norm"])
         self.assertIs(trainer.verifier_norm, mock.sentinel.norm)
+
+    def test_init_does_not_request_the_norm_for_a_ce_only_objective(self):
+        trainer = self._make_trainer(prenorm=True, uses_target_hidden_states=False)
+        head = mock.MagicMock()
+        head.norm = None
+
+        with mock.patch(
+            "torchspec.models.target.target_utils.load_synced_target_lm_head",
+            return_value=head,
+        ) as mock_load:
+            trainer._init_target_lm_head("/nonexistent/target")
+
+        self.assertFalse(mock_load.call_args.kwargs["load_norm"])
+        self.assertIsNone(trainer.verifier_norm)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_forward_normalizes_last_hidden_states(self):
@@ -788,6 +803,31 @@ class TestDFlashVerifierNorm(unittest.TestCase):
         )
 
         self.assertIs(seen["last_hidden_states"], last_hidden_states)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_forward_drops_last_hidden_states_for_a_ce_only_objective(self):
+        trainer = self._make_trainer(prenorm=True, uses_target_hidden_states=False)
+        trainer.num_target_layers = 1
+        trainer.target_lm_head_weight = torch.randn(8, 4, device="cuda")
+
+        seen = {}
+
+        def _capture(**kwargs):
+            seen["last_hidden_states"] = kwargs["last_hidden_states"]
+            zero = torch.zeros((), device="cuda")
+            return zero, zero, zero, zero, zero, {}
+
+        trainer.model = _capture
+        trainer._forward(
+            {
+                "input_ids": torch.zeros(1, 3, dtype=torch.long, device="cuda"),
+                "hidden_states": torch.randn(1, 3, 4, device="cuda"),
+                "loss_mask": torch.ones(1, 3, device="cuda"),
+                "last_hidden_states": torch.randn(1, 3, 4, device="cuda"),
+            }
+        )
+
+        self.assertIsNone(seen["last_hidden_states"])
 
 
 class TestMiniTrainingLoop(unittest.TestCase):
@@ -1573,6 +1613,10 @@ class TestDFlashL1Loss(unittest.TestCase):
         kwargs = self._data(with_last_hs=False)
         with self.assertRaisesRegex(ValueError, "last_hidden_states"):
             model(**kwargs)
+
+    def test_uses_target_hidden_states_tracks_the_l1_weight(self):
+        self.assertTrue(self._model(l1_alpha=0.5).uses_target_hidden_states)
+        self.assertFalse(self._model(l1_alpha=0.0).uses_target_hidden_states)
 
     def test_default_is_pure_ce(self):
         """ce_alpha=1, l1_alpha=0 (defaults) reproduces the plain-CE loss, and

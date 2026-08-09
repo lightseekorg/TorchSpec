@@ -81,7 +81,13 @@ def _make_dspark_config(
     )
 
 
-def _make_dspark_model(block_size=4, num_anchors=6, **cfg_kw):
+def _make_dspark_model(
+    block_size=4,
+    num_anchors=6,
+    l1_loss_alpha=L1_A,
+    confidence_head_alpha=CF_A,
+    **cfg_kw,
+):
     config = _make_dspark_config(**cfg_kw)
     draft = DSparkDraftModel(config).to(dtype=torch.float32)
     draft.freeze_embedding()
@@ -91,8 +97,8 @@ def _make_dspark_model(block_size=4, num_anchors=6, **cfg_kw):
         num_anchors=num_anchors,
         loss_decay_gamma=4.0,
         ce_loss_alpha=CE_A,
-        l1_loss_alpha=L1_A,
-        confidence_head_alpha=CF_A,
+        l1_loss_alpha=l1_loss_alpha,
+        confidence_head_alpha=confidence_head_alpha,
     )
 
 
@@ -229,6 +235,56 @@ class TestHeadMath(unittest.TestCase):
         expected = head.proj(feats).squeeze(-1)
         self.assertTrue(torch.allclose(out, expected, atol=1e-6))
         self.assertEqual(out.shape, (2, 3, 4))
+
+
+class TestDSparkTargetHiddenStates(unittest.TestCase):
+    """The predicate the trainer reads to decide whether to load the verifier norm."""
+
+    def test_confidence_head_alone_still_reads_the_target_distribution(self):
+        m = _make_dspark_model(
+            l1_loss_alpha=0.0, confidence_head_alpha=1.0, enable_confidence_head=True
+        )
+        self.assertTrue(m.uses_target_hidden_states)
+
+    def test_l1_alone_reads_the_target_distribution(self):
+        m = _make_dspark_model(
+            l1_loss_alpha=0.9,
+            confidence_head_alpha=0.0,
+            enable_confidence_head=False,
+            confidence_head_with_markov=False,
+        )
+        self.assertTrue(m.uses_target_hidden_states)
+
+    def test_ce_only_does_not(self):
+        m = _make_dspark_model(
+            l1_loss_alpha=0.0,
+            confidence_head_alpha=0.0,
+            enable_confidence_head=False,
+            confidence_head_with_markov=False,
+        )
+        self.assertFalse(m.uses_target_hidden_states)
+
+    def test_a_weighted_confidence_head_the_draft_does_not_have_does_not(self):
+        m = _make_dspark_model(
+            l1_loss_alpha=0.0,
+            confidence_head_alpha=1.0,
+            enable_confidence_head=False,
+            confidence_head_with_markov=False,
+        )
+        self.assertFalse(m.uses_target_hidden_states)
+
+    def test_a_ce_only_model_runs_without_last_hidden_states(self):
+        m = _make_dspark_model(
+            l1_loss_alpha=0.0,
+            confidence_head_alpha=0.0,
+            enable_confidence_head=False,
+            confidence_head_with_markov=False,
+        )
+        batch = _batch()
+        batch["last_hidden_states"] = None
+        with torch.no_grad():
+            loss = m(**batch)[0]
+        self.assertTrue(torch.isfinite(loss))
 
 
 class TestDispatch(unittest.TestCase):
