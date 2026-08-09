@@ -171,3 +171,12 @@ def test_pretokenized_dataset_rejects_deferred_tokenization(tmp_path):
 
     with pytest.raises(ValueError, match="require defer_tokenization=False"):
         load_conversation_dataset(args)
+
+
+def test_pretokenized_dataset_needs_neither_renderer_nor_chat_template(tmp_path):
+    source = _write_parquet(tmp_path, [_row()])
+    args = _pretokenized_args(source, tmp_path, chat_template=None)
+
+    prompts = load_conversation_dataset(args)
+
+    assert [prompt["data_id"] for prompt in prompts] == ["row-1"]

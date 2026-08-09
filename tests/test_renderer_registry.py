@@ -249,7 +249,11 @@ def test_dataset_loading_rejects_an_unknown_renderer(tmp_path):
 
 
 def test_dataset_loading_requires_a_renderer_or_a_chat_template(tmp_path):
-    args = _renderer_args(tmp_path, tmp_path / "rows.jsonl", renderer=None)
+    # Raw conversations only: a pretokenized corpus needs neither setting, so
+    # the requirement can only be enforced once the schema is known.
+    source = tmp_path / "rows.jsonl"
+    source.write_text("{}\n")
+    args = _renderer_args(tmp_path, source, renderer=None)
 
     with pytest.raises(ValueError, match="Either renderer or chat_template"):
         dataset_module.load_conversation_dataset(args)

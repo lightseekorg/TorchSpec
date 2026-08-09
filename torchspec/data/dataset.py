@@ -362,15 +362,16 @@ def load_conversation_dataset(args):
 
     if renderer_name and defer_tokenization:
         raise ValueError("Registered dataset renderers require defer_tokenization=False")
-    if not renderer_name and not chat_template_name:
-        raise ValueError("Either renderer or chat_template must be set for dataset tokenization")
     if renderer_name and renderer_name not in RENDERER_REGISTRY.get_all_renderer_names():
         available = ", ".join(RENDERER_REGISTRY.get_all_renderer_names()) or "<none>"
         raise ValueError(f"Unknown dataset renderer {renderer_name!r}; available: {available}")
 
-    custom_template = TEMPLATE_REGISTRY.get(chat_template_name) if not renderer_name else None
     hf_dataset = load_hf_dataset(args.train_data_path)
 
+    # Detection comes before the renderer/template requirement below: a
+    # pretokenized corpus is never rendered, so a config that sets neither is
+    # complete rather than under-specified. The checks above are decidable from
+    # the config alone and stay there.
     if _is_pretokenized_dataset(hf_dataset):
         if defer_tokenization:
             raise ValueError("Pretokenized datasets require defer_tokenization=False")
@@ -382,6 +383,11 @@ def load_conversation_dataset(args):
         )
         logger.info(f"Loaded {len(prompts)} pretokenized samples without re-rendering")
         return prompts
+
+    if not renderer_name and not chat_template_name:
+        raise ValueError("Either renderer or chat_template must be set for dataset tokenization")
+
+    custom_template = TEMPLATE_REGISTRY.get(chat_template_name) if not renderer_name else None
 
     dataset_name = os.path.basename(args.train_data_path)
     file_stat = ""
