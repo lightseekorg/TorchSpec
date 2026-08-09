@@ -26,6 +26,7 @@ from torchspec.data.preprocessing import (
 from torchspec.data.renderers import (
     RENDERER_REGISTRY,
     ConversationRenderer,
+    K3Renderer,
     RendererRegistry,
 )
 from torchspec.data.template import TEMPLATE_REGISTRY, ChatTemplate
@@ -41,6 +42,7 @@ __all__ = [
     "ChatTemplate",
     "ConversationRenderer",
     "DataCollatorWithPadding",
+    "K3Renderer",
     "RENDERER_REGISTRY",
     "RendererRegistry",
     "TEMPLATE_REGISTRY",

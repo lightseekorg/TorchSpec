@@ -19,11 +19,15 @@
 # SOFTWARE.
 
 from torchspec.data.renderers.base import DEFAULT_CACHE_VERSION, ConversationRenderer
+from torchspec.data.renderers.kimi_k3 import K3Renderer
 from torchspec.data.renderers.registry import RENDERER_REGISTRY, RendererRegistry
+
+RENDERER_REGISTRY.register("kimi-k3", K3Renderer)
 
 __all__ = [
     "DEFAULT_CACHE_VERSION",
     "ConversationRenderer",
+    "K3Renderer",
     "RENDERER_REGISTRY",
     "RendererRegistry",
 ]
