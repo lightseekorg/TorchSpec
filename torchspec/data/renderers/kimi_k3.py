@@ -45,7 +45,7 @@ class K3Renderer:
 
     # Included in the dataset tokenization cache key. Bump whenever rendering
     # semantics change in a way that can alter input_ids or loss masks.
-    CACHE_VERSION = "generation-config-v2"
+    CACHE_VERSION = "generation-config-v3"
 
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
@@ -87,8 +87,16 @@ class K3Renderer:
         tools: list[dict[str, Any]] | None,
         *,
         thinking: bool = True,
-        thinking_effort: str | None = "max",
+        thinking_effort: str | None = None,
     ) -> list[int]:
+        """Encode ``messages``, leaving unset options to the tokenizer.
+
+        The tokenizer treats a non-``None`` ``thinking_effort`` as an explicit
+        rendering option and injects an internal thinking-effort system
+        message. Passing one where the caller did not ask for it would make
+        training prompts diverge from what the checkpoint renders at serving
+        time for a request that named no effort, so the default stays ``None``.
+        """
         token_ids = self.tokenizer.apply_chat_template(
             messages,
             tools=tools,
@@ -109,8 +117,10 @@ class K3Renderer:
         cls,
         generation_config: dict[str, Any] | None,
     ) -> tuple[bool, str | None]:
+        # A row that carries no config at all asks for nothing in particular,
+        # so no effort is forwarded and the tokenizer's own default stands.
         if generation_config is None:
-            return True, "max"
+            return True, None
         if not isinstance(generation_config, dict):
             raise TypeError(
                 "Kimi-K3 generation_config must be a dictionary or None, "
