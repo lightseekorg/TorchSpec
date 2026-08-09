@@ -25,10 +25,24 @@ Unit tests: Test logic with mocks (no GPU/vLLM/Mooncake needed)
 
 import json
 import os
+import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
 import torch
+
+
+@pytest.fixture(autouse=True)
+def _stub_mooncake_extension(monkeypatch):
+    """Keep these unit tests independent of the native Mooncake extension."""
+    mooncake_module = types.ModuleType("mooncake")
+    store_module = types.ModuleType("mooncake.store")
+    store_module.MooncakeDistributedStore = MagicMock
+    mooncake_module.store = store_module
+    monkeypatch.setitem(sys.modules, "mooncake", mooncake_module)
+    monkeypatch.setitem(sys.modules, "mooncake.store", store_module)
+
 
 # =============================================================================
 # Helpers
@@ -73,6 +87,33 @@ class TestSanitizeMooncakeKey:
     def test_empty_string(self):
         _sanitize = _import_connector_utils()
         assert _sanitize("") == ""
+
+
+@pytest.mark.parametrize(
+    ("pp_rank", "expected_positions"),
+    [
+        (0, [0]),
+        (1, [1]),
+        (2, []),
+        (3, [2, 3]),
+    ],
+)
+def test_connector_assigns_each_layer_to_one_pp_rank(monkeypatch, pp_rank, expected_positions):
+    try:
+        from torchspec.inference.engine.mooncake_hidden_states_connector import (
+            MooncakeHiddenStatesConnector,
+        )
+    except ImportError as e:
+        pytest.skip(f"Connector import failed (missing deps): {e}")
+
+    connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
+    connector._pp_size = 4
+    connector._num_target_layers = 93
+    connector._layer_ids = [2, 46, 90, 93]
+    connector.num_hidden_states = 4
+    monkeypatch.setattr(connector, "_get_pp_rank", lambda: pp_rank)
+
+    assert connector._local_layer_positions() == expected_positions
 
 
 # =============================================================================
@@ -262,6 +303,51 @@ class TestGenerateWithExtractHiddenStates:
 
         assert results[0]["input_ids_list"] == [10, 20, 30]
 
+    def test_pp_manifest_is_forwarded_only_as_committed_metadata(self):
+        engine, mock_llm = _build_engine_with_mock_vllm()
+        manifest = [
+            {
+                "layer_id": 2,
+                "mooncake_key": "d0_layer2",
+                "role": "hidden_states",
+            },
+            {
+                "layer_id": 4,
+                "mooncake_key": "d0_layer4",
+                "role": "last_hidden_states",
+            },
+        ]
+        mock_llm.generate.return_value = [
+            _make_mock_output(
+                "0",
+                [1, 2, 3],
+                kv_transfer_params={
+                    "mooncake_key": "d0",
+                    "tensor_shapes": {
+                        "hidden_states": (3, 4096),
+                        "input_ids": (3,),
+                        "last_hidden_states": (3, 4096),
+                    },
+                    "tensor_dtypes": {
+                        "hidden_states": "bfloat16",
+                        "input_ids": "int64",
+                        "last_hidden_states": "bfloat16",
+                    },
+                    "pp_layer_manifest": manifest,
+                },
+            ),
+        ]
+
+        result = engine.generate(
+            data_id=["d0"],
+            formatted_prompts=["test"],
+        )[0]
+
+        assert result["metadata"] == {
+            "vllm_pp_complete": True,
+            "vllm_pp_layer_manifest": manifest,
+        }
+
 
 class TestVllmEngineShutdown:
     def test_shutdown_uses_engine_core_when_available(self, monkeypatch):
@@ -274,6 +360,8 @@ class TestVllmEngineShutdown:
         engine.rank = 0
         engine.args = MagicMock()
         engine._hidden_size = None
+        engine._headless_executor = None
+        engine._headless_monitor_thread = None
 
         engine_core = MagicMock()
         llm_engine = MagicMock()
@@ -288,6 +376,147 @@ class TestVllmEngineShutdown:
 
         engine_core.shutdown.assert_called_once_with()
         assert engine._engine is None
+
+    def test_shutdown_tears_down_headless_follower(self, monkeypatch):
+        """A follower has no LLM, so only the executor teardown frees its workers."""
+        try:
+            from torchspec.inference.engine.vllm_engine import VllmEngine
+        except ImportError as e:
+            pytest.skip(f"VllmEngine import failed: {e}")
+
+        engine = VllmEngine.__new__(VllmEngine)
+        engine.rank = 1
+        engine.args = MagicMock()
+        engine._hidden_size = None
+        engine._engine = None
+        executor = MagicMock()
+        monitor_thread = MagicMock()
+        monitor_thread.is_alive.return_value = False
+        engine._headless_executor = executor
+        engine._headless_monitor_thread = monitor_thread
+
+        assert engine.health_check() is True
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        engine.shutdown()
+
+        executor.shutdown.assert_called_once_with()
+        monitor_thread.join.assert_called_once()
+        assert engine._headless_executor is None
+        assert engine._headless_monitor_thread is None
+        assert engine.health_check() is False
+
+
+class TestConnectorFailClosed:
+    """Dropping a sample is invisible downstream, so the writer must not skip."""
+
+    @staticmethod
+    def _connector():
+        try:
+            from torchspec.inference.engine.mooncake_hidden_states_connector import (
+                MooncakeHiddenStatesConnector,
+            )
+        except ImportError as e:
+            pytest.skip(f"Connector import failed (missing deps): {e}")
+
+        connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
+        connector._mooncake_setup_done = False
+        connector._mooncake_store = None
+        connector._tp_rank = 0
+        connector._pp_rank = 0
+        connector._pp_size = 1
+        return connector
+
+    def test_missing_master_is_rejected_at_construction(self, monkeypatch):
+        """Raising here is a clean startup failure; raising from save_kv_layer
+        strands the other pipeline stages until an RPC timeout."""
+        monkeypatch.delenv("MOONCAKE_MASTER_SERVER", raising=False)
+        monkeypatch.delenv("MOONCAKE_MASTER_HOST", raising=False)
+        connector = self._connector()
+
+        with pytest.raises(RuntimeError, match="MOONCAKE_MASTER_SERVER"):
+            connector._check_mooncake_env()
+
+    def test_non_writer_tp_rank_skips_without_raising(self, monkeypatch):
+        monkeypatch.delenv("MOONCAKE_MASTER_SERVER", raising=False)
+        monkeypatch.delenv("MOONCAKE_MASTER_HOST", raising=False)
+        connector = self._connector()
+        connector._tp_rank = 1
+
+        assert connector._ensure_mooncake_store() is False
+
+    def test_final_aux_layer_must_be_the_post_last_layer_slot(self):
+        connector = self._connector()
+        connector._layer_ids = [2, 18, 33]
+        connector._num_target_layers = 36
+
+        with pytest.raises(ValueError, match="Final aux layer id"):
+            connector._check_layer_layout()
+
+    def test_layer_layout_accepts_appended_final_slot(self):
+        connector = self._connector()
+        connector._layer_ids = [2, 18, 33, 36]
+        connector._num_target_layers = 36
+
+        connector._check_layer_layout()
+
+    @pytest.mark.parametrize("layer_ids", [[18, 2, 33, 36], [2, 2, 33, 36]])
+    def test_non_ascending_aux_layer_ids_rejected(self, layer_ids):
+        """PP=1 concatenates in capture order and PP in manifest order, so a
+        non-ascending list would train on a pipeline-size-dependent layout."""
+        connector = self._connector()
+        connector._layer_ids = layer_ids
+        connector._num_target_layers = 36
+
+        with pytest.raises(ValueError, match="strictly ascending"):
+            connector._check_layer_layout()
+
+    def test_empty_aux_layer_ids_rejected(self):
+        connector = self._connector()
+        connector._layer_ids = []
+        connector._num_target_layers = 36
+
+        with pytest.raises(ValueError, match="non-empty"):
+            connector._check_layer_layout()
+
+
+class TestPerStageCaptureGate:
+    """vllm_pp_size > 1 needs a target that emits aux states on every stage."""
+
+    @staticmethod
+    def _check(pp_size, architectures):
+        from torchspec.inference.engine.vllm_engine import VllmEngine
+
+        return VllmEngine._check_per_stage_capture_support(pp_size, architectures)
+
+    def test_pp1_accepts_any_architecture(self):
+        self._check(1, ["LlamaForCausalLM"])
+        self._check(1, None)
+
+    def test_supported_architecture_passes(self):
+        self._check(2, ["Qwen3ForCausalLM"])
+        self._check(4, ["KimiK3ForConditionalGeneration"])
+
+    def test_unsupported_architecture_is_rejected(self):
+        with pytest.raises(ValueError, match="LlamaForCausalLM"):
+            self._check(2, ["LlamaForCausalLM"])
+
+    def test_missing_architectures_is_rejected(self):
+        with pytest.raises(ValueError, match="declares no architectures"):
+            self._check(2, None)
+
+
+class TestVllmParallelSizes:
+    def test_tp4_pp4_uses_all_16_gpus(self):
+        from torchspec.inference.engine.vllm_engine import VllmEngine
+
+        assert VllmEngine._resolve_parallel_sizes(4, 4, 4) == (4, 4)
+
+    def test_parallel_product_must_match_world_size(self):
+        from torchspec.inference.engine.vllm_engine import VllmEngine
+
+        with pytest.raises(ValueError, match="must be divisible"):
+            VllmEngine._resolve_parallel_sizes(4, 4, 3)
 
 
 # =============================================================================

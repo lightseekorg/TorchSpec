@@ -34,6 +34,7 @@ MRV2, CUDA graphs, and ``torch.compile``.
 import gc
 import os
 import socket
+import threading
 from typing import Any
 
 import ray
@@ -49,6 +50,7 @@ _PROTECTION_ENGINE_KEYS = frozenset(
     {
         "model",
         "tensor_parallel_size",
+        "pipeline_parallel_size",
         "gpu_memory_utilization",
         "nnodes",
         "node_rank",
@@ -56,6 +58,24 @@ _PROTECTION_ENGINE_KEYS = frozenset(
         "master_port",
         "speculative_config",
         "kv_transfer_config",
+    }
+)
+
+# Target architectures whose vLLM model returns
+# ``(IntermediateTensors, aux_hidden_states)`` from a non-last pipeline stage.
+#
+# Our vLLM patch stack enables aux capture on every PP rank, which also removes
+# the ``SupportsPP`` check that made stock vLLM reject this configuration at
+# config time.  A model without that return contract therefore builds its aux
+# list on each stage, discards it, and dies much later inside memory profiling
+# with an unpack error that names nothing relevant.  Keep this in sync with
+# ``patches/vllm/<image-tag>/vllm_pp_hidden_states.patch``.
+_PER_STAGE_AUX_CAPTURE_ARCHITECTURES = frozenset(
+    {
+        "KimiK3ForConditionalGeneration",
+        "KimiLinearForCausalLM",
+        "Qwen2ForCausalLM",
+        "Qwen3ForCausalLM",
     }
 )
 
@@ -83,11 +103,24 @@ class VllmEngine(InferenceEngine, RayActor):
         self.num_gpus_per_engine = num_gpus_per_engine
         self.node_rank = node_rank
         self._engine = None
+        self._headless_executor = None
+        self._headless_monitor_thread = None
         self._mooncake_config = None
         self._hidden_size = None
         self.local_gpu_id = None
 
         setup_file_logging("inference", self.rank, group=engine_group)
+
+    @staticmethod
+    def _resolve_parallel_sizes(
+        nnodes: int,
+        num_gpus_per_node: int,
+        pp_size: int,
+    ) -> tuple[int, int]:
+        world_size = nnodes * num_gpus_per_node
+        if world_size % pp_size != 0:
+            raise ValueError(f"vLLM world_size={world_size} must be divisible by pp_size={pp_size}")
+        return world_size // pp_size, pp_size
 
     def init(
         self,
@@ -146,11 +179,11 @@ class VllmEngine(InferenceEngine, RayActor):
 
         from transformers import AutoConfig as _AC
 
-        _cfg = _AC.from_pretrained(
+        _outer_cfg = _AC.from_pretrained(
             self.args.target_model_path,
             trust_remote_code=getattr(self.args, "trust_remote_code", True),
         )
-        _cfg = getattr(_cfg, "text_config", _cfg)
+        _cfg = getattr(_outer_cfg, "text_config", _outer_cfg)
 
         # Layer IDs use post-layer semantics: "capture the residual stream
         # after layer N runs".  vllm's capture hook fires at the INPUT of each
@@ -184,7 +217,12 @@ class VllmEngine(InferenceEngine, RayActor):
                 )
 
         nnodes = getattr(self.args, "vllm_nnodes", 1)
-        tp_size = nnodes * self.num_gpus_per_engine
+        tp_size, pp_size = self._resolve_parallel_sizes(
+            nnodes,
+            self.num_gpus_per_engine,
+            pp_size,
+        )
+        self._check_per_stage_capture_support(pp_size, getattr(_outer_cfg, "architectures", None))
 
         logger.info(
             f"VllmEngine rank {self.rank}: BEFORE init - "
@@ -197,7 +235,13 @@ class VllmEngine(InferenceEngine, RayActor):
             tp_size, pp_size, nnodes, mem_fraction, dist_init_addr, pre_allocated_port
         )
 
-        self._hidden_size = self._get_hidden_size_from_engine()
+        # Only node_rank=0 owns the LLM front end.  Follower nodes run vLLM's
+        # headless MultiprocExecutor and therefore do not expose an LLM object.
+        self._hidden_size = (
+            _cfg.hidden_size
+            if nnodes > 1 and self.node_rank > 0
+            else self._get_hidden_size_from_engine()
+        )
 
         logger.info(
             f"VllmEngine rank {self.rank}: initialized from {self.args.target_model_path} "
@@ -224,11 +268,10 @@ class VllmEngine(InferenceEngine, RayActor):
                 f"VllmEngine rank {self.rank}: set CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"
             )
 
-        from vllm import LLM
-
         engine_kwargs = {
             "model": self.args.target_model_path,
             "tensor_parallel_size": tp_size,
+            "pipeline_parallel_size": pp_size,
             "trust_remote_code": getattr(self.args, "trust_remote_code", True),
             "distributed_executor_backend": "mp",
             "disable_custom_all_reduce": True,
@@ -318,13 +361,98 @@ class VllmEngine(InferenceEngine, RayActor):
             # save_kv_layer).  Auto-compute a utilization that reserves room.
             engine_kwargs["gpu_memory_utilization"] = self._compute_mem_fraction(engine_kwargs)
 
-        self._engine = LLM(**engine_kwargs)
-        logger.info(
-            f"VllmEngine rank {self.rank}: initialized extract_hidden_states mode "
-            f"with layers={self.aux_hidden_state_layer_ids}"
+        if nnodes > 1 and self.node_rank > 0:
+            self._init_headless_executor(engine_kwargs)
+            logger.info(
+                f"VllmEngine rank {self.rank}: initialized headless follower "
+                f"(node_rank={self.node_rank}) with layers={self.aux_hidden_state_layer_ids}"
+            )
+        else:
+            from vllm import LLM
+
+            self._engine = LLM(**engine_kwargs)
+            logger.info(
+                f"VllmEngine rank {self.rank}: initialized extract_hidden_states mode "
+                f"with layers={self.aux_hidden_state_layer_ids}"
+            )
+
+    @staticmethod
+    def _check_per_stage_capture_support(pp_size: int, architectures: list[str] | None) -> None:
+        """Reject pipeline parallelism for targets that cannot capture per stage.
+
+        Hidden-state extraction under PP needs every stage to hand back the aux
+        layers it owns.  Only the models listed in
+        ``_PER_STAGE_AUX_CAPTURE_ARCHITECTURES`` do that; the rest silently drop
+        theirs, so a run would train on fragments that no stage ever wrote.
+        """
+        if pp_size <= 1:
+            return
+
+        supported = sorted(_PER_STAGE_AUX_CAPTURE_ARCHITECTURES)
+        if not architectures:
+            raise ValueError(
+                "vllm_pp_size > 1 requires a target model whose architecture is known "
+                "to capture aux hidden states on every pipeline stage, but the target "
+                f"config declares no architectures. Supported: {supported}"
+            )
+
+        unsupported = [
+            arch for arch in architectures if arch not in _PER_STAGE_AUX_CAPTURE_ARCHITECTURES
+        ]
+        if unsupported:
+            raise ValueError(
+                f"Target architectures {unsupported} do not implement per-stage aux "
+                f"hidden-state capture, so vllm_pp_size={pp_size} would publish "
+                "fragments that no pipeline stage writes. Use vllm_pp_size=1, or add "
+                "the non-last-rank capture return to the model in "
+                "patches/vllm/<image-tag>/vllm_pp_hidden_states.patch and list it in "
+                f"_PER_STAGE_AUX_CAPTURE_ARCHITECTURES. Supported: {supported}"
+            )
+
+    def _init_headless_executor(self, engine_kwargs: dict) -> None:
+        """Start the vLLM MP follower protocol without creating an LLM front end.
+
+        vLLM multi-node multiprocessing has one scheduler/EngineCore on
+        ``node_rank=0``.  Other nodes must create only a headless
+        ``MultiprocExecutor``; constructing ``LLM`` on every node creates a
+        second EngineCore on each follower and makes it issue control-plane
+        collective RPCs without the leader message queue.
+        """
+        from vllm import EngineArgs
+        from vllm.config import CompilationConfig
+        from vllm.config.kv_transfer import KVTransferConfig
+        from vllm.usage.usage_lib import UsageContext
+        from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+        headless_kwargs = dict(engine_kwargs)
+
+        kv_transfer_config = headless_kwargs.get("kv_transfer_config")
+        if isinstance(kv_transfer_config, dict):
+            headless_kwargs["kv_transfer_config"] = KVTransferConfig(**kv_transfer_config)
+
+        compilation_config = headless_kwargs.get("compilation_config")
+        if isinstance(compilation_config, dict):
+            headless_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
+
+        engine_args = EngineArgs(**headless_kwargs)
+        vllm_config = engine_args.create_engine_config(
+            usage_context=UsageContext.LLM_CLASS,
+            headless=True,
         )
+        self._headless_executor = MultiprocExecutor(
+            vllm_config,
+            monitor_workers=False,
+        )
+        self._headless_monitor_thread = threading.Thread(
+            target=self._headless_executor.start_worker_monitor,
+            kwargs={"inline": True},
+            name=f"vllm-headless-monitor-rank-{self.rank}",
+            daemon=True,
+        )
+        self._headless_monitor_thread.start()
 
     _VLLM_DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
+    _HEADLESS_MONITOR_JOIN_TIMEOUT_S = 30.0
 
     def _compute_mem_fraction(self, engine_kwargs: dict) -> float:
         """Auto-compute gpu_memory_utilization with connector overhead reserved.
@@ -457,6 +585,12 @@ class VllmEngine(InferenceEngine, RayActor):
                 "data_id": did,
                 "seq_len": seq_len,
             }
+            pp_layer_manifest = kv_params.get("pp_layer_manifest")
+            if pp_layer_manifest is not None:
+                result["metadata"] = {
+                    "vllm_pp_complete": True,
+                    "vllm_pp_layer_manifest": pp_layer_manifest,
+                }
 
             packed_loss_mask = packed_loss_mask_map.get(did)
             if packed_loss_mask is not None:
@@ -562,9 +696,13 @@ class VllmEngine(InferenceEngine, RayActor):
         return prompts
 
     def health_check(self, timeout: float = 5.0) -> bool:
-        return self._engine is not None
+        # A follower node owns a headless executor instead of an LLM front end,
+        # so it is live without ``_engine``.
+        return self._engine is not None or self._headless_executor is not None
 
     def shutdown(self) -> None:
+        self._shutdown_headless_executor()
+
         if self._engine is not None:
             try:
                 llm_engine = getattr(self._engine, "llm_engine", None)
@@ -585,6 +723,35 @@ class VllmEngine(InferenceEngine, RayActor):
                     torch.cuda.empty_cache()
 
         logger.info(f"VllmEngine rank {self.rank}: shutdown complete")
+
+    def _shutdown_headless_executor(self) -> None:
+        """Tear down a follower node's executor and its worker processes.
+
+        Followers never build an ``LLM``, so without this their
+        ``MultiprocExecutor``, its monitor thread and every child worker
+        process outlive the actor and keep holding GPU memory.
+        """
+        if self._headless_executor is None:
+            return
+
+        try:
+            self._headless_executor.shutdown()
+        except Exception as e:
+            logger.warning(
+                f"VllmEngine rank {self.rank}: Error during headless executor shutdown: {e}"
+            )
+        finally:
+            self._headless_executor = None
+
+        monitor_thread = getattr(self, "_headless_monitor_thread", None)
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=self._HEADLESS_MONITOR_JOIN_TIMEOUT_S)
+            if monitor_thread.is_alive():
+                logger.warning(
+                    f"VllmEngine rank {self.rank}: headless monitor thread did not exit "
+                    f"within {self._HEADLESS_MONITOR_JOIN_TIMEOUT_S}s"
+                )
+            self._headless_monitor_thread = None
 
     def get_status(self) -> dict:
         return {
