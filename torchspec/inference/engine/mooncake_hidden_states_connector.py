@@ -174,6 +174,30 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._mooncake_store = None
         self._mooncake_setup_done = False
         self._tp_rank: int | None = None
+        self._pp_rank: int | None = None
+        self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        self._num_target_layers = vllm_config.model_config.get_total_num_hidden_layers()
+        self._check_layer_layout()
+        self._check_mooncake_env()
+
+    def _check_layer_layout(self) -> None:
+        if not self._layer_ids:
+            raise ValueError(
+                "MooncakeHiddenStatesConnector requires a non-empty "
+                "eagle_aux_hidden_state_layer_ids on the draft model config"
+            )
+        if any(a >= b for a, b in zip(self._layer_ids, self._layer_ids[1:])):
+            raise ValueError(
+                "eagle_aux_hidden_state_layer_ids must be strictly ascending, "
+                f"got {self._layer_ids}"
+            )
+        if self._layer_ids[-1] != self._num_target_layers:
+            raise ValueError(
+                "Final aux layer id must be the target model's post-last-layer "
+                f"slot: got eagle_aux_hidden_state_layer_ids={self._layer_ids} "
+                f"with vLLM num_hidden_layers={self._num_target_layers}. The "
+                "HF config VllmEngine read and vLLM's own layer count disagree."
+            )
 
     @staticmethod
     def _find_cache_layer_group_id(kv_cache_config) -> int:
@@ -211,6 +235,44 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 self._tp_rank = 0
         return self._tp_rank
 
+    def _get_pp_rank(self) -> int:
+        if self._pp_rank is None:
+            try:
+                from vllm.distributed import get_pp_group
+
+                self._pp_rank = get_pp_group().rank_in_group
+            except Exception:
+                self._pp_rank = 0
+        return self._pp_rank
+
+    def _local_layer_positions(self) -> list[int]:
+        if self._pp_size == 1:
+            return list(range(self.num_hidden_states))
+
+        from vllm.distributed.utils import get_pp_indices
+
+        start_layer, end_layer = get_pp_indices(
+            self._num_target_layers,
+            self._get_pp_rank(),
+            self._pp_size,
+        )
+        return [
+            index
+            for index, layer_id in enumerate(self._layer_ids)
+            if (layer_id == 0 and self._get_pp_rank() == 0) or (start_layer < layer_id <= end_layer)
+        ]
+
+    @staticmethod
+    def _check_mooncake_env() -> None:
+        if not os.environ.get("MOONCAKE_MASTER_SERVER") and not os.environ.get(
+            "MOONCAKE_MASTER_HOST"
+        ):
+            raise RuntimeError(
+                "MooncakeHiddenStatesConnector requires MOONCAKE_MASTER_SERVER or "
+                "MOONCAKE_MASTER_HOST to be set; without a store no hidden states "
+                "are published and training would silently receive nothing."
+            )
+
     def _ensure_mooncake_store(self) -> bool:
         if self._mooncake_setup_done:
             return self._mooncake_store is not None
@@ -219,37 +281,24 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._mooncake_setup_done = True
             return False
 
-        if not os.environ.get("MOONCAKE_MASTER_SERVER") and not os.environ.get(
-            "MOONCAKE_MASTER_HOST"
-        ):
-            logger.warning(
-                "MooncakeHiddenStatesConnector: no MOONCAKE_MASTER_SERVER env var; "
-                "hidden states will NOT be stored."
-            )
-            self._mooncake_setup_done = True
-            return False
+        from torchspec.config.mooncake_config import MooncakeConfig
+        from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 
-        try:
-            from torchspec.config.mooncake_config import MooncakeConfig
-            from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
+        config = MooncakeConfig.from_env()
+        store = EagleMooncakeStore(config)
 
-            config = MooncakeConfig.from_env()
-            self._mooncake_store = EagleMooncakeStore(config)
+        device: torch.device | None = None
+        if torch.cuda.is_initialized():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        store.setup(device=device)
 
-            device: torch.device | None = None
-            if torch.cuda.is_initialized():
-                device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            self._mooncake_store.setup(device=device)
-            self._mooncake_setup_done = True
-            logger.info(
-                "MooncakeHiddenStatesConnector: store initialized "
-                f"(master={config.master_server_address})"
-            )
-            return True
-        except Exception:
-            logger.exception("MooncakeHiddenStatesConnector: failed to init store")
-            self._mooncake_setup_done = True
-            return False
+        self._mooncake_store = store
+        self._mooncake_setup_done = True
+        logger.info(
+            "MooncakeHiddenStatesConnector: store initialized "
+            f"(master={config.master_server_address})"
+        )
+        return True
 
     # ==============================
     # Worker-side methods
@@ -296,9 +345,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, MooncakeConnectorMetadata)
 
+        # Non-writer TP ranks return here; a writer that cannot reach the store
+        # has already raised inside _ensure_mooncake_store.
         if not self._ensure_mooncake_store():
-            if self._get_tp_rank() == 0:
-                logger.warning("save_kv_layer: Mooncake store not available, skipping")
             return
 
         # Use tensor's actual page_size, not cache_config.block_size
@@ -326,26 +375,35 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
             hidden_states_3d = _extract_from_kv_cache(kv_layer, slot_mapping, num_tokens)
 
-            all_hidden = hidden_states_3d.reshape(num_tokens, -1)
-
-            # Split: first N-1 aux layers → draft model input,
-            # last aux layer (final model layer) → target logit computation
-            split_at = self._num_training_layers * self._hidden_size
-            hidden_states = all_hidden[:, :split_at]
-            last_hidden_states = all_hidden[:, -self._hidden_size :]
-
-            input_ids = request.token_ids.to(hidden_states.device)
+            input_ids = request.token_ids.to(hidden_states_3d.device)
 
             try:
-                self._mooncake_store.put(
-                    key=mooncake_key,
-                    hidden_states=hidden_states,
-                    input_ids=input_ids,
-                    last_hidden_states=last_hidden_states,
-                    target=None,
-                )
+                if self._pp_size == 1:
+                    all_hidden = hidden_states_3d.reshape(num_tokens, -1)
+                    split_at = self._num_training_layers * self._hidden_size
+                    self._mooncake_store.put(
+                        key=mooncake_key,
+                        hidden_states=all_hidden[:, :split_at],
+                        input_ids=input_ids,
+                        last_hidden_states=all_hidden[:, -self._hidden_size :],
+                        target=None,
+                    )
+                else:
+                    for position in self._local_layer_positions():
+                        layer_id = self._layer_ids[position]
+                        layer_key = f"{mooncake_key}_layer{layer_id}"
+                        self._mooncake_store.put(
+                            key=layer_key,
+                            hidden_states=hidden_states_3d[:, position, :],
+                            input_ids=input_ids,
+                            last_hidden_states=None,
+                            target=None,
+                        )
             except Exception:
+                # Fatal at every PP size: a dropped sample is a hole in the
+                # training data that no consumer can detect.
                 logger.exception(f"save_kv_layer: failed to store to Mooncake for {request.req_id}")
+                raise
 
     # ==============================
     # Scheduler-side methods
@@ -415,6 +473,19 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_layers": self.num_hidden_states,
                 "input_ids_list": token_ids,
             }
+            if self._pp_size > 1:
+                self._req_metadata[new_req.req_id]["pp_layer_manifest"] = [
+                    {
+                        "layer_id": layer_id,
+                        "mooncake_key": f"{mooncake_key}_layer{layer_id}",
+                        "role": (
+                            "last_hidden_states"
+                            if layer_id == self._num_target_layers
+                            else "hidden_states"
+                        ),
+                    }
+                    for layer_id in self._layer_ids
+                ]
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):

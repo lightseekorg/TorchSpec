@@ -211,6 +211,38 @@ def test_saving_actor_consumes_normal_train_sample(tmp_path):
     actor.store.remove_eagle3_tensors.assert_called_once()
 
 
+def test_saving_actor_rejects_vllm_pp_sample():
+    """PP writes per-layer fragments, never the base key the actor reads."""
+    from torchspec.offline.saving_actor import OfflineSavingActor
+    from torchspec.training.data_fetcher import TrainSample
+
+    actor_class = OfflineSavingActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_class)
+    actor.dataset = MagicMock()
+    actor.store = MagicMock()
+    actor.queues = {"train": Queue()}
+    actor.queues["train"].put(
+        TrainSample(
+            data_id="train-1",
+            mooncake_key="key",
+            tensor_shapes={"input_ids": (1, 4), "hidden_states": (1, 4, 6)},
+            tensor_dtypes={"input_ids": "int64"},
+            metadata={
+                "vllm_pp_complete": True,
+                "vllm_pp_layer_manifest": [
+                    {"layer_id": 4, "mooncake_key": "key_layer4", "role": "last_hidden_states"}
+                ],
+            },
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        actor.save_from_queue("train")
+
+    actor.store.get.assert_not_called()
+    actor.store.remove_eagle3_tensors.assert_not_called()
+
+
 def test_controller_sources_manifest_ids_without_retokenizing(tmp_path):
     args, _writer = _write_dataset(tmp_path)
     args.inference_engine_type = "offline"

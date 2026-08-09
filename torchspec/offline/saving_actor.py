@@ -39,6 +39,16 @@ class OfflineSavingActor:
             sample = self.queues[split].get()
             if not sample.data_id:
                 raise ValueError("Offline saving requires TrainSample.data_id")
+            if (sample.metadata or {}).get("vllm_pp_layer_manifest") is not None:
+                # Under vLLM pipeline parallelism each stage writes its own
+                # per-layer fragments and the base key is never written, so a
+                # plain get() here would miss the data and then "clean up" a
+                # key that does not exist while every fragment leaks.
+                raise NotImplementedError(
+                    "Offline saving does not support vLLM pipeline parallelism yet; "
+                    f"sample {sample.data_id} carries a per-layer PP manifest. "
+                    "Generate offline data with vllm_pp_size=1."
+                )
             dtypes = {
                 key: getattr(torch, value.replace("torch.", ""))
                 if isinstance(value, str)

@@ -140,31 +140,100 @@ class MooncakeDataset(IterableDataset):
             f"requesting shapes={sample.tensor_shapes}"
         )
 
-        tensors = self.mooncake_store.get(
-            key=sample.mooncake_key,
-            shapes=sample.tensor_shapes,
-            dtypes=dtypes,
-            device=self.device,
-        )
-
-        tensor_dict = tensors.to_tensor_dict()
-        if self._batch_size > 1:
-            # Clone to prevent use-after-free: collator holds sample N while
-            # fetching N+1, but cleanup frees the Mooncake buffer (Issue 31).
-            # Note: clone() converts pinned → unpinned, breaking non_blocking
-            # H2D transfers. Only do this when actually needed.
-            result = {k: v.clone() for k, v in tensor_dict.items()}
+        metadata = sample.metadata or {}
+        pp_manifest = metadata.get("vllm_pp_layer_manifest")
+        if pp_manifest is not None:
+            result = self._load_vllm_pp_layers(sample, pp_manifest, dtypes)
         else:
-            # batch_size=1: safe to use pinned views — consumed immediately.
-            # Preserves pinned memory for async H2D via non_blocking=True.
-            result = dict(tensor_dict)
+            tensors = self.mooncake_store.get(
+                key=sample.mooncake_key,
+                shapes=sample.tensor_shapes,
+                dtypes=dtypes,
+                device=self.device,
+            )
 
-        self._cleanup_mooncake_data(sample)
+            tensor_dict = tensors.to_tensor_dict()
+            if self._batch_size > 1:
+                # Clone to prevent use-after-free: collator holds sample N while
+                # fetching N+1, but cleanup frees the Mooncake buffer (Issue 31).
+                # Note: clone() converts pinned → unpinned, breaking non_blocking
+                # H2D transfers. Only do this when actually needed.
+                result = {k: v.clone() for k, v in tensor_dict.items()}
+            else:
+                # batch_size=1: safe to use pinned views — consumed immediately.
+                # Preserves pinned memory for async H2D via non_blocking=True.
+                result = dict(tensor_dict)
+
+            self._cleanup_mooncake_data(sample)
         if sample.packed_loss_mask is not None:
             result["packed_loss_mask"] = sample.packed_loss_mask
         if sample.last_turn_loss_only is not None:
             result["last_turn_loss_only"] = sample.last_turn_loss_only
         return result
+
+    def _load_vllm_pp_layers(
+        self,
+        sample: TrainSample,
+        manifest: list[dict[str, Any]],
+        dtypes: dict[str, torch.dtype],
+    ) -> Dict[str, Any]:
+        metadata = sample.metadata or {}
+        if not metadata.get("vllm_pp_complete", False):
+            raise RuntimeError(f"Incomplete vLLM PP sample: mooncake_key={sample.mooncake_key}")
+
+        seq_len = sample.tensor_shapes["input_ids"][0]
+        hidden_size = sample.tensor_shapes["last_hidden_states"][-1]
+        fragment_shapes = {
+            "hidden_states": (seq_len, hidden_size),
+            "input_ids": (seq_len,),
+        }
+        fragment_dtypes = {
+            "hidden_states": dtypes.get("hidden_states", torch.bfloat16),
+            "input_ids": torch.int64,
+        }
+
+        hidden_states = []
+        last_hidden_states = None
+        input_ids = None
+        fragment_keys = []
+        for entry in manifest:
+            key = entry["mooncake_key"]
+            tensors = self.mooncake_store.get(
+                key=key,
+                shapes=fragment_shapes,
+                dtypes=fragment_dtypes,
+                device=self.device,
+            ).to_tensor_dict()
+
+            layer_hidden = tensors["hidden_states"].clone()
+            layer_input_ids = tensors["input_ids"].clone()
+            if input_ids is None:
+                input_ids = layer_input_ids
+            elif not torch.equal(input_ids, layer_input_ids):
+                raise RuntimeError(f"vLLM PP input_ids mismatch for fragment {key}")
+
+            if entry["role"] == "last_hidden_states":
+                last_hidden_states = layer_hidden
+            else:
+                hidden_states.append(layer_hidden)
+
+            fragment_keys.append(key)
+
+        if not hidden_states or last_hidden_states is None or input_ids is None:
+            raise RuntimeError(f"Invalid vLLM PP layer manifest for {sample.mooncake_key}")
+
+        for key in fragment_keys:
+            self.mooncake_store.remove_eagle3_tensors(
+                key,
+                has_last_hidden_states=False,
+                has_target=False,
+            )
+
+        return {
+            "hidden_states": torch.cat(hidden_states, dim=-1),
+            "last_hidden_states": last_hidden_states,
+            "input_ids": input_ids,
+        }
 
     def _cleanup_mooncake_data(self, sample: TrainSample) -> None:
         """Remove data from mooncake store to release buffer space."""

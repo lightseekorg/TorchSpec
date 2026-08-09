@@ -4,6 +4,7 @@ import queue
 import time
 from typing import Dict, List, Tuple
 
+import pytest
 import torch
 
 from torchspec.data.utils import pack_loss_mask, serialize_packed_loss_mask
@@ -142,6 +143,95 @@ class TestMooncakeDataset:
         samples = list(dataset)
 
         assert len(samples) == 1
+
+    def test_vllm_pp_manifest_reassembles_layers_after_commit(self):
+        ray_queue = MockRayQueue()
+        store = MockMooncakeStore()
+        input_ids = torch.tensor([10, 20, 30])
+        layer_2 = torch.full((3, 2), 2, dtype=torch.bfloat16)
+        layer_8 = torch.full((3, 2), 8, dtype=torch.bfloat16)
+        layer_12 = torch.full((3, 2), 12, dtype=torch.bfloat16)
+        for layer_id, hidden_states in (
+            (2, layer_2),
+            (8, layer_8),
+            (12, layer_12),
+        ):
+            store.put_tensors(
+                f"sample_layer{layer_id}",
+                {
+                    "hidden_states": hidden_states,
+                    "input_ids": input_ids,
+                },
+            )
+
+        ray_queue.put(
+            TrainSample(
+                mooncake_key="sample",
+                tensor_shapes={
+                    "hidden_states": (3, 4),
+                    "input_ids": (3,),
+                    "last_hidden_states": (3, 2),
+                },
+                tensor_dtypes={
+                    "hidden_states": torch.bfloat16,
+                    "input_ids": torch.int64,
+                    "last_hidden_states": torch.bfloat16,
+                },
+                metadata={
+                    "vllm_pp_complete": True,
+                    "vllm_pp_layer_manifest": [
+                        {
+                            "layer_id": 2,
+                            "mooncake_key": "sample_layer2",
+                            "role": "hidden_states",
+                        },
+                        {
+                            "layer_id": 8,
+                            "mooncake_key": "sample_layer8",
+                            "role": "hidden_states",
+                        },
+                        {
+                            "layer_id": 12,
+                            "mooncake_key": "sample_layer12",
+                            "role": "last_hidden_states",
+                        },
+                    ],
+                },
+            )
+        )
+        ray_queue.put(None)
+
+        dataset = MooncakeDataset(ray_queue, store, torch.device("cpu"))
+        samples = list(dataset)
+
+        assert len(samples) == 1
+        sample = samples[0]
+        assert torch.equal(sample["hidden_states"][0], torch.cat([layer_2, layer_8], dim=-1))
+        assert torch.equal(sample["last_hidden_states"][0], layer_12)
+        assert torch.equal(sample["input_ids"][0], input_ids)
+        assert store.call_count == 3
+
+    def test_vllm_pp_manifest_rejects_uncommitted_sample(self):
+        dataset = MooncakeDataset(
+            MockRayQueue(),
+            MockMooncakeStore(),
+            torch.device("cpu"),
+        )
+        sample = TrainSample(
+            mooncake_key="sample",
+            tensor_shapes={
+                "hidden_states": (3, 2),
+                "input_ids": (3,),
+                "last_hidden_states": (3, 2),
+            },
+            metadata={
+                "vllm_pp_complete": False,
+                "vllm_pp_layer_manifest": [],
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="Incomplete vLLM PP sample"):
+            dataset._load_from_mooncake(sample)
 
     def test_subthreshold_samples_neutralized_not_dropped(self):
         """Empty / sub-min_loss_tokens samples are kept as zero-mask micro-batches,
