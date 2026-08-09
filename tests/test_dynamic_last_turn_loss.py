@@ -250,6 +250,32 @@ class TestResolveLossMask:
         assert mask is not None
         assert mask.tolist() == [0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0]
 
+    def test_unresolved_auto_global_supervises_all_turns(self):
+        ids = [10, 20, 1, 2, 30, 40, 10, 20, 3, 4, 30, 40]
+        data = {"input_ids": torch.tensor(ids, dtype=torch.long)}
+        mask = resolve_loss_mask(
+            data,
+            dynamic_loss_mask=True,
+            assistant_header_ids=_HEADER,
+            end_token_ids=_END,
+            last_turn_loss_only="auto",
+        )
+        assert mask is not None
+        assert mask.tolist() == [0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0]
+
+    def test_per_sample_decision_overrides_auto_global(self):
+        ids = [10, 20, 1, 2, 30, 40, 10, 20, 3, 4, 30, 40]
+        data = {"input_ids": torch.tensor(ids, dtype=torch.long), "last_turn_loss_only": True}
+        mask = resolve_loss_mask(
+            data,
+            dynamic_loss_mask=True,
+            assistant_header_ids=_HEADER,
+            end_token_ids=_END,
+            last_turn_loss_only="auto",
+        )
+        assert mask is not None
+        assert mask.tolist() == [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0]
+
     def test_no_params_defaults_nonzero(self):
         data = {"input_ids": torch.tensor([1, 2, 3], dtype=torch.long)}
         assert resolve_loss_mask(data) is not None
@@ -257,3 +283,91 @@ class TestResolveLossMask:
     def test_empty_packed_loss_mask(self):
         data = {"packed_loss_mask": ""}
         assert resolve_loss_mask(data) is None
+
+
+# ── auto decisions survive the multimodal mask drop ───────────────────
+
+
+_THINKING_CONV = [
+    {"role": "user", "content": "Hi"},
+    {"role": "assistant", "content": "<think>reasoning</think>Hello!"},
+]
+_PLAIN_CONV = [
+    {"role": "user", "content": "Hi"},
+    {"role": "assistant", "content": "Hello!"},
+]
+
+
+class _StubRenderer:
+    """Minimal ConversationRenderer stand-in returning a fixed token stream."""
+
+    def render(self, messages, tools, max_seq_length, last_turn_only, generation_config):
+        return [1, 2, 3, 4], [0, 1, 1, 0]
+
+
+class TestTokenizeWorkerAutoMetadata:
+    def _run(self, conversation, last_turn_loss_only):
+        from torchspec.data import dataset as dataset_mod
+
+        saved = dict(dataset_mod._worker_state)
+        dataset_mod._worker_state.clear()
+        dataset_mod._worker_state.update(
+            {
+                "renderer": _StubRenderer(),
+                "last_turn_loss_only": last_turn_loss_only,
+                "min_loss_tokens": 0,
+            }
+        )
+        try:
+            return dataset_mod._tokenize_single((conversation, None, None, 128, False))
+        finally:
+            dataset_mod._worker_state.clear()
+            dataset_mod._worker_state.update(saved)
+
+    def test_auto_records_thinking_decision(self):
+        assert self._run(_THINKING_CONV, "auto")["has_thinking"] is True
+
+    def test_auto_records_non_thinking_decision(self):
+        assert self._run(_PLAIN_CONV, "auto")["has_thinking"] is False
+
+    def test_explicit_flag_records_nothing(self):
+        assert "has_thinking" not in self._run(_THINKING_CONV, True)
+
+
+class TestDropStaleMultimodalMasks:
+    def _prompt(self, metadata=None):
+        return {
+            "data_id": "s0",
+            "multimodal_inputs": [{"type": "image", "url": "x"}],
+            "packed_loss_mask": "1,2,1",
+            "metadata": metadata or {},
+        }
+
+    def test_mask_dropped_when_decision_recorded(self):
+        from torchspec.data.dataset import _drop_stale_multimodal_masks
+
+        prompts = [self._prompt({"has_thinking": False})]
+        _drop_stale_multimodal_masks(prompts, True, last_turn_loss_only="auto")
+        assert "packed_loss_mask" not in prompts[0]
+
+    def test_missing_decision_under_auto_raises(self):
+        import pytest
+
+        from torchspec.data.dataset import _drop_stale_multimodal_masks
+
+        with pytest.raises(ValueError, match="last_turn_loss_only"):
+            _drop_stale_multimodal_masks([self._prompt()], True, last_turn_loss_only="auto")
+
+    def test_missing_decision_under_explicit_flag_allowed(self):
+        from torchspec.data.dataset import _drop_stale_multimodal_masks
+
+        prompts = [self._prompt()]
+        _drop_stale_multimodal_masks(prompts, True, last_turn_loss_only=False)
+        assert "packed_loss_mask" not in prompts[0]
+
+    def test_text_rows_keep_their_mask(self):
+        from torchspec.data.dataset import _drop_stale_multimodal_masks
+
+        prompts = [{"data_id": "s0", "multimodal_inputs": None, "packed_loss_mask": "1,2,1"}]
+        _drop_stale_multimodal_masks(prompts, True, last_turn_loss_only="auto")
+        assert prompts[0]["packed_loss_mask"] == "1,2,1"

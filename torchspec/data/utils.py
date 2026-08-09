@@ -258,6 +258,8 @@ def resolve_loss_mask(
             input_ids = input_ids.squeeze(0)
         per_sample = data.get("last_turn_loss_only")
         last_turn_only = per_sample if per_sample is not None else last_turn_loss_only
+        if not isinstance(last_turn_only, bool):
+            last_turn_only = False
         mask = compute_assistant_loss_mask(
             input_ids,
             assistant_header_ids,

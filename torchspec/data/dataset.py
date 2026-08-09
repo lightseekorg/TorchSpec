@@ -205,9 +205,23 @@ def _resolve_last_turn_loss_only(messages):
     return bool(ltlo)
 
 
+def _auto_decision_metadata(last_turn_only: bool) -> dict:
+    """Record a resolved "auto" decision so training can reapply it.
+
+    A multimodal row's mask is discarded before training (it was rendered
+    against unexpanded media placeholders), so the decision made here must
+    travel as metadata or the training-time matcher has nothing to consult.
+    """
+    if _worker_state.get("last_turn_loss_only", False) != "auto":
+        return {}
+    return {"has_thinking": last_turn_only}
+
+
 def _tokenize_single(args):
     """Worker function — tokenize one sample."""
     messages, tools, generation_config, max_length, train_with_decode = args
+    last_turn_only = _resolve_last_turn_loss_only(messages)
+    auto_metadata = _auto_decision_metadata(last_turn_only)
     renderer = _worker_state.get("renderer")
     if renderer is not None:
         if train_with_decode:
@@ -216,7 +230,7 @@ def _tokenize_single(args):
             messages,
             tools,
             max_seq_length=max_length,
-            last_turn_only=_resolve_last_turn_loss_only(messages),
+            last_turn_only=last_turn_only,
             generation_config=generation_config,
         )
         # A renderer owns its own supervision, so a sample with no supervised
@@ -231,6 +245,7 @@ def _tokenize_single(args):
             "input_ids": np.asarray(input_ids, dtype=np.int64),
             "packed_loss_mask": packed_loss_mask,
             "formatted_prompt": None,
+            **auto_metadata,
         }
 
     processed = _worker_state["preprocess"](
@@ -243,7 +258,7 @@ def _tokenize_single(args):
         use_packed_loss_mask=True,
         add_generation_prompt=train_with_decode,
         return_formatted_text=True,
-        last_turn_loss_only=_resolve_last_turn_loss_only(messages),
+        last_turn_loss_only=last_turn_only,
         min_loss_tokens=_worker_state.get("min_loss_tokens", 0),
     )
     if not processed["input_ids"]:
@@ -254,6 +269,7 @@ def _tokenize_single(args):
         "input_ids": processed["input_ids"][0].numpy(),
         "packed_loss_mask": processed["packed_loss_mask"][0],
         "formatted_prompt": processed["formatted_text"][0],
+        **auto_metadata,
     }
 
 
@@ -274,10 +290,7 @@ def _format_single(args):
     messages, _, _, _, train_with_decode = args
     messages = _normalize_conversation(messages)
 
-    result = {}
-    ltlo = _worker_state.get("last_turn_loss_only", False)
-    if ltlo == "auto":
-        result["has_thinking"] = has_thinking_content(messages)
+    result = _auto_decision_metadata(_resolve_last_turn_loss_only(messages))
 
     parser = _worker_state["parser"]
     formatted = parser.format(
@@ -289,13 +302,30 @@ def _format_single(args):
     return result
 
 
-def _drop_stale_multimodal_masks(prompts, dynamic_loss_mask: bool) -> None:
+def _drop_stale_multimodal_masks(
+    prompts, dynamic_loss_mask: bool, last_turn_loss_only=False
+) -> None:
     """Remove masks rendered before the engine expands media placeholders."""
     if not dynamic_loss_mask:
         return
     for prompt in prompts:
-        if prompt.get("multimodal_inputs") is not None:
-            prompt.pop("packed_loss_mask", None)
+        if prompt.get("multimodal_inputs") is None:
+            continue
+        dropped = prompt.pop("packed_loss_mask", None)
+        if (
+            dropped is not None
+            and last_turn_loss_only == "auto"
+            and "has_thinking" not in (prompt.get("metadata") or {})
+        ):
+            # Only a cache written before auto decisions were recorded can get
+            # here; the source messages are gone, so the decision that the
+            # training-time matcher needs cannot be recovered.
+            raise ValueError(
+                f"Multimodal sample {prompt.get('data_id')} has no recorded "
+                "last_turn_loss_only='auto' decision, so its dropped mask cannot be "
+                "recomputed at training time. Delete the tokenization cache and re-run, "
+                "or set dataset.last_turn_loss_only to an explicit true/false."
+            )
 
 
 def load_conversation_dataset(args):
@@ -378,7 +408,11 @@ def load_conversation_dataset(args):
     if os.path.exists(cache_path):
         logger.info(f"Loading dataset from cache: {cache_path}")
         prompts = torch.load(cache_path, weights_only=False)
-        _drop_stale_multimodal_masks(prompts, dynamic_loss_mask=dynamic_loss_mask)
+        _drop_stale_multimodal_masks(
+            prompts,
+            dynamic_loss_mask=dynamic_loss_mask,
+            last_turn_loss_only=last_turn_loss_only_flag,
+        )
         logger.info(f"Loaded {len(prompts)} cached samples")
         return prompts
 
@@ -508,7 +542,11 @@ def load_conversation_dataset(args):
 
         prompts.append(entry)
 
-    _drop_stale_multimodal_masks(prompts, dynamic_loss_mask=dynamic_loss_mask)
+    _drop_stale_multimodal_masks(
+        prompts,
+        dynamic_loss_mask=dynamic_loss_mask,
+        last_turn_loss_only=last_turn_loss_only_flag,
+    )
 
     if skipped:
         logger.warning(f"Skipped {skipped} samples (empty source or zero loss mask)")
