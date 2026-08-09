@@ -34,19 +34,16 @@ from torchspec.models.draft.base import Eagle3DraftModel
 
 # TODO: Extract shared components into a common module to reduce duplication:
 # - LlamaMLP, LlamaRMSNorm, RoPE classes → torchspec/models/draft/modules.py
-# - _init_rope() is near-identical to LlamaAttention._init_rope (~60 lines)
 # - DecoderLayer.forward() is line-for-line identical to LlamaDecoderLayer.forward()
 # - embed_input_ids/project_hidden_states/compute_logits/backbone are identical
 #   to LlamaForCausalLMEagle3 and could live in Eagle3DraftModel base class
 # - Suffix attention loop could be batched (einsum instead of Python loop) for
 #   both this file and llama3_eagle.py
 from torchspec.models.draft.llama3_eagle import (
-    LlamaDynamicNTKScalingRotaryEmbedding,
-    LlamaLinearScalingRotaryEmbedding,
     LlamaMLP,
     LlamaRMSNorm,
-    LlamaRotaryEmbedding,
-    LlamaYarnRotaryEmbedding,
+    build_rotary_embedding,
+    rope_config_get,
     yarn_get_mscale,
 )
 from torchspec.models.ops.flex_attention import (
@@ -54,16 +51,6 @@ from torchspec.models.ops.flex_attention import (
     eagle3_block_mask,
 )
 from torchspec.utils.logging import logger, print_with_rank
-
-
-def _rope_config_get(rope_scaling, key, default=None):
-    """Get a value from rope_scaling config (dict or object)."""
-    if rope_scaling is None:
-        return default
-    if isinstance(rope_scaling, dict):
-        return rope_scaling.get(key, default)
-    return getattr(rope_scaling, key, default)
-
 
 # ── Interleaved RoPE (DeepSeek convention) ────────────────────────────────
 #
@@ -157,70 +144,16 @@ class DeepSeekMLAAttention(nn.Module):
         self.softmax_scale = self._compute_softmax_scale()
 
     def _init_rope(self):
-        """Initialize rotary embeddings with qk_rope_head_dim as the dimension."""
-        rope_dim = self.qk_rope_head_dim
-        rope_scaling = self.config.rope_scaling
-        rope_theta = getattr(self.config, "rope_theta", 10000)
-        rget = partial(_rope_config_get, rope_scaling)
-        scaling_type = rget("rope_type", rget("type"))
-
-        if rope_scaling is None or scaling_type == "default":
-            self.rotary_emb = LlamaRotaryEmbedding(
-                rope_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=rope_theta,
-            )
-        else:
-            scaling_factor = rget("factor")
-
-            if scaling_type in (None, "default"):
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    rope_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=rope_theta,
-                )
-            elif scaling_type == "linear":
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                    rope_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    rope_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                )
-            elif scaling_type == "llama3":
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    rope_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=rope_theta,
-                    scaling_factor=scaling_factor if scaling_factor is not None else 1.0,
-                    low_freq_factor=rget("low_freq_factor"),
-                    high_freq_factor=rget("high_freq_factor"),
-                    orig_max_position=rget("original_max_position_embeddings"),
-                )
-            elif scaling_type == "yarn":
-                self.rotary_emb = LlamaYarnRotaryEmbedding(
-                    rope_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=rope_theta,
-                    original_max_position_embeddings=rget("original_max_position_embeddings"),
-                    scaling_factor=scaling_factor,
-                    beta_fast=rget("beta_fast"),
-                    beta_slow=rget("beta_slow"),
-                    mscale=rget("mscale"),
-                    mscale_all_dim=rget("mscale_all_dim"),
-                )
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        """Rotate only the rope side dims, so the cache is built at qk_rope_head_dim."""
+        self.rotary_emb = build_rotary_embedding(
+            self.config, self.qk_rope_head_dim, self.max_position_embeddings
+        )
 
     def _compute_softmax_scale(self) -> float:
         """Compute softmax scale, incorporating YaRN mscale if applicable."""
         rope_scaling = self.config.rope_scaling
         if rope_scaling is not None:
-            rget = partial(_rope_config_get, rope_scaling)
+            rget = partial(rope_config_get, rope_scaling)
             scaling_type = rget("rope_type", rget("type"))
             if scaling_type == "yarn":
                 factor = rget("factor", 1.0)

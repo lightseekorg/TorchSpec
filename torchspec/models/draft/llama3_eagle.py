@@ -20,6 +20,7 @@
 
 import math
 import os
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -30,6 +31,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from torchspec.config.utils import resolve_rope_theta
 from torchspec.models.draft.base import Eagle3DraftModel
 from torchspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
@@ -604,6 +606,82 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
         )
 
 
+def rope_config_get(rope_scaling, key, default=None):
+    """Read a key out of a rope_scaling config, which may be a dict or an object."""
+    if rope_scaling is None:
+        return default
+    if isinstance(rope_scaling, dict):
+        return rope_scaling.get(key, default)
+    return getattr(rope_scaling, key, default)
+
+
+def build_rotary_embedding(config, dim: int, max_position_embeddings: int):
+    """Build the rotary embedding a config asks for.
+
+    Every draft that uses these rotary classes goes through here, and `dim` is the
+    only thing that differs between callers — the head dim for GQA blocks, the
+    rope side dim for MLA ones. Each attention block used to carry its own copy of
+    this branch ladder, and the copies drifted: the MLA one dropped `base` on the
+    YaRN branch, so drafts trained at 10000 while their config declared otherwise.
+    Adding a scaling type or an argument in one place now reaches every draft.
+    """
+    rope_scaling = config.rope_scaling
+    rope_theta = resolve_rope_theta(config)
+    rget = partial(rope_config_get, rope_scaling)
+    scaling_type = rget("rope_type", rget("type"))
+
+    if rope_scaling is None or scaling_type in (None, "default"):
+        return LlamaRotaryEmbedding(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=rope_theta,
+        )
+
+    scaling_factor = rget("factor")
+
+    if scaling_type == "linear":
+        if scaling_factor is None:
+            raise ValueError("Linear RoPE scaling requires 'factor' in rope_scaling config.")
+        return LlamaLinearScalingRotaryEmbedding(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            scaling_factor=scaling_factor,
+        )
+    if scaling_type == "dynamic":
+        if scaling_factor is None:
+            raise ValueError("Dynamic RoPE scaling requires 'factor' in rope_scaling config.")
+        return LlamaDynamicNTKScalingRotaryEmbedding(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            scaling_factor=scaling_factor,
+        )
+    if scaling_type == "llama3":
+        return LlamaRotaryEmbedding(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=rope_theta,
+            scaling_factor=scaling_factor if scaling_factor is not None else 1.0,
+            low_freq_factor=rget("low_freq_factor"),
+            high_freq_factor=rget("high_freq_factor"),
+            orig_max_position=rget("original_max_position_embeddings"),
+        )
+    if scaling_type == "mrope":
+        return LlamaMutiRotaryEmbedding(dim, max_position_embeddings=max_position_embeddings)
+    if scaling_type == "yarn":
+        return LlamaYarnRotaryEmbedding(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=rope_theta,
+            original_max_position_embeddings=rget("original_max_position_embeddings"),
+            scaling_factor=scaling_factor,
+            beta_fast=rget("beta_fast"),
+            beta_slow=rget("beta_slow"),
+            mscale=rget("mscale"),
+            mscale_all_dim=rget("mscale_all_dim"),
+        )
+    raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+
 _SNAP_Q = 128  # Alignment granularity for Q_LEN bucketing.
 
 
@@ -1155,75 +1233,9 @@ class LlamaAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        rope_scaling = self.config.rope_scaling
-
-        def rope_get(key, default=None):
-            if rope_scaling is None:
-                return default
-            if isinstance(rope_scaling, dict):
-                return rope_scaling.get(key, default)
-            return getattr(rope_scaling, key, default)
-
-        scaling_type = rope_get("rope_type", rope_get("type"))
-
-        if rope_scaling is None or scaling_type == "default":
-            self.rotary_emb = LlamaRotaryEmbedding(
-                self.head_dim,
-                max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
-            )
-        else:
-            scaling_factor = rope_get("factor")
-
-            if scaling_type == "linear":
-                if scaling_factor is None:
-                    raise ValueError(
-                        "Linear RoPE scaling requires 'factor' in rope_scaling config."
-                    )
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                )
-            elif scaling_type == "dynamic":
-                if scaling_factor is None:
-                    raise ValueError(
-                        "Dynamic RoPE scaling requires 'factor' in rope_scaling config."
-                    )
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                )
-            elif scaling_type == "llama3":
-                # for nv type
-                self.rotary_emb = LlamaRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
-                    scaling_factor=(scaling_factor if scaling_factor is not None else 1.0),
-                    low_freq_factor=rope_get("low_freq_factor"),
-                    high_freq_factor=rope_get("high_freq_factor"),
-                    orig_max_position=rope_get("original_max_position_embeddings"),
-                )
-            elif scaling_type == "mrope":
-                self.rotary_emb = LlamaMutiRotaryEmbedding(
-                    self.head_dim, max_position_embeddings=self.max_position_embeddings
-                )
-            elif scaling_type == "yarn":
-                self.rotary_emb = LlamaYarnRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
-                    original_max_position_embeddings=rope_get("original_max_position_embeddings"),
-                    scaling_factor=scaling_factor,
-                    beta_fast=rope_get("beta_fast"),
-                    beta_slow=rope_get("beta_slow"),
-                    mscale=rope_get("mscale"),
-                    mscale_all_dim=rope_get("mscale_all_dim"),
-                )
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        self.rotary_emb = build_rotary_embedding(
+            self.config, self.head_dim, self.max_position_embeddings
+        )
 
     def forward(
         self,
