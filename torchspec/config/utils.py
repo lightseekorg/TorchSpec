@@ -22,6 +22,7 @@ import copy
 import json
 import logging
 import warnings
+from typing import Optional
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -56,6 +57,39 @@ def _normalize_rope_scaling(rope_scaling):
                 normalized[key] = default
 
     return normalized
+
+
+def resolve_rope_theta(config, default: Optional[float] = 10000.0) -> Optional[float]:
+    """Return the RoPE base a config asks for, wherever it happens to be stored.
+
+    transformers 5.x keeps `rope_theta` inside `rope_parameters` instead of as a
+    top-level attribute, so reading the attribute alone silently yields `default`
+    for any config loaded from such a checkpoint — a draft then trains against
+    frequencies for 10000 while its config declares something else entirely.
+
+    Configs written by this repo (`DFlashConfig` and friends) declare the
+    attribute themselves and have no `rope_parameters`, so the attribute is
+    preferred and those paths are unaffected. The two disagree only if a stale
+    legacy value was left behind next to an updated block, which is ambiguous
+    enough to refuse rather than silently resolve.
+
+    Pass `default=None` to distinguish "declared nowhere" from a real value.
+    """
+    top_level = getattr(config, "rope_theta", None)
+    params = getattr(config, "rope_parameters", None)
+    nested = params.get("rope_theta") if isinstance(params, dict) else None
+
+    if top_level is not None and nested is not None and float(top_level) != float(nested):
+        raise ValueError(
+            f"Conflicting rope_theta: attribute is {top_level} but rope_parameters "
+            f"carries {nested}. Remove the stale top-level value, or set both to the "
+            "base the checkpoint was trained with."
+        )
+    if top_level is not None:
+        return float(top_level)
+    if nested is not None:
+        return float(nested)
+    return None if default is None else float(default)
 
 
 def generate_draft_model_config(
@@ -138,6 +172,14 @@ def generate_draft_model_config(
         if target_param == "rope_scaling":
             value = _normalize_rope_scaling(value)
         draft_config[draft_param] = value
+
+    # The hasattr copy above cannot see a rope_theta that lives only inside the
+    # target's rope_parameters, which is where transformers 5.x puts it.
+    for source in (text_config, target_config):
+        theta = resolve_rope_theta(source, default=None)
+        if theta is not None:
+            draft_config["rope_theta"] = theta
+            break
 
     draft_config["num_hidden_layers"] = 1
     draft_config["tie_word_embeddings"] = False

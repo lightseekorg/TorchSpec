@@ -38,6 +38,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
 
+from torchspec.config.utils import resolve_rope_theta
+
 
 class DFlashConfig(PretrainedConfig):
     """Configuration for DFlash draft model."""
@@ -189,7 +191,7 @@ class DFlashAttention(nn.Module):
         self.rotary_emb = DFlashRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
-            base=getattr(config, "rope_theta", 10000.0),
+            base=resolve_rope_theta(config),
         )
 
     def forward(

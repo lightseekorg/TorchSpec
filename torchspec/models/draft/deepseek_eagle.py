@@ -30,6 +30,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
+from torchspec.config.utils import resolve_rope_theta
 from torchspec.models.draft.base import Eagle3DraftModel
 
 # TODO: Extract shared components into a common module to reduce duplication:
@@ -160,7 +161,7 @@ class DeepSeekMLAAttention(nn.Module):
         """Initialize rotary embeddings with qk_rope_head_dim as the dimension."""
         rope_dim = self.qk_rope_head_dim
         rope_scaling = self.config.rope_scaling
-        rope_theta = getattr(self.config, "rope_theta", 10000)
+        rope_theta = resolve_rope_theta(self.config)
         rget = partial(_rope_config_get, rope_scaling)
         scaling_type = rget("rope_type", rget("type"))
 

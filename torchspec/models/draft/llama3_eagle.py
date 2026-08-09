@@ -30,6 +30,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from torchspec.config.utils import resolve_rope_theta
 from torchspec.models.draft.base import Eagle3DraftModel
 from torchspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
@@ -1156,6 +1157,7 @@ class LlamaAttention(nn.Module):
 
     def _init_rope(self):
         rope_scaling = self.config.rope_scaling
+        rope_theta = resolve_rope_theta(self.config)
 
         def rope_get(key, default=None):
             if rope_scaling is None:
@@ -1170,7 +1172,7 @@ class LlamaAttention(nn.Module):
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
+                base=rope_theta,
             )
         else:
             scaling_factor = rope_get("factor")
@@ -1200,7 +1202,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_theta,
                     scaling_factor=(scaling_factor if scaling_factor is not None else 1.0),
                     low_freq_factor=rope_get("low_freq_factor"),
                     high_freq_factor=rope_get("high_freq_factor"),
@@ -1214,7 +1216,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_theta,
                     original_max_position_embeddings=rope_get("original_max_position_embeddings"),
                     scaling_factor=scaling_factor,
                     beta_fast=rope_get("beta_fast"),
