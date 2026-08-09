@@ -517,7 +517,17 @@ def load_hf_dataset(data_path: str):
 
     # hub path — try native load_dataset first (handles Arrow, Parquet, etc.),
     # fall back to manual JSON download for repos with mixed-type columns
-    _KEEP_COLUMNS = frozenset({"id", "conversations", "text", "messages"})
+    _KEEP_COLUMNS = frozenset(
+        {
+            "id",
+            "data_id",
+            "conversations",
+            "text",
+            "messages",
+            "tools",
+            "generation_config",
+        }
+    )
     try:
         ds = load_dataset(data_path, split="train", streaming=True)
         drop_cols = [c for c in (ds.column_names or []) if c not in _KEEP_COLUMNS]

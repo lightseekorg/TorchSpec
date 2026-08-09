@@ -39,7 +39,30 @@ def get_assistant_token_ids(
         merge issues. Pass this to ``compute_assistant_loss_mask`` so it skips
         the formatting newline after the role name.
     """
+    from torchspec.data.renderers import RENDERER_REGISTRY
     from torchspec.data.template import TEMPLATE_REGISTRY
+
+    renderer_name = getattr(args, "renderer", None)
+    if renderer_name:
+        tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
+        renderer = RENDERER_REGISTRY.create(renderer_name, tokenizer)
+        get_match_tokens = getattr(renderer, "get_assistant_token_ids", None)
+        if get_match_tokens is None:
+            raise ValueError(
+                f"Dataset renderer {renderer_name!r} does not support dynamic "
+                "assistant-token matching"
+            )
+        header_ids, end_ids, skip_after_header = get_match_tokens()
+        if not header_ids or not end_ids:
+            raise ValueError(
+                f"Dataset renderer {renderer_name!r} returned an empty assistant matcher"
+            )
+        logger.info(
+            f"Renderer assistant loss mask token IDs ({renderer_name}): "
+            f"header={header_ids}, end={end_ids}, "
+            f"skip_after_header={skip_after_header}"
+        )
+        return header_ids, end_ids, skip_after_header
 
     chat_template_name = getattr(args, "chat_template", None)
     if not chat_template_name:

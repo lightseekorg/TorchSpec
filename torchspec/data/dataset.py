@@ -24,6 +24,7 @@ import logging as _logging
 import multiprocessing as mp
 import os
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -33,12 +34,15 @@ from torchspec.data.parse import (
     has_unbalanced_thinking_tags,
 )
 from torchspec.data.preprocessing import _normalize_conversation, preprocess_conversations
+from torchspec.data.renderers import RENDERER_REGISTRY
 from torchspec.data.template import TEMPLATE_REGISTRY
 from torchspec.data.utils import (
     estimate_row_count,
     extract_media_urls,
     flatten_multimodal_content,
     load_hf_dataset,
+    pack_loss_mask,
+    serialize_packed_loss_mask,
 )
 from torchspec.utils.logging import logger
 from torchspec.utils.processing import load_tokenizer
@@ -54,12 +58,19 @@ def _init_tokenize_worker(
     chat_template_name,
     last_turn_loss_only=False,
     min_loss_tokens=0,
+    renderer_name=None,
 ):
     """Initializer for each worker process — loads tokenizer once."""
     _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
-    _worker_state["tokenizer"] = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
-    _worker_state["template"] = TEMPLATE_REGISTRY.get(chat_template_name)
-    _worker_state["preprocess"] = preprocess_conversations
+    tokenizer = load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
+    _worker_state["tokenizer"] = tokenizer
+    _worker_state["renderer"] = (
+        RENDERER_REGISTRY.create(renderer_name, tokenizer) if renderer_name else None
+    )
+    _worker_state["template"] = (
+        TEMPLATE_REGISTRY.get(chat_template_name) if not renderer_name else None
+    )
+    _worker_state["preprocess"] = preprocess_conversations if not renderer_name else None
     _worker_state["last_turn_loss_only"] = last_turn_loss_only
     _worker_state["min_loss_tokens"] = min_loss_tokens
 
@@ -73,7 +84,32 @@ def _resolve_last_turn_loss_only(messages):
 
 def _tokenize_single(args):
     """Worker function — tokenize one sample."""
-    messages, max_length, train_with_decode = args
+    messages, tools, generation_config, max_length, train_with_decode = args
+    renderer = _worker_state.get("renderer")
+    if renderer is not None:
+        if train_with_decode:
+            raise ValueError("Registered dataset renderers do not support train_with_decode=True")
+        input_ids, loss_mask = renderer.render(
+            messages,
+            tools,
+            max_seq_length=max_length,
+            last_turn_only=_resolve_last_turn_loss_only(messages),
+            generation_config=generation_config,
+        )
+        # A renderer owns its own supervision, so a sample with no supervised
+        # token is unusable rather than merely short.
+        min_loss_tokens = max(1, _worker_state.get("min_loss_tokens", 0))
+        if not input_ids or sum(loss_mask) < min_loss_tokens:
+            return None
+        packed_loss_mask = serialize_packed_loss_mask(
+            pack_loss_mask(torch.tensor(loss_mask, dtype=torch.long))
+        )
+        return {
+            "input_ids": np.asarray(input_ids, dtype=np.int64),
+            "packed_loss_mask": packed_loss_mask,
+            "formatted_prompt": None,
+        }
+
     processed = _worker_state["preprocess"](
         _worker_state["tokenizer"],
         [messages],
@@ -112,7 +148,7 @@ def _format_single(args):
     """
     Worker function — format only, skip tokenization.
     """
-    messages, _, train_with_decode = args
+    messages, _, _, _, train_with_decode = args
     messages = _normalize_conversation(messages)
 
     result = {}
@@ -130,6 +166,15 @@ def _format_single(args):
     return result
 
 
+def _drop_stale_multimodal_masks(prompts, dynamic_loss_mask: bool) -> None:
+    """Remove masks rendered before the engine expands media placeholders."""
+    if not dynamic_loss_mask:
+        return
+    for prompt in prompts:
+        if prompt.get("multimodal_inputs") is not None:
+            prompt.pop("packed_loss_mask", None)
+
+
 def load_conversation_dataset(args):
     """Load conversation dataset and optionally tokenize for training.
 
@@ -140,7 +185,10 @@ def load_conversation_dataset(args):
     actual input_ids.
 
     When defer_tokenization=False (default), fully tokenizes and produces
-    input_ids + packed_loss_mask for the input_ids engine path.
+    input_ids + packed_loss_mask for the input_ids engine path. Tokenization
+    goes through either the ``chat_template`` registry or, if ``renderer`` is
+    set, a registered :class:`ConversationRenderer` that owns both prompt
+    construction and loss-mask derivation.
 
     Returns list of dicts. Fields depend on mode:
         defer_tokenization=True:  data_id, formatted_prompt, multimodal_inputs, metadata
@@ -148,15 +196,21 @@ def load_conversation_dataset(args):
     """
     prompt_key = getattr(args, "prompt_key", "text")
     chat_template_name = getattr(args, "chat_template", None)
+    renderer_name = getattr(args, "renderer", None)
     max_length = args.max_seq_length
     defer_tokenization = getattr(args, "defer_tokenization", False)
 
     logger.info(f"Max sequence length allowed for training: {max_length}")
 
-    if not chat_template_name:
-        raise ValueError("chat_template must be set for load_conversation_dataset")
+    if renderer_name and defer_tokenization:
+        raise ValueError("Registered dataset renderers require defer_tokenization=False")
+    if not renderer_name and not chat_template_name:
+        raise ValueError("Either renderer or chat_template must be set for dataset tokenization")
+    if renderer_name and renderer_name not in RENDERER_REGISTRY.get_all_renderer_names():
+        available = ", ".join(RENDERER_REGISTRY.get_all_renderer_names()) or "<none>"
+        raise ValueError(f"Unknown dataset renderer {renderer_name!r}; available: {available}")
 
-    custom_template = TEMPLATE_REGISTRY.get(chat_template_name)
+    custom_template = TEMPLATE_REGISTRY.get(chat_template_name) if not renderer_name else None
     hf_dataset = load_hf_dataset(args.train_data_path)
 
     dataset_name = os.path.basename(args.train_data_path)
@@ -167,9 +221,11 @@ def load_conversation_dataset(args):
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
     train_with_decode = getattr(args, "train_with_decode", False)
     min_loss_tokens_val = getattr(args, "min_loss_tokens", 0)
+    renderer_version = RENDERER_REGISTRY.cache_version(renderer_name) if renderer_name else None
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
-        f"-{max_length}-{chat_template_name}-ltlo={last_turn_loss_only_flag}"
+        f"-{max_length}-template={chat_template_name}-renderer={renderer_name}"
+        f"-renderer-version={renderer_version}-ltlo={last_turn_loss_only_flag}"
         f"-defer={defer_tokenization}-decode={train_with_decode}"
         f"-mlt={min_loss_tokens_val}"
     )
@@ -177,9 +233,12 @@ def load_conversation_dataset(args):
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
     cache_path = os.path.join(cache_dir, f"{cache_key}.pt")
 
+    dynamic_loss_mask = getattr(args, "dynamic_loss_mask", False)
+
     if os.path.exists(cache_path):
         logger.info(f"Loading dataset from cache: {cache_path}")
         prompts = torch.load(cache_path, weights_only=False)
+        _drop_stale_multimodal_masks(prompts, dynamic_loss_mask=dynamic_loss_mask)
         logger.info(f"Loaded {len(prompts)} cached samples")
         return prompts
 
@@ -209,6 +268,7 @@ def load_conversation_dataset(args):
             chat_template_name,
             last_turn_loss_only,
             min_loss_tokens,
+            renderer_name,
         )
         worker_fn = _tokenize_single
         desc = "Tokenizing dataset"
@@ -236,16 +296,28 @@ def load_conversation_dataset(args):
 
             messages = _normalize_conversation(raw_prompt)
             multimodal_inputs = extract_media_urls(messages)
-            flatten_multimodal_content(messages, custom_template.image_placeholder)
-            data_id = sample.get("id", f"sample_{idx}")
-            raw_samples.append((data_id, messages, multimodal_inputs))
+            if custom_template is not None:
+                flatten_multimodal_content(messages, custom_template.image_placeholder)
+            data_id = sample.get("id") or sample.get("data_id") or f"sample_{idx}"
+            raw_samples.append(
+                (
+                    data_id,
+                    messages,
+                    multimodal_inputs,
+                    sample.get("tools"),
+                    sample.get("generation_config"),
+                )
+            )
 
         logger.info(
             f"Loaded {len(raw_samples)} samples, {mode_label.lower()} with {num_proc} workers..."
         )
 
         # Pass 2: process in parallel
-        work_items = [(messages, max_length, train_with_decode) for _, messages, _ in raw_samples]
+        work_items = [
+            (messages, tools, generation_config, max_length, train_with_decode)
+            for _, messages, _, tools, generation_config in raw_samples
+        ]
 
         if pool is None:
             results = [worker_fn(item) for item in tqdm(work_items, desc=desc)]
@@ -262,12 +334,15 @@ def load_conversation_dataset(args):
     prompts = []
     skipped = 0
     unbalanced_think = 0
-    for (data_id, _, multimodal_inputs), result in zip(raw_samples, results):
+    for (data_id, _, multimodal_inputs, _, _), result in zip(raw_samples, results):
         if result is None:
             skipped += 1
             continue
-        if not defer_tokenization and has_unbalanced_thinking_tags(
-            result.get("formatted_prompt", "")
+        formatted_prompt = result.get("formatted_prompt")
+        if (
+            not defer_tokenization
+            and isinstance(formatted_prompt, str)
+            and has_unbalanced_thinking_tags(formatted_prompt)
         ):
             unbalanced_think += 1
         metadata = {}
@@ -278,14 +353,22 @@ def load_conversation_dataset(args):
             "data_id": data_id,
             "metadata": metadata,
             "multimodal_inputs": multimodal_inputs,
-            "formatted_prompt": result["formatted_prompt"],
+            "formatted_prompt": formatted_prompt,
         }
 
         if not defer_tokenization:
             entry["input_ids"] = torch.from_numpy(result["input_ids"])
-            entry["packed_loss_mask"] = result["packed_loss_mask"]
+            if multimodal_inputs is None:
+                entry["packed_loss_mask"] = result["packed_loss_mask"]
+            elif not dynamic_loss_mask:
+                raise ValueError(
+                    "Multimodal samples require dynamic_loss_mask=True because "
+                    "the inference engine expands media placeholders after rendering"
+                )
 
         prompts.append(entry)
+
+    _drop_stale_multimodal_masks(prompts, dynamic_loss_mask=dynamic_loss_mask)
 
     if skipped:
         logger.warning(f"Skipped {skipped} samples (empty source or zero loss mask)")

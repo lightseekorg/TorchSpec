@@ -33,7 +33,7 @@ from torchspec.utils.logging import logger
 
 @dataclass
 class DatasetConfig:
-    chat_template: str = "llama3"
+    chat_template: Optional[str] = "llama3"
     defer_tokenization: bool = False
     eval_data_path: Optional[str] = None
     eval_interval: int = 50
@@ -43,6 +43,7 @@ class DatasetConfig:
     length_group_size: int = 32
     min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
     prompt_key: str = "conversations"
+    renderer: Optional[str] = None  # registered ConversationRenderer; overrides chat_template
     shuffle_dataset: bool = True
     train_data_path: str = ""
 
@@ -370,7 +371,15 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
     if flat.get("inference_engine_type") == "offline":
         # Replay records are already tokenized and carry their loss masks.
         flat["defer_tokenization"] = False
-    flat["dynamic_loss_mask"] = flat["defer_tokenization"] and not flat["train_with_decode"]
+    # Deferred tokenization always needs the training-time matcher, since only
+    # the engine knows the final token IDs. Renderers need it too: a renderer
+    # emits its mask before the engine expands media placeholders, so any
+    # multimodal sample's mask has to be recomputed after expansion.
+    flat["dynamic_loss_mask"] = (
+        flat.get("inference_engine_type") != "offline"
+        and (flat["defer_tokenization"] or bool(flat.get("renderer")))
+        and not flat["train_with_decode"]
+    )
     flat["use_wandb"] = flat.get("use_wandb", False) or flat.get("report_to") == "wandb"
     flat["use_tensorboard"] = (
         flat.get("use_tensorboard", False) or flat.get("report_to") == "tensorboard"

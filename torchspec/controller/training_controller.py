@@ -183,11 +183,15 @@ class AsyncTrainingController:
                     data_id = sample.get("data_id") or self._generate_data_id()
                     input_ids = sample.get("input_ids")
                     packed_loss_mask = sample.get("packed_loss_mask")
-                    if input_ids is not None and packed_loss_mask is None:
+                    if (
+                        input_ids is not None
+                        and packed_loss_mask is None
+                        and not getattr(self.args, "dynamic_loss_mask", False)
+                    ):
                         raise ValueError(
                             f"packed_loss_mask is required when input_ids is provided "
-                            f"(data_id={data_id}). Use defer_tokenization=True to skip "
-                            f"tokenization entirely."
+                            f"(data_id={data_id}). Enable dynamic_loss_mask or use "
+                            f"defer_tokenization=True to match engine-produced token IDs."
                         )
                     entry = InferenceInput(
                         data_id=data_id,
