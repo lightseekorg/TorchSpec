@@ -1,0 +1,504 @@
+diff --git a/vllm/model_executor/models/extract_hidden_states.py b/vllm/model_executor/models/extract_hidden_states.py
+index 87dba7b5c..446e5f3fd 100644
+--- a/vllm/model_executor/models/extract_hidden_states.py
++++ b/vllm/model_executor/models/extract_hidden_states.py
+@@ -23,7 +23,12 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
+     maybe_transfer_kv_layer,
+ )
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+-from vllm.model_executor.models.utils import maybe_prefix
++from vllm.model_executor.models.interfaces import SupportsPP
++from vllm.model_executor.models.utils import (
++    make_empty_intermediate_tensors_factory,
++    maybe_prefix,
++)
++from vllm.sequence import IntermediateTensors
+ from vllm.utils.torch_utils import is_quantized_kv_cache, kv_cache_dtype_str_to_dtype
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+@@ -336,7 +341,7 @@ class CacheOnlyAttentionLayer(nn.Module, AttentionLayerBase):
+ ############ ExtractHiddenStatesModel definition ##########
+ 
+ 
+-class ExtractHiddenStatesModel(nn.Module):
++class ExtractHiddenStatesModel(nn.Module, SupportsPP):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -349,6 +354,9 @@ class ExtractHiddenStatesModel(nn.Module):
+         self.num_hidden_states = len(
+             getattr(self.hf_config, "eagle_aux_hidden_state_layer_ids", [])
+         )
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states"], self.hidden_size
++        )
+ 
+         cache_config = vllm_config.cache_config
+ 
+@@ -374,7 +382,12 @@ class ExtractHiddenStatesModel(nn.Module):
+             }
+         )
+ 
+-    def forward(self, hidden_states: torch.Tensor) -> None:
++    def forward(
++        self,
++        hidden_states: torch.Tensor | None = None,
++        *,
++        intermediate_tensors: IntermediateTensors | None = None,
++    ) -> None:
+         """Process and cache hidden states.
+ 
+         Args:
+@@ -385,6 +398,10 @@ class ExtractHiddenStatesModel(nn.Module):
+             Tuple of (dummy_output, dummy_output) - both unused
+         """
+ 
++        if hidden_states is None:
++            assert intermediate_tensors is not None
++            hidden_states = intermediate_tensors["hidden_states"]
++
+         # Call dummy attention layer to cache hidden states
+         # Output is ignored - we only care about the KV cache side effects
+         _ = self.cache_only_layers[str(self.target_num_hidden_layers)](hidden_states)
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -400,7 +400,11 @@
+         positions: torch.Tensor,
+         intermediate_tensors: IntermediateTensors | None = None,
+         inputs_embeds: torch.Tensor | None = None,
+-    ) -> torch.Tensor | IntermediateTensors:
++    ) -> (
++        torch.Tensor
++        | IntermediateTensors
++        | tuple[torch.Tensor | IntermediateTensors, list[torch.Tensor]]
++    ):
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+                 hidden_states = inputs_embeds
+@@ -412,19 +416,33 @@
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        # Capture ids are global layer positions, so a stage that starts partway
++        # through the model must offset by ``start_layer``.  The id-0 slot is the
++        # embedding output and only exists on the first stage; every later stage
++        # would otherwise re-capture its own input, which the previous stage has
++        # already published as its last owned layer.
++        aux_hidden_states: list[torch.Tensor] = []
++        if self.start_layer == 0:
++            self._maybe_add_hidden_state(aux_hidden_states, 0, hidden_states, residual)
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer)
+         ):
+             hidden_states, residual = layer(positions, hidden_states, residual)
+             self._maybe_add_hidden_state(
+-                aux_hidden_states, idx + 1, hidden_states, residual
++                aux_hidden_states, self.start_layer + idx + 1, hidden_states, residual
+             )
+ 
+         if not get_pp_group().is_last_rank:
+-            return IntermediateTensors(
++            intermediate_tensors = IntermediateTensors(
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
++            # Non-last stages own aux layers too under pipeline parallelism.
++            # Keyed off the globally configured layers, not this stage's own
++            # list, so every stage returns the same arity even when it happens
++            # to own none of them.
++            if self.aux_hidden_state_layers:
++                return intermediate_tensors, aux_hidden_states
++            return intermediate_tensors
+ 
+         hidden_states, _ = self.norm(hidden_states, residual)
+ 
+diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
+index 7efe92893..8f536e497 100644
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -1198,7 +1198,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+         assert hidden_states is not None
+ 
+         aux_hidden_states: list[torch.Tensor] = []
+-        if self.start_layer in self.aux_hidden_state_layers:
++        if self.start_layer == 0 and self.start_layer in self.aux_hidden_state_layers:
+             if self.use_attn_res or residual is None:
+                 aux_hidden_states.append(hidden_states)
+             else:
+@@ -1263,9 +1263,12 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             )
+             if prefix_sum is not None:
+                 hidden_states = hidden_states + prefix_sum
+-            return IntermediateTensors(
++            intermediate_tensors = IntermediateTensors(
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
++            if self.aux_hidden_state_layers:
++                return intermediate_tensors, aux_hidden_states
++            return intermediate_tensors
+ 
+         if self.use_attn_res:
+             assert prefix_sum is not None
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 56a532b80..456d18233 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -25,7 +25,7 @@ class AsyncScheduler(Scheduler):
+         ] * scheduler_output.num_spec_tokens_to_schedule
+         for req_id in scheduler_output.num_scheduled_tokens:
+             request = self.requests[req_id]
+-            if request.is_prefill_chunk:
++            if request.is_prefill_chunk or self.is_prefill_only:
+                 continue
+ 
+             scheduler_output.pending_structured_output_tokens |= (
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 99a8b4404..004906b16 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -117,9 +117,15 @@ class Scheduler(SchedulerInterface):
+             self.kv_events_config is not None
+             and self.kv_events_config.enable_kv_cache_events
+         )
+-        # Diffusion models may not sample any tokens for a denoising step.
++        self.is_prefill_only = (
++            vllm_config.speculative_config is not None
++            and vllm_config.speculative_config.uses_extract_hidden_states()
++        )
++        # Diffusion models and hidden-state extraction do not sample tokens.
+         self.num_sampled_tokens_per_step = (
+-            1 if not vllm_config.model_config.is_diffusion else 0
++            0
++            if vllm_config.model_config.is_diffusion or self.is_prefill_only
++            else 1
+         )
+ 
+         # Create KVConnector for the Scheduler. Note that each Worker
+@@ -1809,6 +1815,12 @@ class Scheduler(SchedulerInterface):
+                 new_token_ids, stopped = self._update_request_with_output(
+                     request, new_token_ids, is_stale=output_is_stale
+                 )
++            elif model_runner_output.prefill_only and not request.is_prefill_chunk:
++                # extract_hidden_states is a prefill-only operation. Once the
++                # final prompt chunk has executed, finish the request without
++                # creating a sampled token or scheduling a decode iteration.
++                request.status = RequestStatus.FINISHED_STOPPED
++                stopped = True
+             elif request.pooling_params and pooler_output is not None:
+                 # Pooling stops as soon as there is output.
+                 request.status = RequestStatus.FINISHED_STOPPED
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 359d1952a..b9f505243 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -49,6 +49,10 @@ class InputProcessor:
+         self.lora_config = vllm_config.lora_config
+         self.scheduler_config = vllm_config.scheduler_config
+         self.speculative_config = vllm_config.speculative_config
++        self.is_prefill_only = (
++            self.speculative_config is not None
++            and self.speculative_config.uses_extract_hidden_states()
++        )
+         self.structured_outputs_config = vllm_config.structured_outputs_config
+         self.observability_config = vllm_config.observability_config
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+@@ -431,7 +435,11 @@ class InputProcessor:
+                 f"longer than the maximum model length of {max_prompt_len}. "
+                 f"{suggestion}"
+             )
+-        elif prompt_len == max_prompt_len and model_config.runner_type == "generate":
++        elif (
++            prompt_len == max_prompt_len
++            and model_config.runner_type == "generate"
++            and not self.is_prefill_only
++        ):
+             suggestion = (
+                 "Make sure that `max_model_len` is no smaller than the "
+                 "number of text tokens (prompt + requested output tokens)."
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index abb6a2be0..e64905714 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -307,6 +307,10 @@ class ModelRunnerOutput:
+     # ``None`` when ``enable_return_routed_experts`` is off.
+     routed_experts: RoutedExpertsLists | None = None
+ 
++    # The model runner completed a prefill-only operation. Requests whose
++    # final prompt chunk ran in this step should finish without output tokens.
++    prefill_only: bool = False
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+diff --git a/vllm/v1/spec_decode/extract_hidden_states.py b/vllm/v1/spec_decode/extract_hidden_states.py
+index de7a075e2..e8de519a1 100644
+--- a/vllm/v1/spec_decode/extract_hidden_states.py
++++ b/vllm/v1/spec_decode/extract_hidden_states.py
+@@ -6,10 +6,11 @@ from __future__ import annotations
+ from typing import TYPE_CHECKING
+ 
+ import torch
+-import torch.nn as nn
+-
++from torch import nn
+ from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+ from vllm.distributed.eplb.eplb_state import EplbState
++from vllm.distributed.parallel_state import get_pp_group
++from vllm.distributed.utils import get_pp_indices
+ from vllm.forward_context import set_forward_context
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.model_loader import get_model
+@@ -73,7 +74,9 @@ class ExtractHiddenStatesProposer:
+                 "eagle_aux_hidden_state_layer_ids must be set in the draft "
+                 "model config for extract_hidden_states method"
+             )
+-        self.num_hidden_states = len(layer_ids)
++        self.layer_ids = tuple(layer_ids)
++        self.num_hidden_states = len(self.layer_ids)
++        self.local_hidden_state_indices = self._get_local_hidden_state_indices()
+         self.hidden_size = vllm_config.model_config.get_hidden_size()
+         self.hidden_states = torch.zeros(
+             (self.max_num_tokens, self.num_hidden_states, self.hidden_size),
+@@ -86,6 +89,20 @@ class ExtractHiddenStatesProposer:
+             self.max_num_tokens, dtype=torch.int64, device=device
+         )
+ 
++    def _get_local_hidden_state_indices(self) -> tuple[int, ...]:
++        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
++        if pp_size == 1:
++            return tuple(range(self.num_hidden_states))
++
++        num_layers = self.vllm_config.model_config.get_total_num_hidden_layers()
++        pp_rank = get_pp_group().rank_in_group
++        start_layer, end_layer = get_pp_indices(num_layers, pp_rank, pp_size)
++        return tuple(
++            index
++            for index, layer_id in enumerate(self.layer_ids)
++            if (layer_id == 0 and pp_rank == 0) or (start_layer < layer_id <= end_layer)
++        )
++
+     def set_eplb_state(self, eplb_state: EplbState) -> None:
+         """Inject EPLB state after construction."""
+         self.eplb_state = eplb_state
+@@ -126,14 +143,41 @@ class ExtractHiddenStatesProposer:
+         assert num_speculative_tokens == self.num_speculative_tokens
+         assert self.model is not None and isinstance(target_hidden_states, list)
+ 
+-        # target_hidden_states is a list of tensors (one per layer)
+-        # Each tensor has shape [num_tokens, hidden_size]
+-        # Stack to shape: [num_tokens, num_hidden_states, hidden_size]
+-        stacked_hidden_states = torch.stack(target_hidden_states, dim=1)
+-        num_tokens = stacked_hidden_states.shape[0]
++        self.cache_hidden_states(
++            target_hidden_states=target_hidden_states,
++            common_attn_metadata=common_attn_metadata,
++        )
+ 
+-        # Copy hidden states to buffer
+-        self.hidden_states[:num_tokens] = stacked_hidden_states
++        # Return the sampled tokens as "draft" tokens
++        # Shape: [batch_size, 1] to match num_speculative_tokens=1
++        # On decode steps with spec tokens, sampled_token_ids may have
++        # shape [batch_size, 2] (target + spec verification); slice to
++        # return only the target-sampled column.
++        return sampled_token_ids[:, :1]
++
++    def cache_hidden_states(
++        self,
++        target_hidden_states: list[torch.Tensor],
++        common_attn_metadata: CommonAttentionMetadata,
++    ) -> int:
++        """Cache the auxiliary hidden states owned by this pipeline stage."""
++        if len(target_hidden_states) != len(self.local_hidden_state_indices):
++            raise ValueError(
++                "Expected "
++                f"{len(self.local_hidden_state_indices)} local hidden states, "
++                f"got {len(target_hidden_states)}"
++            )
++
++        if target_hidden_states:
++            num_tokens = target_hidden_states[0].shape[0]
++        else:
++            num_tokens = common_attn_metadata.slot_mapping.shape[0]
++
++        self.hidden_states[:num_tokens].zero_()
++        for index, hidden_state in zip(
++            self.local_hidden_state_indices, target_hidden_states
++        ):
++            self.hidden_states[:num_tokens, index].copy_(hidden_state)
+ 
+         assert self.attn_metadata_builder is not None
+         attn_metadata = self.attn_metadata_builder.build_for_drafting(
+@@ -171,13 +215,7 @@ class ExtractHiddenStatesProposer:
+             self.model(
+                 hidden_states=self.hidden_states[:num_input_tokens],
+             )
+-
+-        # Return the sampled tokens as "draft" tokens
+-        # Shape: [batch_size, 1] to match num_speculative_tokens=1
+-        # On decode steps with spec tokens, sampled_token_ids may have
+-        # shape [batch_size, 2] (target + spec verification); slice to
+-        # return only the target-sampled column.
+-        return sampled_token_ids[:, :1]
++        return num_tokens
+ 
+     def _get_slot_mapping(
+         self,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index d500b6720..78a7128c4 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -440,7 +440,7 @@ class ExecuteModelState(NamedTuple):
+     sample_tokens(), after execute_model() returns None."""
+ 
+     scheduler_output: "SchedulerOutput"
+-    logits: torch.Tensor
++    logits: torch.Tensor | None
+     spec_decode_metadata: SpecDecodeMetadata | None
+     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
+     hidden_states: torch.Tensor
+@@ -580,7 +580,13 @@ class GPUModelRunner(
+         # NOTE(Jiayi): currently we put the entire draft model on
+         # the last PP rank. This is not ideal if there are many
+         # layers in the draft model.
+-        if self.speculative_config and get_pp_group().is_last_rank:
++        extract_hidden_states = (
++            self.speculative_config is not None
++            and self.speculative_config.uses_extract_hidden_states()
++        )
++        if self.speculative_config and (
++            get_pp_group().is_last_rank or extract_hidden_states
++        ):
+             self.drafter: (
+                 NgramProposer  # noqa: F823
+                 | NgramProposerGPU
+@@ -653,9 +659,10 @@ class GPUModelRunner(
+                     "Unknown speculative decoding method: "
+                     f"{self.speculative_config.method}"
+                 )
+-            self.rejection_sampler = RejectionSampler(
+-                self.sampler, self.speculative_config, self.device
+-            )
++            if get_pp_group().is_last_rank:
++                self.rejection_sampler = RejectionSampler(
++                    self.sampler, self.speculative_config, self.device
++                )
+ 
+         self.num_spec_tokens = 0
+         self.prev_num_spec_tokens = 0
+@@ -4452,6 +4459,21 @@ class GPUModelRunner(
+                 hidden_states = model_output
+                 aux_hidden_states = None
+ 
++            extract_hidden_states = (
++                self.speculative_config is not None
++                and self.speculative_config.uses_extract_hidden_states()
++            )
++            if extract_hidden_states:
++                assert isinstance(self.drafter, ExtractHiddenStatesProposer)
++                assert aux_hidden_states is not None
++                assert spec_decode_common_attn_metadata is not None
++                self.drafter.cache_hidden_states(
++                    target_hidden_states=[
++                        h[:num_scheduled_tokens] for h in aux_hidden_states
++                    ],
++                    common_attn_metadata=spec_decode_common_attn_metadata,
++                )
++
+             if not self.broadcast_pp_output:
+                 # Common case.
+                 if not get_pp_group().is_last_rank:
+@@ -4469,8 +4491,12 @@ class GPUModelRunner(
+                         kv_connector_output,
+                     )
+ 
+-                sample_hidden_states = hidden_states[logits_indices]
+-                logits = self.model.compute_logits(sample_hidden_states)
++                if extract_hidden_states:
++                    sample_hidden_states = hidden_states[:0]
++                    logits = None
++                else:
++                    sample_hidden_states = hidden_states[logits_indices]
++                    logits = self.model.compute_logits(sample_hidden_states)
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+@@ -4542,11 +4568,23 @@ class GPUModelRunner(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+         if self.execute_model_state is None:
++            extract_hidden_states = (
++                self.speculative_config is not None
++                and self.speculative_config.uses_extract_hidden_states()
++            )
++            if extract_hidden_states:
++                self.finalize_kv_connector()
+             kv_connector_output = self.kv_connector_output
+             self.kv_connector_output = None
+             # receive sampled token ids from the last PP rank.
+-            if self.use_async_scheduling and not get_pp_group().is_last_rank:
++            if (
++                self.use_async_scheduling
++                and not extract_hidden_states
++                and not get_pp_group().is_last_rank
++            ):
+                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
++            if extract_hidden_states and get_pp_group().world_size > 1:
++                get_pp_group().barrier()
+             # In case of PP with kv transfer, we need to pass through the
+             # kv_connector_output
+             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+@@ -4567,6 +4605,40 @@ class GPUModelRunner(
+         # Clear ephemeral state.
+         self.execute_model_state = None
+ 
++        if (
++            self.speculative_config is not None
++            and self.speculative_config.uses_extract_hidden_states()
++        ):
++            # Hidden states were cached directly after the target prefill.
++            # Finish without logits, sampling, token proposal, or decode.
++            logger.info_once(
++                "extract_hidden_states prefill-only path: skipping logits, "
++                "sampling, token proposal, and decode"
++            )
++            self.finalize_kv_connector()
++            if get_pp_group().world_size > 1:
++                get_pp_group().barrier()
++            self.eplb_step()
++
++            kv_connector_output = self.kv_connector_output
++            self.kv_connector_output = None
++            req_ids = list(scheduler_output.num_scheduled_tokens)
++            return ModelRunnerOutput(
++                req_ids=req_ids,
++                req_id_to_index={
++                    req_id: index for index, req_id in enumerate(req_ids)
++                },
++                sampled_token_ids=[[] for _ in req_ids],
++                prefill_only=True,
++                kv_connector_output=kv_connector_output,
++                ec_connector_output=ec_connector_output
++                if self.supports_mm_inputs
++                else None,
++                cudagraph_stats=cudagraph_stats,
++            )
++
++        assert logits is not None
++
+         # Apply structured output bitmasks if present.
+         if grammar_output is not None:
+             apply_grammar_bitmask(
+@@ -4743,6 +4815,11 @@ class GPUModelRunner(
+         # draft model to also save its KV cache.
+         if spec_config is not None:
+             self.finalize_kv_connector()
++            if (
++                spec_config.uses_extract_hidden_states()
++                and get_pp_group().world_size > 1
++            ):
++                get_pp_group().barrier()
+ 
+         with record_function_or_nullcontext("gpu_model_runner: eplb"):
+             self.eplb_step()

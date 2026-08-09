@@ -1,0 +1,164 @@
+TorchSpec patches for vllm nightly-7794b1e08bf505ff28664515ffaaeeec955ab796
+(base image vllm/vllm-openai:nightly-7794b1e08bf505ff28664515ffaaeeec955ab796,
+vllm-project/vllm @ 7794b1e08bf5, 2026-08-05)
+
+1. Tap the pre-norm AttnRes mixture as the Kimi K3 aux hidden state
+   vllm/models/kimi_k3/nvidia/model.py
+   vllm/envs.py
+   Backport of https://github.com/vllm-project/vllm/pull/50487.
+
+   Under AttnRes the tensor threaded between K3 layers is only the current
+   block's running prefix sum; the blocks committed so far live separately in
+   the block_residual bank. The old tap recorded ``prefix_sum +
+   hidden_states``, i.e. a residual stream that no consumer in the model ever
+   reads: both the next layer's attention front-end and the model's own
+   output-side aggregation first run a softmax-weighted AttnRes mixture over
+   ``bank[:num_blocks] + prefix``. That includes the last layer, whose logits
+   come from ``attn_res(...)`` followed by the final norm, so the mismatch was
+   not limited to the intermediate Eagle3 taps -- a drafter trained on the old
+   capture was fit against features the verifier never sees.
+
+Deviation from upstream: upstream ships VLLM_KIMI_K3_AUX_ATTN_RES_STREAM off
+by default while the serving-side effect is measured. This image defaults it
+on, since the pre-PR capture yields incorrect training targets and a silently
+wrong default is the failure mode we care about here. Set
+VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=0 to reproduce upstream behaviour. The model
+logs the active mode once at configuration time:
+  Kimi-K3 aux hidden capture: layers=... mode=attn_res_stream
+Once the base image carries PR #50487, drop this patch but keep exporting
+VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1, or the default flips back to prefix_only.
+
+Note: the v0.22.1 patch is not needed on this nightly:
+- flash_attn rotary import fix: upstream, the import is now guarded with
+  ``suppress(ModuleNotFoundError)`` in
+  vllm/model_executor/layers/rotary_embedding/common.py
+
+Apply:
+  cd $VLLM_ROOT && git apply /path/to/vllm_k3.patch
+
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -196,6 +196,7 @@ if TYPE_CHECKING:
+     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
+     VLLM_MOE_SKIP_PADDING: bool = True
+     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
++    VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = True
+     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
+     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
+     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
+@@ -1539,6 +1540,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT": lambda: bool(
+         int(os.getenv("VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT", "0"))
+     ),
++    # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
++    # AttnRes mixture, rather than the post-mixture sum, as the auxiliary
++    # hidden state handed to a DFlash drafter. Upstream ships this off while
++    # the effect on serving is measured; TorchSpec defaults it on because the
++    # post-mixture sum is not a feature the target model ever consumes, so
++    # training against it silently fits the wrong distribution.
++    "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM": lambda: bool(
++        int(os.getenv("VLLM_KIMI_K3_AUX_ATTN_RES_STREAM", "1"))
++    ),
+     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
+     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
+     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
+--- a/vllm/models/kimi_k3/nvidia/model.py
++++ b/vllm/models/kimi_k3/nvidia/model.py
+@@ -1095,6 +1095,85 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             }
+         )
+ 
++    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        super()._set_aux_hidden_state_layers(layers)
++        if self.use_attn_res:
++            # Emitted once, at configuration time. Which layers are tapped and
++            # which convention is in force are the two things you need to
++            # confirm from a running process, and neither is recoverable from
++            # the served output.
++            logger.info_once(
++                "Kimi-K3 aux hidden capture: layers=%s mode=%s "
++                "(VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=%d)",
++                layers,
++                "attn_res_stream" if self._aux_attn_res_stream else "prefix_only",
++                int(self._aux_attn_res_stream),
++            )
++
++    @property
++    def _aux_attn_res_stream(self) -> bool:
++        return envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM
++
++    def _capture_aux_hidden_stream(
++        self,
++        layer_idx: int,
++        prefix_sum: torch.Tensor,
++        pending_mlp_out: torch.Tensor | None,
++        block_residual: torch.Tensor,
++    ) -> torch.Tensor:
++        """Auxiliary feature tapped after ``layer_idx`` under AttnRes.
++
++        The wire between layers only carries the current block's running prefix;
++        the committed blocks live in the bank. The value the next consumer
++        actually reads is the pre-norm AttnRes mixture over
++        ``bank[:num_blocks] + prefix``, which is what the DFlash drafters were
++        trained against. ``attn_res`` with no delta, no block write and no
++        output norm computes exactly that and leaves both the prefix and the
++        bank untouched.
++
++        Folding the pending MLP output into the prefix rather than passing it as
++        ``delta`` is deliberate: the kernel writes an applied delta back into
++        the prefix in place, which would double-add it into the live residual
++        stream.
++        """
++        prefix = prefix_sum if pending_mlp_out is None else prefix_sum + pending_mlp_out
++        # `use_attn_res` is what constructs the norm and projection weights this
++        # reads; without it there is no mixture to compute and the attribute
++        # lookups below would raise.
++        if not (self._aux_attn_res_stream and self.use_attn_res):
++            return prefix
++
++        if layer_idx + 1 < self.end_layer:
++            consumer = self.layers[layer_idx + 1]
++            score_norm = consumer.self_attention_res_norm
++            score_proj = consumer.self_attention_res_proj
++            num_blocks = consumer.prev_valid_blocks
++        elif get_pp_group().is_last_rank:
++            # Nothing downstream but the model's own output-side aggregation.
++            score_norm = self.output_attn_res_norm
++            score_proj = self.output_attn_res_proj
++            num_blocks = self.num_attn_res_blocks
++        else:
++            # Last layer of a non-final pipeline stage: the consumer lives on
++            # the next rank and the output-side aggregation only exists on the
++            # last one, so there is nothing here to mix against. Falling back
++            # to the running prefix keeps the tap defined rather than reaching
++            # for weights this rank does not construct.
++            return prefix
++
++        return attn_res(
++            prefix,
++            None,
++            block_residual,
++            score_norm.weight,
++            score_proj.weight.squeeze(0),
++            None,
++            num_blocks=num_blocks,
++            block_write_idx=-1,
++            eps=score_norm.variance_epsilon,
++            output_norm_eps=0.0,
++        )
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
+@@ -1161,7 +1240,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             if (layer_idx + 1) in self.aux_hidden_state_layers:
+                 if self.use_attn_res:
+                     assert prefix_sum is not None
+-                    aux_hidden_state = prefix_sum + hidden_states
++                    assert residual is not None
++                    aux_hidden_state = self._capture_aux_hidden_stream(
++                        layer_idx, prefix_sum, hidden_states, residual
++                    )
+                 else:
+                     assert residual is not None
+                     aux_hidden_state = hidden_states + residual

@@ -1,0 +1,152 @@
+diff --git a/tests/v1/spec_decode/test_extract_hidden_states.py b/tests/v1/spec_decode/test_extract_hidden_states.py
+index 6b4e53ced..86f0ea11a 100644
+--- a/tests/v1/spec_decode/test_extract_hidden_states.py
++++ b/tests/v1/spec_decode/test_extract_hidden_states.py
+@@ -7,12 +7,11 @@ from unittest import mock
+ import numpy as np
+ import pytest
+ import torch
+-from transformers import CLIPVisionConfig, LlamaConfig, LlavaConfig, PretrainedConfig
+-
+ from tests.v1.attention.utils import (
+     BatchSpec,
+     create_common_attn_metadata,
+ )
++from transformers import CLIPVisionConfig, LlamaConfig, LlavaConfig, PretrainedConfig
+ from vllm.config import (
+     AttentionConfig,
+     CacheConfig,
+@@ -24,18 +23,26 @@ from vllm.config import (
+     VllmConfig,
+ )
+ from vllm.config.load import LoadConfig
++from vllm.model_executor.models.extract_hidden_states import ExtractHiddenStatesModel
++from vllm.model_executor.models.interfaces import supports_pp
+ from vllm.platforms import current_platform
+ from vllm.transformers_utils.config import get_hf_text_config
+ from vllm.transformers_utils.configs.extract_hidden_states import (
+     ExtractHiddenStatesConfig,
+ )
+-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+ 
++from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
++from vllm.v1.worker.gpu_model_runner import ExecuteModelState, GPUModelRunner
++
+ model_dir = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+ DEVICE_TYPE = current_platform.device_type
+ 
+ 
++def test_extract_hidden_states_model_declares_pipeline_parallel_support():
++    assert supports_pp(ExtractHiddenStatesModel)
++
++
+ def _create_proposer(
+     num_speculative_tokens: int = 1,
+     layer_ids: list[int] | None = None,
+@@ -278,6 +285,105 @@ def test_propose():
+     )
+ 
+ 
++def test_cache_hidden_states_accepts_pipeline_local_layers():
++    """A PP stage writes only its owned layer slots into the shared cache layout."""
++    device = torch.device(DEVICE_TYPE)
++    proposer = _create_proposer(layer_ids=[2, 8, 14, 20])
++    proposer.local_hidden_state_indices = (1, 3)
++    proposer.model = mock.MagicMock()
++    proposer.attn_layer_names = ["cache_only_layers.28"]
++    proposer.attn_metadata_builder = mock.MagicMock()
++
++    batch_spec = BatchSpec(seq_lens=[3], query_lens=[3])
++    common_attn_metadata = create_common_attn_metadata(
++        batch_spec,
++        block_size=16,
++        device=device,
++    )
++    local_hidden_states = [
++        torch.randn(3, proposer.hidden_size, dtype=proposer.dtype, device=device)
++        for _ in range(2)
++    ]
++
++    proposer.cache_hidden_states(local_hidden_states, common_attn_metadata)
++
++    assert torch.equal(
++        proposer.hidden_states[:3, 1],
++        local_hidden_states[0],
++    )
++    assert torch.equal(
++        proposer.hidden_states[:3, 3],
++        local_hidden_states[1],
++    )
++    assert not proposer.hidden_states[:3, 0].any()
++    assert not proposer.hidden_states[:3, 2].any()
++    proposer.model.assert_called_once()
++
++
++def test_non_last_pp_stage_flushes_before_completion_barrier():
++    runner = GPUModelRunner.__new__(GPUModelRunner)
++    runner.execute_model_state = None
++    runner.speculative_config = mock.MagicMock()
++    runner.speculative_config.uses_extract_hidden_states.return_value = True
++    runner.kv_connector_output = None
++    runner.use_async_scheduling = False
++
++    events = []
++    runner.finalize_kv_connector = mock.MagicMock(
++        side_effect=lambda: events.append("flush")
++    )
++    pp_group = mock.MagicMock(world_size=4)
++    pp_group.barrier.side_effect = lambda: events.append("barrier")
++
++    with mock.patch(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        return_value=pp_group,
++    ):
++        runner.sample_tokens(grammar_output=None)
++
++    assert events == ["flush", "barrier"]
++
++
++def test_extract_hidden_states_prefill_only_skips_sampler():
++    runner = GPUModelRunner.__new__(GPUModelRunner)
++    runner.speculative_config = mock.MagicMock()
++    runner.speculative_config.uses_extract_hidden_states.return_value = True
++    runner.kv_connector_output = None
++    runner.supports_mm_inputs = False
++    runner.finalize_kv_connector = mock.MagicMock()
++    runner.eplb_step = mock.MagicMock()
++    runner._sample = mock.MagicMock(
++        side_effect=AssertionError("extract-only path must not sample")
++    )
++
++    scheduler_output = mock.MagicMock()
++    scheduler_output.num_scheduled_tokens = {"req-0": 7}
++    runner.execute_model_state = ExecuteModelState(
++        scheduler_output=scheduler_output,
++        logits=None,
++        spec_decode_metadata=None,
++        spec_decode_common_attn_metadata=None,
++        hidden_states=mock.MagicMock(),
++        sample_hidden_states=mock.MagicMock(),
++        aux_hidden_states=None,
++        ec_connector_output=None,
++        cudagraph_stats=None,
++        slot_mappings=None,
++    )
++
++    with mock.patch(
++        "vllm.v1.worker.gpu_model_runner.get_pp_group",
++        return_value=mock.MagicMock(world_size=1),
++    ):
++        output = runner.sample_tokens(grammar_output=None)
++
++    assert output.prefill_only
++    assert output.sampled_token_ids == [[]]
++    assert output.req_ids == ["req-0"]
++    runner._sample.assert_not_called()
++    runner.finalize_kv_connector.assert_called_once()
++
++
+ @pytest.mark.parametrize("num_hidden_layers", [1, 4, 8])
+ def test_propose_different_layer_counts(num_hidden_layers):
+     """Test that propose works correctly with different numbers of hidden layers."""

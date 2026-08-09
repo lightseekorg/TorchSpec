@@ -1,0 +1,26 @@
+# Patch stack for vllm/vllm-openai:nightly-7794b1e08bf505ff28664515ffaaeeec955ab796
+# (vLLM 0.26.1rc1.dev353+g7794b1e08, main @ 2026-08-05).
+#
+# Applied top to bottom; blank lines and #-comments are skipped. Files under
+# tests/ are deliberately not listed — the installed dist-packages tree has no
+# tests directory.
+#
+# The order below is the order the patches were authored in: vllm_k3.patch and
+# vllm_pp_hidden_states.patch both edit vllm/models/kimi_k3/nvidia/model.py, and
+# the latter is generated against the tree the former produces. Either order
+# applies cleanly today — patch absorbs the ~80-line shift as an offset — so
+# listing them here is about not depending on that, and on glob order.
+#
+# Upstream intent differs per patch. Keep them separate so the upstream-candidate
+# ones can be format-patch'd out, and so a rebase onto a newer nightly shows
+# which hunks upstream has absorbed (a shrinking patch is the progress signal).
+
+# Ours indefinitely: Kimi-K3 model + env flag, not upstreamable as-is.
+vllm_k3.patch
+
+# Upstream candidate: per-PP-stage aux hidden-state capture, the prefill-only
+# extract path, and the PP completion barrier. Forward-ported onto this nightly
+# from an earlier working tree based on vLLM PR #50000 (head 0498dc7ea9204f18).
+# Adds SupportsPP to ExtractHiddenStatesModel, which is what lets
+# pipeline_parallel_size > 1 past ModelConfig.verify_with_parallel_config.
+vllm_pp_hidden_states.patch
