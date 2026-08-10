@@ -97,6 +97,12 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
     the abstract methods to support training with TTT.
     """
 
+    # Draft models intentionally never tie the input embedding to the draft LM head, and they do not
+    # call ``post_init()`` — which is where Transformers 5.x would otherwise populate this mapping.
+    # Without the declaration ``from_pretrained`` fails with an AttributeError while it filters tied
+    # parameters out of the missing keys.
+    all_tied_weights_keys = {}
+
     def __init__(self, config):
         super().__init__(config)
 
