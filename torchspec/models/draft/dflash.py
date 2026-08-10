@@ -366,8 +366,7 @@ class DFlashDraftModel(PreTrainedModel):
 
     config_class = DFlashConfig
     decoder_layer_class = DFlashDecoderLayer
-    # See ``Eagle3DraftModel.all_tied_weights_keys``: nothing is tied here either, and this model
-    # does not call ``post_init()``, so Transformers 5.x never gets to populate the mapping itself.
+    # See Eagle3DraftModel.all_tied_weights_keys.
     all_tied_weights_keys = {}
 
     def __init__(self, config: PretrainedConfig):

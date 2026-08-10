@@ -512,8 +512,6 @@ class TestDispatch(unittest.TestCase):
         self.assertIsInstance(cfg, DFlashConfig)
 
     def test_draft_class_name_resolves_to_dspark_config(self):
-        # "Qwen3DSparkModel" names the serving-side class; a generic DSpark draft config names
-        # the class this repo actually builds, and both must reach the same model.
         cfg = AutoDraftModelConfig.from_dict(
             {
                 "architectures": ["DSparkDraftModel"],

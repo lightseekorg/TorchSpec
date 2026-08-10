@@ -28,8 +28,7 @@ mean-of-means over/under-weights small ones relative to a true token-weighted
 mean.
 
 TestInitModelInitialDraft covers ``model.initial_draft_model_path``, the
-staged-training entry point: rank 0 loads a published draft into the freshly
-built model, and the target model's embedding is applied on top of it.
+staged-training entry point.
 """
 
 import tempfile
@@ -258,8 +257,6 @@ class TestInitModelInitialDraft(unittest.TestCase):
                 continue
             self.assertTrue(torch.equal(value, expected[key]), msg=f"{key} was not restored")
 
-        # load_embedding runs after the checkpoint, so the embedding is the target's, not the
-        # published draft's, and it stays frozen.
         self.assertTrue(torch.equal(trainer.draft_model.embed_tokens.weight, target_embedding))
         self.assertFalse(trainer.draft_model.embed_tokens.weight.requires_grad)
 

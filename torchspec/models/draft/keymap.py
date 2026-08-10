@@ -48,14 +48,10 @@ def to_export_keys(tensors: dict) -> dict:
 def to_internal_keys(tensors: dict, model_keys: Collection[str]) -> dict:
     """Rename exported draft keys back to internal names (reverse direction).
 
-    The forward direction is not injective across draft families: an Eagle3 draft owns a top-level
-    ``norm.*`` while a DFlash draft *exports* its ``final_norm.*`` under that same name, and the
-    same holds for ``fc.*`` (Eagle3's own) versus ``context_proj.*`` (DFlash's export name). So the
-    reverse rename is applied per key and only when the key is not already a parameter of
-    *model_keys*, which disambiguates by asking the model that is about to be loaded.
-
-    Keys that match neither spelling are passed through untouched, so the caller's own strictness
-    check is what reports them.
+    The forward direction is not injective across draft families -- an Eagle3 draft owns a
+    top-level ``norm.*``, which is also DFlash's export name for ``final_norm.*`` -- so a key is
+    only renamed when *model_keys* does not already contain it. Unknown keys pass through for the
+    caller's own strictness check to report.
     """
     model_keys = set(model_keys)
     remapped = {}

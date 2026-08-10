@@ -18,12 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Staged training off a published draft (``model.initial_draft_model_path``).
-
-Covers the three pieces the feature is made of: resolving the configured path to a
-``model.safetensors`` file, mapping a published draft's serving key names back to the internal
-ones, and the config plumbing that carries the path to the trainer.
-"""
+"""Staged training off a published draft (``model.initial_draft_model_path``)."""
 
 import tempfile
 import unittest
@@ -91,7 +86,7 @@ def _build(config_dict, seed):
 
 
 def _publish(model, directory: Path) -> Path:
-    """Write *model* out the way ``tools/convert_to_hf.py`` does, i.e. under serving key names."""
+    """Write *model* out the way ``tools/convert_to_hf.py`` does, under serving key names."""
     directory.mkdir(parents=True, exist_ok=True)
     save_file(to_export_keys(model.state_dict()), str(directory / "model.safetensors"))
     return directory
@@ -152,8 +147,8 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
         self._assert_matches(fresh, published)
 
     def test_loads_a_published_dflash_draft(self):
-        # DFlash exports `final_norm` as `norm` and `context_proj` as `fc`, which are the names an
-        # Eagle3 draft uses internally -- the reverse mapping has to disambiguate per model.
+        # DFlash exports `final_norm` as `norm` and `context_proj` as `fc`, both of which are
+        # names an Eagle3 draft uses internally.
         published = _build(_DFLASH, seed=0)
         directory = _publish(published, self.tmpdir / "dflash")
 
@@ -194,7 +189,6 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
 
 class TestToInternalKeys(unittest.TestCase):
     def test_leaves_a_key_the_model_already_owns_alone(self):
-        # `norm.weight` is Eagle3's own parameter *and* DFlash's export name for `final_norm`.
         eagle3_keys = {"norm.weight", "fc.weight", "midlayer.self_attn.q_proj.weight"}
         remapped = to_internal_keys(
             {
@@ -232,9 +226,8 @@ class TestConfigPlumbing(unittest.TestCase):
         self.assertEqual(args.initial_draft_model_path, "/drafts/published")
 
     def test_relative_path_is_absolutized_like_the_other_local_paths(self):
-        # Ray actors do not share the launcher's working directory, so the path has to be absolute
-        # by the time it reaches a trainer. Like output_dir, it resolves against the invocation
-        # CWD rather than the config file's directory.
+        # Ray actors do not share the launcher's working directory. Like output_dir, this resolves
+        # against the invocation CWD, not the config file's directory.
         tmpdir = _tmpdir(self)
         config_path = tmpdir / "train.yaml"
         config_path.write_text(

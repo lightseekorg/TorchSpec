@@ -90,8 +90,6 @@ class Eagle3Trainer(Trainer):
             )
 
         if dist.get_rank() == 0:
-            # Rank 0 holds the only materialised copy; the others init on meta and pick these
-            # weights up from the full state dict broadcast by fsdp2_load_full_state_dict below.
             initial_draft_model_path = getattr(self.args, "initial_draft_model_path", None)
             if initial_draft_model_path:
                 loaded_from = checkpoint.load_initial_draft_weights(
@@ -99,8 +97,7 @@ class Eagle3Trainer(Trainer):
                 )
                 logger.info(f"[Rank 0] Loaded initial draft weights from {loaded_from}")
 
-            # Always after the initial checkpoint: the embedding is the target model's, whatever a
-            # published draft happens to ship.
+            # Must stay after the initial checkpoint, so the target's embedding wins.
             draft_model.load_embedding(
                 target_model_path,
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens"),

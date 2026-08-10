@@ -20,11 +20,9 @@
 
 """``save_pretrained`` / ``from_pretrained`` round trip for every draft family.
 
-Draft models deliberately do not tie the input embedding to the draft LM head,
-and none of them call ``post_init()`` — which is where Transformers 5.x
-populates ``all_tied_weights_keys``. The two base classes therefore declare the
-mapping as empty; without it ``from_pretrained`` dies with an ``AttributeError``
-while filtering tied parameters out of the missing keys.
+No draft calls ``post_init()``, where Transformers 5.x populates
+``all_tied_weights_keys``, so without the base classes declaring it empty every
+one of these loads dies with an ``AttributeError``.
 """
 
 import tempfile
@@ -153,8 +151,7 @@ class TestFromPretrainedRoundTrip(unittest.TestCase):
                     )
 
     def test_embeddings_are_not_tied_to_the_lm_head(self):
-        # The empty mapping is only correct because nothing actually shares storage: an Eagle3 draft
-        # has its own (possibly pruned) vocabulary, so a tie would silently corrupt the LM head.
+        # Empty is only the correct mapping while this holds.
         model = _build(_LLAMA_EAGLE3)
         self.assertIsNot(model.embed_tokens.weight, model.lm_head.weight)
         self.assertNotEqual(model.embed_tokens.weight.shape, model.lm_head.weight.shape)
