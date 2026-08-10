@@ -187,6 +187,57 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
             load_initial_draft_weights(_build(_EAGLE3, seed=1), str(directory))
 
 
+class TestVocabMappingGuard(unittest.TestCase):
+    """A seeded draft's lm_head rows are ordered by the mapping that produced them."""
+
+    @staticmethod
+    def _mapping(used_tokens, target_vocab=128):
+        used = torch.tensor(used_tokens, dtype=torch.long)
+        t2d = torch.zeros(target_vocab, dtype=torch.bool)
+        t2d[used] = True
+        return used - torch.arange(len(used)), t2d
+
+    def _pruned_draft(self):
+        return _build({**_EAGLE3, "vocab_size": 128, "draft_vocab_size": 4}, seed=0)
+
+    def test_fresh_draft_accepts_any_mapping(self):
+        draft = self._pruned_draft()
+        self.assertFalse(draft.has_vocab_pruning)
+
+        d2t, t2d = self._mapping([3, 9, 40, 77])
+        draft.set_vocab_buffers(d2t, t2d)
+
+        self.assertTrue(draft.has_vocab_pruning)
+        self.assertTrue(torch.equal(draft.t2d, t2d))
+        self.assertTrue(torch.equal(draft.d2t, d2t))
+
+    def test_seeded_draft_accepts_the_same_mapping(self):
+        draft = self._pruned_draft()
+        d2t, t2d = self._mapping([3, 9, 40, 77])
+        draft.set_vocab_buffers(d2t, t2d)
+        draft.set_vocab_buffers(d2t.clone(), t2d.clone())
+
+    def test_seeded_draft_rejects_a_different_token_set(self):
+        draft = self._pruned_draft()
+        draft.set_vocab_buffers(*self._mapping([3, 9, 40, 77]))
+
+        with self.assertRaises(ValueError) as caught:
+            draft.set_vocab_buffers(*self._mapping([3, 9, 40, 78]))
+        self.assertIn("keep_initial_vocab_mapping", str(caught.exception))
+
+    def test_guard_survives_a_load_from_a_pruned_published_draft(self):
+        published = self._pruned_draft()
+        published.set_vocab_buffers(*self._mapping([3, 9, 40, 77]))
+        directory = _publish(published, _tmpdir(self) / "pruned")
+
+        fresh = self._pruned_draft()
+        load_initial_draft_weights(fresh, str(directory))
+        self.assertTrue(fresh.has_vocab_pruning)
+
+        with self.assertRaises(ValueError):
+            fresh.set_vocab_buffers(*self._mapping([3, 9, 40, 78]))
+
+
 class TestToInternalKeys(unittest.TestCase):
     def test_leaves_a_key_the_model_already_owns_alone(self):
         eagle3_keys = {"norm.weight", "fc.weight", "midlayer.self_attn.q_proj.weight"}
@@ -247,6 +298,26 @@ class TestConfigPlumbing(unittest.TestCase):
         loaded = load_config(config_path=str(config_path))
 
         self.assertEqual(loaded.model.initial_draft_model_path, f"{tmpdir}/published")
+
+    def test_keep_initial_vocab_mapping_requires_loaded_weights(self):
+        tmpdir = _tmpdir(self)
+        config_path = tmpdir / "train.yaml"
+        config_path.write_text("model:\n  keep_initial_vocab_mapping: true\n")
+
+        with self.assertRaises(ValueError):
+            load_config(config_path=str(config_path))
+
+    def test_keep_initial_vocab_mapping_accepted_with_a_seeded_draft(self):
+        tmpdir = _tmpdir(self)
+        config_path = tmpdir / "train.yaml"
+        config_path.write_text(
+            "model:\n"
+            "  keep_initial_vocab_mapping: true\n"
+            f"  initial_draft_model_path: {tmpdir}/published\n"
+        )
+        loaded = load_config(config_path=str(config_path))
+
+        self.assertTrue(loaded.model.keep_initial_vocab_mapping)
 
     def test_unset_path_stays_unset(self):
         tmpdir = _tmpdir(self)

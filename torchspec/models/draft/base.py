@@ -189,10 +189,29 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
 
     @torch.no_grad()
     def set_vocab_buffers(self, d2t: torch.Tensor, t2d: torch.Tensor) -> None:
-        """Set the t2d/d2t vocab mapping buffers directly from tensors."""
+        """Set the t2d/d2t vocab mapping buffers directly from tensors.
+
+        Refuses to replace a mapping that arrived with loaded weights. ``lm_head`` row j holds the
+        j-th target token selected by the mapping, and the target side is pruned with
+        ``target_lm_head_weight[t2d]`` in the same order, so swapping in a mapping that selects a
+        different token set repoints every row without touching the rows themselves.
+        """
         assert hasattr(self, "t2d") and hasattr(self, "d2t"), (
             "t2d and d2t buffers are not found in the draft model"
         )
+        if self.has_vocab_pruning and not (
+            torch.equal(self.t2d, t2d.to(self.t2d.device))
+            and torch.equal(self.d2t, d2t.to(self.d2t.device))
+        ):
+            raise ValueError(
+                "The draft was seeded from weights whose vocabulary mapping selects a different "
+                "token set than the one computed for this run. The loaded lm_head rows are "
+                "ordered by the old mapping, so replacing the buffers alone would silently "
+                "mistrain every row. Either set model.keep_initial_vocab_mapping=true to train "
+                "against the mapping the weights were built with, or drop "
+                "model.initial_draft_model_path / training.load_path and train the head from "
+                "scratch for the new mapping."
+            )
         self.t2d.copy_(t2d)
         self.d2t.copy_(d2t)
 

@@ -375,7 +375,12 @@ def train_async_no_generation(args):
     vocab_size = draft_model_config.vocab_size
     if draft_vocab_size is not None and draft_vocab_size != vocab_size:
         with timer.phase("Vocab mapping"):
-            if getattr(args, "inference_engine_type", None) == "offline":
+            if getattr(args, "keep_initial_vocab_mapping", False):
+                logger.info(
+                    "keep_initial_vocab_mapping=True: training against the mapping stored in the "
+                    "loaded draft weights, so no mapping is computed for this dataset"
+                )
+            elif getattr(args, "inference_engine_type", None) == "offline":
                 mapping_path = os.path.join(args.offline_data_path, "vocab_mapping.pt")
                 if not os.path.isfile(mapping_path):
                     raise FileNotFoundError(
@@ -392,10 +397,11 @@ def train_async_no_generation(args):
                 vocab_mapping = ray.get(
                     controller.compute_vocab_mapping.remote(vocab_size, draft_vocab_size)
                 )
-            logger.info(
-                f"Generated vocab mapping: "
-                f"d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
-            )
+            if vocab_mapping is not None:
+                logger.info(
+                    f"Generated vocab mapping: "
+                    f"d2t={vocab_mapping[0].shape}, t2d={vocab_mapping[1].shape}"
+                )
 
     # [7] Create training actors + inference engines (args now has num_train_steps)
     timer.begin_async("Actor initialization")
