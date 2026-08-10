@@ -28,6 +28,31 @@ logs the active mode once at configuration time:
 Once the base image carries PR #50487, drop this patch but keep exporting
 VLLM_KIMI_K3_AUX_ATTN_RES_STREAM=1, or the default flips back to prefix_only.
 
+Two fixes on top of #50487 make the capture invariant to the pipeline
+partition.  Background and derivations: docs/kimi_k3_attn_res_capture.md.
+
+PP boundary: the mixture for capture id ``k`` uses layer ``k``'s
+``self_attention_res_norm`` / ``_proj``, which for a non-last stage's
+``end_layer`` sit on the next rank.  #50487 falls back to the running prefix
+there, a different feature entirely (cosine 0.05-0.60 against the real mixture).
+Everything else the tap needs is local, so a non-last AttnRes stage now keeps a
+copy of those two hidden-size vectors (~28KB, unsharded), redirected out of the
+checkpoint by ``_maybe_boundary_attn_res_name`` before the PP filter drops them.
+Rejecting the boundary ids instead was the previous behaviour here; it does not
+survive mostly-PP sharding, since for the 93-layer stage-1 recipe every
+intermediate id is a stage end from pp=40 on.
+
+Zero delta after a handoff, found while measuring the above: ``attn_res`` only
+takes the fused native path when a ``delta`` is supplied, and the handoff folds
+the delta into the prefix, so the first layer of every non-first stage ran the
+Triton fallback -- ~0.008% of elements differ (max relative 7.6e-4) and the
+error compounds through the rest of the stack.  An explicit zero delta restores
+the dispatch, and is skipped for block-write layers, which never reach it.
+
+Verified on GB300 against the real kernel: the boundary tap is bit-identical to
+the PP=1 capture at every split point, and with the zero delta the whole
+two-stage run is bit-identical end to end (31 of 31 split points, from 4).
+
 Note: the v0.22.1 patch is not needed on this nightly:
 - flash_attn rotary import fix: upstream, the import is now guarded with
   ``suppress(ModuleNotFoundError)`` in
@@ -64,13 +89,58 @@ Apply:
      "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
 --- a/vllm/models/kimi_k3/nvidia/model.py
 +++ b/vllm/models/kimi_k3/nvidia/model.py
-@@ -1095,6 +1095,85 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+@@ -1066,6 +1066,23 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             if self.use_attn_res:
+                 self.output_attn_res_norm = PPMissingLayer()
+                 self.output_attn_res_proj = PPMissingLayer()
++                # An aux tap at ``end_layer`` needs that layer's mixture weights,
++                # which live on the next rank.  Two unsharded hidden-size vectors
++                # are cheaper to copy than the tap is to move.
++                self.boundary_attn_res_norm = RMSNorm(
++                    config.hidden_size, eps=config.rms_norm_eps
++                )
++                self.boundary_attn_res_proj = ReplicatedLinear(
++                    config.hidden_size,
++                    1,
++                    bias=False,
++                    quant_config=None,
++                    prefix=f"{prefix}.boundary_attn_res_proj",
++                )
++                # Sentinel: a checkpoint that never supplies these must fail
++                # rather than export a mixture over uninitialised memory.
++                self.boundary_attn_res_norm.weight.data.fill_(float("nan"))
++                self.boundary_attn_res_proj.weight.data.fill_(float("nan"))
+ 
+         world_size = get_tensor_model_parallel_world_size()
+         assert config.num_attention_heads % world_size == 0, (
+@@ -1095,6 +1112,106 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
              }
          )
  
 +    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
 +        super()._set_aux_hidden_state_layers(layers)
 +        if self.use_attn_res:
++            if (
++                self._aux_attn_res_stream
++                and not get_pp_group().is_last_rank
++                and self.end_layer in layers
++            ):
++                missing = [
++                    f"layers.{self.end_layer}.self_attention_res_{kind}.weight"
++                    for kind, param in (
++                        ("norm", self.boundary_attn_res_norm.weight),
++                        ("proj", self.boundary_attn_res_proj.weight),
++                    )
++                    if not torch.isfinite(param).all()
++                ]
++                if missing:
++                    raise ValueError(
++                        f"Kimi-K3 aux layer id {self.end_layer} is the end of PP "
++                        f"stage [{self.start_layer}, {self.end_layer}), so it "
++                        f"needs a copy of layer {self.end_layer}'s AttnRes "
++                        "mixture weights, but the checkpoint supplied no "
++                        f"{' and no '.join(missing)}."
++                    )
 +            # Emitted once, at configuration time. Which layers are tapped and
 +            # which convention is in force are the two things you need to
 +            # confirm from a running process, and neither is recoverable from
@@ -127,12 +197,12 @@ Apply:
 +            score_proj = self.output_attn_res_proj
 +            num_blocks = self.num_attn_res_blocks
 +        else:
-+            # Last layer of a non-final pipeline stage: the consumer lives on
-+            # the next rank and the output-side aggregation only exists on the
-+            # last one, so there is nothing here to mix against. Falling back
-+            # to the running prefix keeps the tap defined rather than reaching
-+            # for weights this rank does not construct.
-+            return prefix
++            # Consumer is layer ``end_layer`` on the next rank.  This is exact
++            # rather than approximate because ``num_attn_res_blocks`` is
++            # ``cdiv(end_layer, block_size)`` -- that layer's ``prev_valid_blocks``.
++            score_norm = self.boundary_attn_res_norm
++            score_proj = self.boundary_attn_res_proj
++            num_blocks = self.num_attn_res_blocks
 +
 +        return attn_res(
 +            prefix,
@@ -150,7 +220,22 @@ Apply:
      def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
          return self.embed_tokens(input_ids)
  
-@@ -1161,7 +1240,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+@@ -1146,6 +1263,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+                 block_residual[:, : residual.size(1), :].copy_(residual)
+             prefix_sum = hidden_states
+             hidden_states = None
++            if (
++                not get_pp_group().is_first_rank
++                and not self.layers[self.start_layer].is_block_write_layer
++            ):
++                # ``attn_res`` only takes its fused path when a delta is supplied,
++                # and the handoff folded this stage's away.  Without a stand-in
++                # the arithmetic depends on where the pipeline was cut.
++                hidden_states = torch.zeros_like(prefix_sum)
+             residual = block_residual
+ 
+         for layer_idx, layer in enumerate(
+@@ -1161,7 +1286,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
              if (layer_idx + 1) in self.aux_hidden_state_layers:
                  if self.use_attn_res:
                      assert prefix_sum is not None
@@ -162,3 +247,39 @@ Apply:
                  else:
                      assert residual is not None
                      aux_hidden_state = hidden_states + residual
+@@ -1213,6 +1341,21 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+             return hidden_states, aux_hidden_states
+         return hidden_states
+ 
++    def _maybe_boundary_attn_res_name(self, name: str) -> str | None:
++        """Map layer ``end_layer``'s two mixture weights onto the boundary copies.
++
++        Everything else about that layer still belongs to the next rank.
++        """
++        if not self.use_attn_res or get_pp_group().is_last_rank:
++            return None
++        for suffix, target in (
++            ("self_attention_res_norm.weight", "boundary_attn_res_norm.weight"),
++            ("self_attention_res_proj.weight", "boundary_attn_res_proj.weight"),
++        ):
++            if name.endswith(f"layers.{self.end_layer}.{suffix}"):
++                return target
++        return None
++
+     def load_weights(
+         self,
+         weights: Iterable[
+@@ -1290,6 +1433,13 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
+                 # Models trained using ColossalAI may include these tensors in
+                 # the checkpoint. Skip them.
+                 continue
++            boundary_name = self._maybe_boundary_attn_res_name(name)
++            if boundary_name is not None:
++                # Must precede the PP filter below, which would drop these.
++                param = params_dict[boundary_name]
++                default_weight_loader(param, loaded_weight)
++                loaded_params.add(boundary_name)
++                continue
+             for param_name, weight_name, shard_id in stacked_params_mapping:
+                 if weight_name not in name:
+                     continue

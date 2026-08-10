@@ -86,7 +86,9 @@ inference:
   inference_fetch_batch: 8
   max_sample_pool_size: 32
   store_last_hidden_states: true
-  # Must match target_layer_ids in the draft config above.
+  # Must match target_layer_ids in the draft config above.  These are the layers
+  # whose *output* is captured; the engine shifts them by +1 into the capture ids
+  # the model uses, so 7 means "the residual stream after layer 7 ran".
   aux_hidden_states_layers: [7, 31, 47, 63, 87]
   last_hidden_states_prenorm: true
 
