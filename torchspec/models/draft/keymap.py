@@ -22,6 +22,8 @@
 Mapping TorchSpec weight keys to HF / vLLM / SGLang serving names.
 """
 
+from typing import Collection
+
 DRAFT_WEIGHT_KEY_REMAP = [
     ("midlayer.", "layers.0."),
     ("context_proj.", "fc."),
@@ -39,5 +41,32 @@ def to_export_keys(tensors: dict) -> dict:
             if k.startswith(internal_prefix):
                 new_key = export_prefix + k[len(internal_prefix) :]
                 break
+        remapped[new_key] = v
+    return remapped
+
+
+def to_internal_keys(tensors: dict, model_keys: Collection[str]) -> dict:
+    """Rename exported draft keys back to internal names (reverse direction).
+
+    The forward direction is not injective across draft families: an Eagle3 draft owns a top-level
+    ``norm.*`` while a DFlash draft *exports* its ``final_norm.*`` under that same name, and the
+    same holds for ``fc.*`` (Eagle3's own) versus ``context_proj.*`` (DFlash's export name). So the
+    reverse rename is applied per key and only when the key is not already a parameter of
+    *model_keys*, which disambiguates by asking the model that is about to be loaded.
+
+    Keys that match neither spelling are passed through untouched, so the caller's own strictness
+    check is what reports them.
+    """
+    model_keys = set(model_keys)
+    remapped = {}
+    for k, v in tensors.items():
+        new_key = k
+        if k not in model_keys:
+            for internal_prefix, export_prefix in DRAFT_WEIGHT_KEY_REMAP:
+                if k.startswith(export_prefix):
+                    candidate = internal_prefix + k[len(export_prefix) :]
+                    if candidate in model_keys:
+                        new_key = candidate
+                        break
         remapped[new_key] = v
     return remapped

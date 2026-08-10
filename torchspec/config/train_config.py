@@ -84,6 +84,7 @@ class LoggingConfig:
 @dataclass
 class ModelConfig:
     draft_model_config: Optional[str] = None
+    initial_draft_model_path: Optional[str] = None
     embedding_key: str = "model.embed_tokens.weight"
     lm_head_key: str = "lm_head.weight"
     norm_key: str = "model.norm.weight"
@@ -209,6 +210,7 @@ _ALWAYS_LOCAL_PATH_KEYS = (
     "cache_dir",
     "model_download_dir",
     "inference.offline.data_path",
+    "model.initial_draft_model_path",
 )
 _DATA_PATH_KEYS = ("dataset.train_data_path", "dataset.eval_data_path")
 

@@ -29,9 +29,11 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from safetensors import safe_open
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
+from torchspec.models.draft.keymap import to_internal_keys
 from torchspec.utils.logging import logger
 
 
@@ -112,6 +114,46 @@ def _write_checkpoint_metadata(path: Path, metadata: dict[str, Any]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     tmp_path.replace(path)
+
+
+def resolve_initial_draft_checkpoint(path: str) -> Path:
+    """Resolve ``model.initial_draft_model_path`` to the ``model.safetensors`` file it names.
+
+    Either the file itself or the published draft directory holding it is accepted; anything else
+    is rejected rather than silently ignored, since a typo here would otherwise start a full
+    training run from random weights.
+    """
+    checkpoint_path = Path(path).expanduser()
+    if checkpoint_path.is_dir():
+        checkpoint_path = checkpoint_path / "model.safetensors"
+    if checkpoint_path.suffix != ".safetensors" or not checkpoint_path.is_file():
+        raise ValueError(
+            "initial_draft_model_path must be a serving-format model.safetensors file "
+            f"(or the directory holding it), got {path!r}"
+        )
+    return checkpoint_path
+
+
+def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
+    """Load a published draft checkpoint into a freshly constructed draft model.
+
+    This is the staged-training entry point, and is unrelated to ``load()`` below: there is no
+    optimizer or scheduler state to restore, only weights, and the source is a published draft
+    rather than a training checkpoint. Published drafts carry the serving key names that
+    ``tools/convert_to_hf.py`` writes, so the keys are mapped back first.
+
+    Loading is strict in both directions -- a checkpoint that does not line up with the configured
+    draft would otherwise leave part of the model randomly initialised, which costs a whole run to
+    notice.
+    """
+    checkpoint_path = resolve_initial_draft_checkpoint(path)
+    with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
+        tensors = {key: f.get_tensor(key) for key in f.keys()}
+
+    draft_model.load_state_dict(
+        to_internal_keys(tensors, draft_model.state_dict().keys()), strict=True
+    )
+    return checkpoint_path
 
 
 def load(actor: Any) -> dict[str, Any] | None:
