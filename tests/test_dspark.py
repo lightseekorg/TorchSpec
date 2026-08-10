@@ -40,7 +40,7 @@ import unittest
 
 import torch
 
-from torchspec.models.draft.auto import AutoDraftModelConfig
+from torchspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.models.draft.dspark import (
     AcceptRatePredictor,
@@ -510,6 +510,28 @@ class TestDispatch(unittest.TestCase):
         # Subclass of DFlashConfig -> any isinstance(DFlashConfig) dispatch must
         # test DSparkConfig first (trainer_actor / train_entry rely on this).
         self.assertIsInstance(cfg, DFlashConfig)
+
+    def test_draft_class_name_resolves_to_dspark_config(self):
+        # "Qwen3DSparkModel" names the serving-side class; a generic DSpark draft config names
+        # the class this repo actually builds, and both must reach the same model.
+        cfg = AutoDraftModelConfig.from_dict(
+            {
+                "architectures": ["DSparkDraftModel"],
+                "model_type": "qwen3_dspark",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "num_hidden_layers": 1,
+                "num_target_layers": 2,
+                "markov_rank": 16,
+                "enable_confidence_head": True,
+            }
+        )
+        self.assertIsInstance(cfg, DSparkConfig)
+        model = AutoEagle3DraftModel.from_config(cfg, torch_dtype=torch.float32)
+        self.assertIsInstance(model, DSparkDraftModel)
 
     def test_k3_json_resolves_to_k3_config(self):
         cfg = AutoDraftModelConfig.from_dict(

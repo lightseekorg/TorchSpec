@@ -85,7 +85,10 @@ class AutoDraftModelConfig:
         "LlamaForCausalLMEagle3": LlamaConfig,
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "DFlashDraftModel": DFlashConfig,
+        # "Qwen3DSparkModel" is the serving-side architecture name; "DSparkDraftModel" is the
+        # class a generic (non-Qwen3) DSpark draft config would name. Both build DSparkDraftModel.
         "Qwen3DSparkModel": DSparkConfig,
+        "DSparkDraftModel": DSparkConfig,
         "K3DSparkModel": K3DSparkConfig,
     }
 
