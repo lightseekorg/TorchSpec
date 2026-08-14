@@ -291,6 +291,15 @@ def _validate_offline_config(config: DictConfig) -> None:
             raise ValueError("inference.offline.num_engines must be positive")
 
 
+def _validate_training_batch_config(config: DictConfig) -> None:
+    if config.training.micro_batch_size < 1:
+        raise ValueError(
+            "training.micro_batch_size must be positive (>= 1): a value of 0 yields "
+            "dispatch_batch_size=0, so try_dispatch_batch no-op-dispatches and every rank "
+            "blocks on the data queue, surfacing as an NCCL all-gather timeout"
+        )
+
+
 def _save_config_snapshot(config: DictConfig) -> None:
     """Save the resolved config to output_dir/config.yaml if output_dir is set."""
     output_dir = OmegaConf.select(config, "output_dir", default=None)
@@ -337,6 +346,7 @@ def load_config(
     _validate_vllm_config(config)
     _validate_offline_config(config)
     _validate_vocab_mapping_config(config)
+    _validate_training_batch_config(config)
 
     if save_snapshot:
         _save_config_snapshot(config)
