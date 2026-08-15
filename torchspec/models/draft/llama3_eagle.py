@@ -1158,7 +1158,7 @@ class _EagleMaskedFlashAttnFunc(torch.autograd.Function):
             direction="kv",
         )
 
-        out, lse = _flash_attn_fwd(
+        out, lse, *_rest = _flash_attn_fwd(
             q,
             k,
             v,
