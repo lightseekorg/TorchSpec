@@ -1,0 +1,210 @@
+name: Tests
+
+# On-demand CI. Runs only when a user with WRITE access adds the `run-tests`
+# label to a PR (or via the manual "Run workflow" button). Nothing runs on
+# push or PR-open.
+#
+# Re-running: the label is auto-removed at the start, so re-adding `run-tests`
+# re-runs; you can also use "Re-run jobs", or workflow_dispatch below.
+on:
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to test"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  authorize:
+    name: Authorize
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-tests'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    outputs:
+      pr: ${{ steps.ctx.outputs.pr }}
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      # Requirement: only users with WRITE (merge) access may run tests.
+      # Applying a label needs only "triage", so verify the actor here.
+      - name: Require write access
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actor = context.eventName === 'workflow_dispatch'
+              ? context.actor
+              : context.payload.sender.login;
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner, repo: context.repo.repo, username: actor,
+            });
+            if (!['admin', 'write'].includes(data.permission)) {
+              core.setFailed(`@${actor} lacks write access (has: ${data.permission}).`);
+            }
+
+      - name: Resolve PR number
+        id: ctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.eventName === 'workflow_dispatch'
+              ? Number(context.payload.inputs.pr)
+              : context.payload.pull_request.number;
+            core.setOutput('pr', pr);
+
+      - name: Resolve PR head SHA
+        id: head
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: ${{ steps.ctx.outputs.pr }},
+            });
+            core.setOutput('sha', data.head.sha);
+
+      - name: Mark status pending
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: '${{ steps.head.outputs.sha }}', state: 'pending',
+              context: 'cpu-tests', description: 'Running…',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+  test:
+    name: CPU tests (Python 3.12, no GPU)
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install CPU torch + dev deps + report tooling
+        run: |
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -e ".[dev]" pytest-html
+
+      - name: Run CPU-safe test suite
+        # This is a CPU smoke tier; the following require a GPU/CUDA stack and
+        # are covered by the GPU tier instead:
+        #
+        #   Import-time pollution:
+        #     test_placement_group   - stubs sys.modules["ray"] at import,
+        #                              poisoning the process; run separately below.
+        #   Backends not installed here:
+        #     test_vllm_engine, test_sgl_engine_factory
+        #   Import torchspec.inference.engine -> mooncake store.so, which needs
+        #   the real CUDA driver (libcuda symbols) absent on a GPU-less runner:
+        #     test_connector_slot_mapping, test_eagle3_trainer, test_hf_runner,
+        #     test_mooncake_force_delete, test_sgl_engine_decode, test_hf_engine,
+        #     test_offline_replay, test_save_config, test_dflash
+        #   Genuine GPU ops (.cuda(), CUDA memory stats, inductor):
+        #     test_build_eagle3_block_mask, test_flex_attention
+        run: |
+          pytest tests/ -q -p no:cacheprovider \
+            --ignore=tests/test_placement_group.py \
+            --ignore=tests/test_vllm_engine.py \
+            --ignore=tests/test_sgl_engine_factory.py \
+            --ignore=tests/test_connector_slot_mapping.py \
+            --ignore=tests/test_eagle3_trainer.py \
+            --ignore=tests/test_hf_runner.py \
+            --ignore=tests/test_mooncake_force_delete.py \
+            --ignore=tests/test_sgl_engine_decode.py \
+            --ignore=tests/test_hf_engine.py \
+            --ignore=tests/test_offline_replay.py \
+            --ignore=tests/test_save_config.py \
+            --ignore=tests/test_dflash.py \
+            --ignore=tests/test_build_eagle3_block_mask.py \
+            --ignore=tests/test_flex_attention.py \
+            --junit-xml=junit-main.xml \
+            --html=report-main.html --self-contained-html
+
+      - name: Run import-isolating tests in their own process
+        if: always()
+        run: |
+          pytest tests/test_placement_group.py -q -p no:cacheprovider \
+            --junit-xml=junit-isolated.xml \
+            --html=report-isolated.html --self-contained-html
+
+      - name: Upload HTML + JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            report-*.html
+            junit-*.xml
+
+  report:
+    name: Publish results
+    needs: [authorize, test]
+    if: always() && needs.authorize.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      statuses: write
+      pull-requests: write
+    steps:
+      # Base checkout (no PR code) gives dorny/test-reporter a git context.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: test-reports
+
+      - name: Remove trigger label (re-add it to re-run)
+        if: github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: ${{ needs.authorize.outputs.pr }}, name: 'run-tests',
+            });
+
+      - name: Publish JUnit report as a check
+        continue-on-error: true
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2  # v3.0.0
+        with:
+          name: pytest results
+          path: junit-*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Publish final commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ok = '${{ needs.test.result }}' === 'success';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: '${{ needs.authorize.outputs.sha }}',
+              state: ok ? 'success' : 'failure', context: 'cpu-tests',
+              description: ok ? 'Passed' : 'Failed',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            if (!ok) core.setFailed('Tests failed');
