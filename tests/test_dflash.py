@@ -807,7 +807,7 @@ class TestDFlashVerifierNorm(unittest.TestCase):
         def _capture(**kwargs):
             seen["last_hidden_states"] = kwargs["last_hidden_states"]
             zero = torch.zeros((), device="cuda")
-            return zero, zero, zero, zero, zero, {}
+            return zero, zero, zero, zero, zero, {}, (zero, zero)
 
         trainer.model = _capture
         last_hidden_states = torch.randn(1, 3, 4, device="cuda")
@@ -835,7 +835,7 @@ class TestDFlashVerifierNorm(unittest.TestCase):
         def _capture(**kwargs):
             seen["last_hidden_states"] = kwargs["last_hidden_states"]
             zero = torch.zeros((), device="cuda")
-            return zero, zero, zero, zero, zero, {}
+            return zero, zero, zero, zero, zero, {}, (zero, zero)
 
         trainer.model = _capture
         last_hidden_states = torch.randn(1, 3, 4, device="cuda")
@@ -861,7 +861,7 @@ class TestDFlashVerifierNorm(unittest.TestCase):
         def _capture(**kwargs):
             seen["last_hidden_states"] = kwargs["last_hidden_states"]
             zero = torch.zeros((), device="cuda")
-            return zero, zero, zero, zero, zero, {}
+            return zero, zero, zero, zero, zero, {}, (zero, zero)
 
         trainer.model = _capture
         trainer._forward(
