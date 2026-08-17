@@ -1,0 +1,194 @@
+name: GPU Integration
+
+# GPU jobs execute PR code and therefore require an explicit WRITE-access
+# maintainer trigger. The selected runner must be ephemeral and must not expose
+# host credentials, a Docker socket, or writable shared caches to the job.
+# Repository setup must provide the `run-gpu-tests` label and an ephemeral
+# runner matching `TORCHSPEC_GPU_RUNNER_LABEL` (default: torchspec-gb200-1gpu).
+on:
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to test"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-integration-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.label.name || 'manual' }}
+  cancel-in-progress: true
+
+jobs:
+  authorize:
+    name: Authorize
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-gpu-tests'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      pr: ${{ steps.ctx.outputs.pr }}
+      head_sha: ${{ steps.source.outputs.head_sha }}
+      merge_sha: ${{ steps.source.outputs.merge_sha }}
+    steps:
+      - name: Require write access
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        with:
+          script: |
+            const actor = context.eventName === 'workflow_dispatch'
+              ? context.actor
+              : context.payload.sender.login;
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner, repo: context.repo.repo, username: actor,
+            });
+            if (!['admin', 'write'].includes(data.permission)) {
+              core.setFailed(`@${actor} lacks write access (has: ${data.permission}).`);
+            }
+
+      - name: Resolve PR number
+        id: ctx
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        with:
+          script: |
+            const pr = context.eventName === 'workflow_dispatch'
+              ? Number(context.payload.inputs.pr)
+              : context.payload.pull_request.number;
+            if (!Number.isInteger(pr) || pr <= 0) {
+              core.setFailed(`Invalid PR number: ${context.payload.inputs?.pr}`);
+              return;
+            }
+            core.setOutput('pr', pr);
+
+      - name: Resolve immutable PR source
+        id: source
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        with:
+          script: |
+            const { data } = await github.rest.pulls.get({
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: ${{ steps.ctx.outputs.pr }},
+            });
+            if (data.state !== 'open') {
+              core.setFailed(`PR #${data.number} is ${data.state}; only open PRs can be tested.`);
+              return;
+            }
+            const merge = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo,
+              ref: `pull/${data.number}/merge`,
+            });
+            const commit = await github.rest.git.getCommit({
+              owner: context.repo.owner, repo: context.repo.repo,
+              commit_sha: merge.data.object.sha,
+            });
+            if (!commit.data.parents.some(parent => parent.sha === data.head.sha)) {
+              core.setFailed('PR changed while its merge commit was being resolved; re-run the test.');
+              return;
+            }
+            core.setOutput('head_sha', data.head.sha);
+            core.setOutput('merge_sha', merge.data.object.sha);
+
+      - name: Mark status pending
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: '${{ steps.source.outputs.head_sha }}', state: 'pending',
+              context: 'gpu-integration/vllm', description: 'Waiting for GB200 runner…',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+  integration:
+    name: vLLM + Mooncake (GB200, 1 GPU)
+    needs: authorize
+    runs-on: ${{ vars.TORCHSPEC_GPU_RUNNER_LABEL || 'torchspec-gb200-1gpu' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TORCHSPEC_CI_MODEL: ${{ vars.TORCHSPEC_CI_MODEL || 'Qwen/Qwen3-8B' }}
+    steps:
+      - name: Checkout PR merge
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ needs.authorize.outputs.merge_sha }}
+
+      - name: Set isolated runtime paths
+        run: |
+          echo "HF_HOME=$RUNNER_TEMP/huggingface" >> "$GITHUB_ENV"
+          echo "TORCHSPEC_CI_ARTIFACT_DIR=$RUNNER_TEMP/torchspec-gpu-integration" >> "$GITHUB_ENV"
+
+      - name: Record runtime provenance
+        run: |
+          set -euo pipefail
+          mkdir -p "$TORCHSPEC_CI_ARTIFACT_DIR"
+          nvidia-smi | tee "$TORCHSPEC_CI_ARTIFACT_DIR/nvidia-smi.txt"
+          python3 - <<'PY' | tee "$TORCHSPEC_CI_ARTIFACT_DIR/runtime.txt"
+          import platform
+          import torch
+          import vllm
+
+          print(f"platform={platform.platform()}")
+          print(f"python={platform.python_version()}")
+          print(f"torch={torch.__version__}")
+          print(f"torch_cuda={torch.version.cuda}")
+          print(f"vllm={vllm.__version__}")
+          print(f"cuda_devices={torch.cuda.device_count()}")
+          if not torch.cuda.is_available():
+              raise SystemExit("CUDA is unavailable")
+          PY
+
+      - name: Install PR source without changing image dependencies
+        run: python3 -m pip install --no-deps -e .
+
+      - name: Run vLLM hidden-state and Mooncake integration
+        run: tools/ci/run_vllm_mooncake_integration.sh
+
+      - name: Upload integration artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: gpu-integration-${{ needs.authorize.outputs.head_sha }}
+          path: ${{ runner.temp }}/torchspec-gpu-integration
+          if-no-files-found: warn
+
+  report:
+    name: Publish GPU result
+    needs: [authorize, integration]
+    if: always() && needs.authorize.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Remove trigger label
+        if: github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        with:
+          script: |
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: ${{ needs.authorize.outputs.pr }}, name: 'run-gpu-tests',
+            });
+
+      - name: Publish final commit status
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        with:
+          script: |
+            const ok = '${{ needs.integration.result }}' === 'success';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner, repo: context.repo.repo,
+              sha: '${{ needs.authorize.outputs.head_sha }}',
+              state: ok ? 'success' : 'failure',
+              context: 'gpu-integration/vllm',
+              description: ok ? 'Passed on GB200' : 'Failed on GB200',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            if (!ok) core.setFailed('GPU integration failed');

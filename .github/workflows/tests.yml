@@ -3,8 +3,9 @@ name: Tests
 # On-demand CI. Runs only when a user with WRITE access adds the `run-tests`
 # label to a PR (or via the manual "Run workflow" button). Nothing runs on
 # push or PR-open.
+# Repository setup must provide the `run-tests` label before the first run.
 #
-# Re-running: the label is auto-removed at the start, so re-adding `run-tests`
+# Re-running: the label is auto-removed after the run, so re-adding `run-tests`
 # re-runs; you can also use "Re-run jobs", or workflow_dispatch below.
 on:
   pull_request_target:
@@ -18,6 +19,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cpu-tests-${{ github.event.pull_request.number || inputs.pr }}-${{ github.event.label.name || 'manual' }}
+  cancel-in-progress: true
+
 jobs:
   authorize:
     name: Authorize
@@ -27,15 +32,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read
       statuses: write
     outputs:
       pr: ${{ steps.ctx.outputs.pr }}
-      sha: ${{ steps.head.outputs.sha }}
+      head_sha: ${{ steps.source.outputs.head_sha }}
+      merge_sha: ${{ steps.source.outputs.merge_sha }}
     steps:
       # Requirement: only users with WRITE (merge) access may run tests.
       # Applying a label needs only "triage", so verify the actor here.
       - name: Require write access
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
         with:
           script: |
             const actor = context.eventName === 'workflow_dispatch'
@@ -50,32 +57,53 @@ jobs:
 
       - name: Resolve PR number
         id: ctx
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
         with:
           script: |
             const pr = context.eventName === 'workflow_dispatch'
               ? Number(context.payload.inputs.pr)
               : context.payload.pull_request.number;
+            if (!Number.isInteger(pr) || pr <= 0) {
+              core.setFailed(`Invalid PR number: ${context.payload.inputs?.pr}`);
+              return;
+            }
             core.setOutput('pr', pr);
 
-      - name: Resolve PR head SHA
-        id: head
-        uses: actions/github-script@v7
+      - name: Resolve immutable PR source
+        id: source
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
         with:
           script: |
             const { data } = await github.rest.pulls.get({
               owner: context.repo.owner, repo: context.repo.repo,
               pull_number: ${{ steps.ctx.outputs.pr }},
             });
-            core.setOutput('sha', data.head.sha);
+            if (data.state !== 'open') {
+              core.setFailed(`PR #${data.number} is ${data.state}; only open PRs can be tested.`);
+              return;
+            }
+            const merge = await github.rest.git.getRef({
+              owner: context.repo.owner, repo: context.repo.repo,
+              ref: `pull/${data.number}/merge`,
+            });
+            const commit = await github.rest.git.getCommit({
+              owner: context.repo.owner, repo: context.repo.repo,
+              commit_sha: merge.data.object.sha,
+            });
+            if (!commit.data.parents.some(parent => parent.sha === data.head.sha)) {
+              core.setFailed('PR changed while its merge commit was being resolved; re-run the test.');
+              return;
+            }
+            core.setOutput('head_sha', data.head.sha);
+            core.setOutput('merge_sha', merge.data.object.sha);
 
       - name: Mark status pending
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
         with:
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ steps.head.outputs.sha }}', state: 'pending',
+              sha: '${{ steps.source.outputs.head_sha }}', state: 'pending',
               context: 'cpu-tests', description: 'Running…',
               target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
@@ -88,15 +116,16 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
-          ref: ${{ needs.authorize.outputs.sha }}
+          # Exercise the PR as merged with the current base branch.
+          ref: ${{ needs.authorize.outputs.merge_sha }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.12"
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
 
       - name: Install CPU torch + dev deps + report tooling
         run: |
@@ -147,7 +176,7 @@ jobs:
 
       - name: Upload HTML + JUnit reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: test-reports
           path: |
@@ -165,20 +194,20 @@ jobs:
       pull-requests: write
     steps:
       # Base checkout (no PR code) gives dorny/test-reporter a git context.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           persist-credentials: false
 
       - name: Download reports
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: test-reports
 
       - name: Remove trigger label (re-add it to re-run)
         if: github.event_name != 'workflow_dispatch'
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
         with:
           script: |
             await github.rest.issues.removeLabel({
@@ -196,13 +225,13 @@ jobs:
           fail-on-error: false
 
       - name: Publish final commit status
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
         with:
           script: |
             const ok = '${{ needs.test.result }}' === 'success';
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ needs.authorize.outputs.sha }}',
+              sha: '${{ needs.authorize.outputs.head_sha }}',
               state: ok ? 'success' : 'failure', context: 'cpu-tests',
               description: ok ? 'Passed' : 'Failed',
               target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,

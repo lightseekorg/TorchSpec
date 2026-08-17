@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai:v0.22.1
+FROM vllm/vllm-openai:v0.22.1@sha256:953d3a06d5e64ab582985cd7401289d3abf2a2c14ef2158e9a84313daeec77d7
 
 WORKDIR /root/
 
