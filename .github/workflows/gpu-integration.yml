@@ -38,7 +38,7 @@ jobs:
       merge_sha: ${{ steps.source.outputs.merge_sha }}
     steps:
       - name: Require write access
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
             const actor = context.eventName === 'workflow_dispatch'
@@ -53,7 +53,7 @@ jobs:
 
       - name: Resolve PR number
         id: ctx
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
             const pr = context.eventName === 'workflow_dispatch'
@@ -67,7 +67,7 @@ jobs:
 
       - name: Resolve immutable PR source
         id: source
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
             const { data } = await github.rest.pulls.get({
@@ -94,7 +94,7 @@ jobs:
             core.setOutput('merge_sha', merge.data.object.sha);
 
       - name: Mark status pending
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -115,7 +115,7 @@ jobs:
       TORCHSPEC_CI_MODEL: ${{ vars.TORCHSPEC_CI_MODEL || 'Qwen/Qwen3-8B' }}
     steps:
       - name: Checkout PR merge
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
           ref: ${{ needs.authorize.outputs.merge_sha }}
 
@@ -170,7 +170,7 @@ jobs:
       - name: Remove trigger label
         if: github.event_name != 'workflow_dispatch'
         continue-on-error: true
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
             await github.rest.issues.removeLabel({
@@ -179,7 +179,7 @@ jobs:
             });
 
       - name: Publish final commit status
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
             const ok = '${{ needs.integration.result }}' === 'success';
