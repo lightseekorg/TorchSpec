@@ -25,7 +25,9 @@ training:
   learning_rate: 1e-4
   max_concurrent_batches: 1
   max_grad_norm: 0.5
-  max_seq_length: 512
+  # The repository sample dataset contains a 12,913-token conversation.
+  # Keep the complete final supervised turn instead of truncating it away.
+  max_seq_length: 16384
   num_epochs: 1
   prefetch_depth: 1
   save_interval: 0
@@ -59,8 +61,9 @@ inference:
     extra_args:
       enforce_eager: true
       language_model_only: true
-      max_model_len: 512
-      max_num_batched_tokens: 512
+      max_model_len: 16384
+      # Exercise vLLM chunked prefill for the long-context sample.
+      max_num_batched_tokens: 4096
 
 mooncake:
   master_server_address: null

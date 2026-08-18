@@ -23,6 +23,7 @@ srun --gpus=2 \
     set -euo pipefail
     export RUNNER_TEMP=/ci-tmp
     export HF_HOME=/ci-tmp/huggingface
+    export PYTHONPATH="/workspace${PYTHONPATH:+:${PYTHONPATH}}"
     export TORCHSPEC_CI_ARTIFACT_DIR=/artifacts
     export TORCHSPEC_CI_MODEL_PATH="/model-cache/snapshots/${TORCHSPEC_CI_MODEL_REVISION}"
     export TORCHSPEC_CI_MODEL_CACHE=/ci-tmp/huggingface
@@ -46,6 +47,5 @@ if torch.cuda.device_count() != 2:
 PY
 
     cd /workspace
-    python3 -m pip install --no-deps -e .
     tools/ci/run_2gpu_training_smoke.sh
   '
