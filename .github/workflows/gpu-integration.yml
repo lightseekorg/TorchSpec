@@ -1,10 +1,8 @@
 name: GPU Integration
 
 # GPU jobs execute PR code and therefore require an explicit WRITE-access
-# maintainer trigger. The selected runner must be ephemeral and must not expose
-# host credentials, a Docker socket, or writable shared caches to the job.
-# Repository setup must provide the `run-gpu-tests` label and an ephemeral
-# runner matching `TORCHSPEC_GPU_RUNNER_LABEL` (default: torchspec-gb200-2gpu).
+# maintainer trigger. A trusted login-node runner dispatches the selected merge
+# commit into an isolated Inkwell Slurm container allocation.
 on:
   pull_request_target:
     types: [labeled]
@@ -107,56 +105,50 @@ jobs:
   integration:
     name: Qwen3.8 Eagle3 + DSpark (GB200, 2 GPUs)
     needs: authorize
-    runs-on: ${{ vars.TORCHSPEC_GPU_RUNNER_LABEL || 'torchspec-gb200-2gpu' }}
-    timeout-minutes: 180
+    runs-on: slurm-dispatch
+    timeout-minutes: 720
     permissions:
       contents: read
     env:
       TORCHSPEC_CI_MODEL: ${{ vars.TORCHSPEC_CI_MODEL || 'Qwen/Qwen3.8-27B' }}
       TORCHSPEC_CI_MODEL_REVISION: ${{ vars.TORCHSPEC_CI_MODEL_REVISION || '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0' }}
+      TORCHSPEC_CI_SOURCE_SHA: ${{ needs.authorize.outputs.merge_sha }}
     steps:
-      - name: Checkout PR merge
+      - name: Checkout trusted dispatcher
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout PR merge without credentials
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
           ref: ${{ needs.authorize.outputs.merge_sha }}
+          path: source
+          persist-credentials: false
 
-      - name: Set isolated runtime paths
+      - name: Submit and wait for Inkwell Slurm integration
+        run: >-
+          trusted/tools/ci/dispatch_inkwell_slurm.sh
+          "$GITHUB_WORKSPACE/source"
+          "$RUNNER_TEMP/slurm-report"
+
+      - name: Publish Slurm summary
+        if: always()
         run: |
-          echo "HF_HOME=$RUNNER_TEMP/huggingface" >> "$GITHUB_ENV"
-          echo "TORCHSPEC_CI_ARTIFACT_DIR=$RUNNER_TEMP/torchspec-2gpu-training" >> "$GITHUB_ENV"
-
-      - name: Record runtime provenance
-        run: |
-          set -euo pipefail
-          mkdir -p "$TORCHSPEC_CI_ARTIFACT_DIR"
-          nvidia-smi | tee "$TORCHSPEC_CI_ARTIFACT_DIR/nvidia-smi.txt"
-          python3 - <<'PY' | tee "$TORCHSPEC_CI_ARTIFACT_DIR/runtime.txt"
-          import platform
-          import torch
-          import vllm
-
-          print(f"platform={platform.platform()}")
-          print(f"python={platform.python_version()}")
-          print(f"torch={torch.__version__}")
-          print(f"torch_cuda={torch.version.cuda}")
-          print(f"vllm={vllm.__version__}")
-          print(f"cuda_devices={torch.cuda.device_count()}")
-          if torch.cuda.device_count() != 2:
-              raise SystemExit("Expected exactly two visible CUDA devices")
-          PY
-
-      - name: Install PR source without changing image dependencies
-        run: python3 -m pip install --no-deps -e .
-
-      - name: Run Qwen3.8 Eagle3 and DSpark training smokes
-        run: tools/ci/run_2gpu_training_smoke.sh
+          if [[ -f "$RUNNER_TEMP/slurm-report/summary.md" ]]; then
+            cat "$RUNNER_TEMP/slurm-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Slurm dispatcher exited before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload integration artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: gpu-training-2gpu-${{ needs.authorize.outputs.head_sha }}
-          path: ${{ runner.temp }}/torchspec-2gpu-training
+          path: ${{ runner.temp }}/slurm-report
           if-no-files-found: warn
 
   report:

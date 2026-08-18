@@ -47,6 +47,23 @@ print(f"CI_SAMPLE_INPUT={sample['input']}")
 print(f"CI_SAMPLE_TARGET_OUTPUT={sample['target_output']}")
 PY
 
+expected_steps="$(python3 - "${fixture}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+records = [
+    json.loads(line)
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+if not records:
+    raise SystemExit("CI fixture must contain at least one training record")
+print(len(records))
+PY
+)"
+echo "CI_EPOCH_OPTIMIZER_STEPS=${expected_steps}"
+
 if [[ -n "${TORCHSPEC_CI_MODEL_PATH:-}" ]]; then
   model_snapshot="${TORCHSPEC_CI_MODEL_PATH}"
 else
@@ -93,7 +110,7 @@ run_lane() {
     cache_dir="${lane_dir}/cache" \
     2>&1 | tee "${train_log}"
 
-  python3 - "${lane}" "${train_log}" "${lane_dir}/step-losses.json" <<'PY'
+  python3 - "${lane}" "${train_log}" "${lane_dir}/step-losses.json" "${expected_steps}" <<'PY'
 import json
 import math
 import re
@@ -108,7 +125,7 @@ for line in Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").spli
     if match:
         losses.append({"step": int(match.group(1)), "loss": float(match.group(2))})
 
-expected_steps = [1, 2]
+expected_steps = list(range(1, int(sys.argv[4]) + 1))
 if [item["step"] for item in losses] != expected_steps:
     raise SystemExit(f"{lane}: expected losses for steps {expected_steps}, got {losses}")
 if not all(math.isfinite(item["loss"]) and item["loss"] > 0 for item in losses):

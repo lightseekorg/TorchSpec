@@ -27,7 +27,6 @@ training:
   max_grad_norm: 0.5
   max_seq_length: 256
   num_epochs: 1
-  num_train_steps: 2
   prefetch_depth: 1
   save_interval: 0
   save_per_epoch: false
