@@ -38,11 +38,11 @@ jobs:
           fi
 
           mapfile -t changed_files < <(
-            git log --since='24 hours ago' --name-only --pretty=format: -- \
+            git log --since="24 hours ago" --name-only --pretty=format: -- \
               torchspec configs tools tests docker pyproject.toml uv.lock \
               .github/workflows/gpu-integration.yml \
               .github/workflows/gpu-nightly.yml \
-              | sed '/^[[:space:]]*$/d' | sort -u
+              | sed "/^[[:space:]]*$/d" | sort -u
           )
           if ((${#changed_files[@]} == 0)); then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
