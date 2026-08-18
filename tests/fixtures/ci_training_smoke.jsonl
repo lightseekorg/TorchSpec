@@ -1,0 +1,4 @@
+{"id":"ci_math","conversations":[{"role":"user","content":"What is 2 + 3? Answer in one short sentence."},{"role":"assistant","content":"2 + 3 equals 5."}]}
+{"id":"ci_code","conversations":[{"role":"user","content":"What does a Python list store? Answer briefly."},{"role":"assistant","content":"A Python list stores an ordered, mutable sequence of objects."}]}
+{"id":"ci_systems","conversations":[{"role":"user","content":"Name one benefit of caching in one sentence."},{"role":"assistant","content":"Caching reduces repeated work and can lower response latency."}]}
+{"id":"ci_algorithm","conversations":[{"role":"user","content":"What is binary search used for? Answer briefly."},{"role":"assistant","content":"Binary search finds a target efficiently in sorted data."}]}

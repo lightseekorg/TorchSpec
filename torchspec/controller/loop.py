@@ -40,6 +40,10 @@ from torchspec.utils.logging import get_tb_writer, logger
 
 
 def _write_training_metrics(metrics: dict, train_step: int, inference_step: int) -> None:
+    loss = metrics.get("train/avg_loss")
+    if isinstance(loss, (int, float)):
+        logger.info(f"TRAIN_STEP step={train_step} loss={loss:.6f}")
+
     if getattr(wandb, "run", None) is not None:
         wandb.log(metrics)
 

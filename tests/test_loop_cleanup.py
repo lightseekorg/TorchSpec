@@ -8,6 +8,16 @@ from torchspec.controller import eval as eval_utils
 from torchspec.controller import loop
 
 
+def test_write_training_metrics_logs_each_step_loss():
+    with (
+        mock.patch("torchspec.controller.loop.logger.info") as mock_log,
+        mock.patch("torchspec.controller.loop.get_tb_writer", return_value=None),
+    ):
+        loop._write_training_metrics({"train/avg_loss": 1.23456789}, train_step=2, inference_step=3)
+
+    mock_log.assert_called_once_with("TRAIN_STEP step=2 loss=1.234568")
+
+
 class TestTrainingLoopCleanup:
     def test_safe_cleanup_stops_inference_and_shutdowns_mooncake_actor(self):
         args = SimpleNamespace(_mooncake_master_actor=mock.MagicMock())
