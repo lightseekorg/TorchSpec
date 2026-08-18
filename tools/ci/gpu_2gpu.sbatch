@@ -3,7 +3,7 @@
 #SBATCH --partition=batch
 #SBATCH --nodes=1
 #SBATCH --exclusive
-#SBATCH --time=03:00:00
+#SBATCH --time=06:00:00
 
 set -euo pipefail
 

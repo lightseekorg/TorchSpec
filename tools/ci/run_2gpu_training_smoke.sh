@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 eagle3_config="${TORCHSPEC_CI_EAGLE3_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_eagle3_2gpu_smoke.yaml}"
 dspark_config="${TORCHSPEC_CI_DSPARK_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_dspark_2gpu_smoke.yaml}"
-fixture="${TORCHSPEC_CI_FIXTURE:-${repo_root}/tests/fixtures/ci_training_smoke.jsonl}"
+fixture="${TORCHSPEC_CI_FIXTURE:-${repo_root}/examples/data/sample_conversations.jsonl}"
 artifact_dir="${TORCHSPEC_CI_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}/torchspec-2gpu-training}"
 model="${TORCHSPEC_CI_MODEL:-Qwen/Qwen3.8-27B}"
 model_revision="${TORCHSPEC_CI_MODEL_REVISION:-1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0}"
