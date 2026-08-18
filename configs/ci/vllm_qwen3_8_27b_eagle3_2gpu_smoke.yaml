@@ -1,8 +1,12 @@
-# Two-GPU CI topology: one GB200 for vLLM target inference and one for
-# TorchSpec draft training. Keep this deterministic and intentionally small.
+# Two-GPU CI lane: Qwen3.8-27B target inference on one GB200 and a
+# deliberately small, one-layer Eagle3 draft training on the other.
 model:
-  target_model_path: Qwen/Qwen3-8B
+  target_model_path: Qwen/Qwen3.8-27B
   target_model_backend: vllm
+  draft_model_config: configs/ci/qwen3_8_27b_eagle3_draft.json
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
   trust_remote_code: true
 
 dataset:
@@ -19,43 +23,49 @@ training:
   learning_rate: 1e-4
   max_concurrent_batches: 1
   max_grad_norm: 0.5
-  max_seq_length: 512
+  max_seq_length: 256
   num_epochs: 1
-  num_train_steps: 3
+  num_train_steps: 2
   prefetch_depth: 1
   save_interval: 0
   save_per_epoch: false
   seed: 42
   training_num_gpus_per_node: 1
   training_num_nodes: 1
-  ttt_length: 3
+  ttt_length: 2
   warmup_ratio: 0.0
 
 inference:
   inference_engine_type: vllm
+  store_last_hidden_states: true
   inference_num_gpus: 1
   inference_num_gpus_per_engine: 1
   inference_num_gpus_per_node: 2
   inference_batch_size: 1
   inference_buffer_threshold: 2
   max_sample_pool_size: 4
+  # Qwen3.8 is hybrid GDN/full-attention. Capture only full-attention layers.
+  # Do not select layer 63: vLLM converts post-layer IDs to pre-next-layer IDs,
+  # and capture index 64 is outside the 64-layer decoder stack.
+  aux_hidden_states_layers: [3, 31, 59]
   vllm:
     tp_size: 1
-    mem_fraction_static: 0.7
+    mem_fraction_static: 0.55
     extra_args:
       enforce_eager: true
-      max_model_len: 512
-      max_num_batched_tokens: 512
+      language_model_only: true
+      max_model_len: 256
+      max_num_batched_tokens: 256
 
 mooncake:
   master_server_address: null
   metadata_server: null
   protocol: tcp
-  global_segment_size: 2GB
-  local_buffer_size: 512MB
+  global_segment_size: 4GB
+  local_buffer_size: 1GB
 
 output_dir: ""
-cache_dir: ../../.ci-cache/qwen3-8b-2gpu-smoke
+cache_dir: ../../.ci-cache/qwen3-8-27b-eagle3-smoke
 model_download_dir: null
 
 logging:

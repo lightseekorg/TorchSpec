@@ -105,14 +105,15 @@ jobs:
             });
 
   integration:
-    name: vLLM + training (GB200, 2 GPUs)
+    name: Qwen3.8 Eagle3 + DSpark (GB200, 2 GPUs)
     needs: authorize
     runs-on: ${{ vars.TORCHSPEC_GPU_RUNNER_LABEL || 'torchspec-gb200-2gpu' }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     permissions:
       contents: read
     env:
-      TORCHSPEC_CI_MODEL: ${{ vars.TORCHSPEC_CI_MODEL || 'Qwen/Qwen3-8B' }}
+      TORCHSPEC_CI_MODEL: ${{ vars.TORCHSPEC_CI_MODEL || 'Qwen/Qwen3.8-27B' }}
+      TORCHSPEC_CI_MODEL_REVISION: ${{ vars.TORCHSPEC_CI_MODEL_REVISION || '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0' }}
     steps:
       - name: Checkout PR merge
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
@@ -147,7 +148,7 @@ jobs:
       - name: Install PR source without changing image dependencies
         run: python3 -m pip install --no-deps -e .
 
-      - name: Run two-GPU vLLM and training smoke
+      - name: Run Qwen3.8 Eagle3 and DSpark training smokes
         run: tools/ci/run_2gpu_training_smoke.sh
 
       - name: Upload integration artifacts

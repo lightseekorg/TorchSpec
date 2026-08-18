@@ -1,0 +1,82 @@
+# Two-GPU CI lane: the same Qwen3.8-27B target on one GB200 and a
+# one-layer DSpark draft on the other. This exercises block diffusion,
+# Markov, confidence, CE, and L1 training paths without a production-sized draft.
+model:
+  target_model_path: Qwen/Qwen3.8-27B
+  target_model_backend: vllm
+  draft_model_config: configs/ci/qwen3_8_27b_dspark_draft.json
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../../tests/fixtures/ci_training_smoke.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+  shuffle_dataset: false
+  length_group_size: 1
+  min_loss_tokens: 4
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 256
+  num_epochs: 1
+  num_train_steps: 2
+  prefetch_depth: 1
+  save_interval: 0
+  save_per_epoch: false
+  seed: 42
+  training_num_gpus_per_node: 1
+  training_num_nodes: 1
+  warmup_ratio: 0.0
+  dflash_block_size: 2
+  dspark_num_anchors: 4
+  dspark_num_target_layers: 5
+  dspark_loss_decay_gamma: 4.0
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+
+inference:
+  inference_engine_type: vllm
+  store_last_hidden_states: true
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 2
+  inference_batch_size: 1
+  inference_buffer_threshold: 2
+  max_sample_pool_size: 4
+  # Five evenly spread full-attention layers; linear/GDN states are excluded.
+  aux_hidden_states_layers: [3, 15, 31, 47, 59]
+  vllm:
+    tp_size: 1
+    mem_fraction_static: 0.55
+    extra_args:
+      enforce_eager: true
+      language_model_only: true
+      max_model_len: 256
+      max_num_batched_tokens: 256
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 4GB
+  local_buffer_size: 1GB
+
+output_dir: ""
+cache_dir: ../../.ci-cache/qwen3-8-27b-dspark-smoke
+model_download_dir: null
+
+logging:
+  report_to: none
+
+debug:
+  enable_perf_metrics: false
+  save_debug_train_data: null
