@@ -23,7 +23,7 @@ training:
   learning_rate: 1e-4
   max_concurrent_batches: 1
   max_grad_norm: 0.5
-  max_seq_length: 256
+  max_seq_length: 512
   num_epochs: 1
   prefetch_depth: 1
   save_interval: 0
@@ -53,8 +53,8 @@ inference:
     extra_args:
       enforce_eager: true
       language_model_only: true
-      max_model_len: 256
-      max_num_batched_tokens: 256
+      max_model_len: 512
+      max_num_batched_tokens: 512
 
 mooncake:
   master_server_address: null

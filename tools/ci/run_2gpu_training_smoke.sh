@@ -8,6 +8,7 @@ fixture="${TORCHSPEC_CI_FIXTURE:-${repo_root}/examples/data/sample_conversations
 artifact_dir="${TORCHSPEC_CI_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}/torchspec-2gpu-training}"
 model="${TORCHSPEC_CI_MODEL:-Qwen/Qwen3.8-27B}"
 model_revision="${TORCHSPEC_CI_MODEL_REVISION:-1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0}"
+excluded_dataset_id="${TORCHSPEC_CI_EXCLUDED_DATASET_ID:-long_chunked_prefill_test}"
 model_cache="${TORCHSPEC_CI_MODEL_CACHE:-${HF_HOME:-${artifact_dir}/huggingface}}"
 compile_cache="${TORCHSPEC_CI_COMPILE_CACHE:-${RUNNER_TEMP:-/tmp}/torchspec-torchinductor}"
 
@@ -47,7 +48,7 @@ print(f"CI_SAMPLE_INPUT={sample['input']}")
 print(f"CI_SAMPLE_TARGET_OUTPUT={sample['target_output']}")
 PY
 
-expected_steps="$(python3 - "${fixture}" <<'PY'
+expected_steps="$(python3 - "${fixture}" "${excluded_dataset_id}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -59,9 +60,16 @@ records = [
 ]
 if not records:
     raise SystemExit("CI fixture must contain at least one training record")
-print(len(records))
+excluded_id = sys.argv[2]
+matching = [record for record in records if record.get("id") == excluded_id]
+if len(matching) != 1:
+    raise SystemExit(
+        f"Expected exactly one dataset record with id={excluded_id!r}, got {len(matching)}"
+    )
+print(len(records) - 1)
 PY
 )"
+echo "CI_DATASET_EXCLUDED_ID=${excluded_dataset_id}"
 echo "CI_EPOCH_OPTIMIZER_STEPS=${expected_steps}"
 
 if [[ -n "${TORCHSPEC_CI_MODEL_PATH:-}" ]]; then
