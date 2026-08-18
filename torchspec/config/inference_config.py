@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from omegaconf import DictConfig
+
 from torchspec.config.mooncake_config import MooncakeConfig
 
 
@@ -198,3 +200,12 @@ class HFInferenceConfig:
     trust_remote_code: bool = False
     aux_hidden_states_layers: Optional[list[int]] = None
     mooncake_config: Optional[MooncakeConfig] = None
+
+
+def _validate_inference_batch_config(config: DictConfig) -> None:
+    if config.inference.inference_batch_size <= 0:
+        raise ValueError(
+            f"inference_batch_size must be > 0 (got {config.inference.inference_batch_size}); "
+            f"0 causes inference-pool starvation (silent dispatch spin) and vLLM rejects "
+            f"max_num_seqs=0 late after init"
+        )

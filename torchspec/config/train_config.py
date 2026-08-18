@@ -26,7 +26,7 @@ from typing import Any, Optional
 
 from omegaconf import DictConfig, OmegaConf
 
-from torchspec.config.inference_config import InferenceConfig
+from torchspec.config.inference_config import InferenceConfig, _validate_inference_batch_config
 from torchspec.data.utils import is_local_data_path
 from torchspec.utils.logging import logger
 
@@ -300,6 +300,31 @@ def _validate_training_batch_config(config: DictConfig) -> None:
         )
 
 
+def _validate_training_numeric_config(config: DictConfig) -> None:
+    """Reject non-positive values that would otherwise fail silently or crash late.
+
+    These fields share the fail-closed-at-load principle of #171: a misconfig that
+    produces flat loss, sign-flipped gradients, or an opaque post-init crash is
+    preferable to surfacing after expensive Ray/mooncake init.
+    """
+    if config.training.draft_accumulation_steps <= 0:
+        raise ValueError(
+            f"draft_accumulation_steps must be > 0 (got {config.training.draft_accumulation_steps}); "
+            f"<=0 propagates into global_batch_size/lr_total_steps and crashes post-init "
+            f"(ZeroDivisionError or bare total_steps assert)"
+        )
+    if config.training.learning_rate <= 0:
+        raise ValueError(
+            f"learning_rate must be > 0 (got {config.training.learning_rate}); "
+            f"0 yields silent flat loss (untrained checkpoint), <0 hits a late assert"
+        )
+    if config.training.max_grad_norm <= 0:
+        raise ValueError(
+            f"max_grad_norm must be > 0 (got {config.training.max_grad_norm}); "
+            f"0 zeroes all grads (silent flat loss), <0 sign-flips grads (silent gradient ascent)"
+        )
+
+
 def _save_config_snapshot(config: DictConfig) -> None:
     """Save the resolved config to output_dir/config.yaml if output_dir is set."""
     output_dir = OmegaConf.select(config, "output_dir", default=None)
@@ -347,6 +372,8 @@ def load_config(
     _validate_offline_config(config)
     _validate_vocab_mapping_config(config)
     _validate_training_batch_config(config)
+    _validate_training_numeric_config(config)
+    _validate_inference_batch_config(config)
 
     if save_snapshot:
         _save_config_snapshot(config)
