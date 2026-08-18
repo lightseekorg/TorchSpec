@@ -9,7 +9,10 @@ fi
 source_dir="$(cd "$1" && pwd)"
 report_dir="$2"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-shared_root="${TORCHSPEC_SLURM_ROOT:-/mnt/nfs01/ts-yineng/torchspec-slurm}"
+: "${TORCHSPEC_SLURM_ROOT:?TORCHSPEC_SLURM_ROOT is required}"
+: "${TORCHSPEC_CI_IMAGE:?TORCHSPEC_CI_IMAGE is required}"
+: "${TORCHSPEC_CI_MODEL_CACHE_HOST:?TORCHSPEC_CI_MODEL_CACHE_HOST is required}"
+shared_root="${TORCHSPEC_SLURM_ROOT}"
 run_id="${GITHUB_RUN_ID:-manual}"
 run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
 run_key="${run_id}-${run_attempt}"
@@ -17,8 +20,8 @@ run_root="${shared_root}/runs/${run_key}"
 repo_dir="${run_root}/repo"
 artifact_dir="${run_root}/artifacts"
 tmp_dir="${run_root}/tmp"
-image="${TORCHSPEC_CI_IMAGE:-/mnt/lustre01/users/ts-yubowang/devbox/torchspec+nightly-4687388-vllm-v0.22.1+ts-yubowang.sqsh}"
-model_cache_host="${TORCHSPEC_CI_MODEL_CACHE_HOST:-/mnt/lustre01/users/ts-yubowang/yubowang/ci-cache/huggingface/models--Qwen--Qwen3.8-27B}"
+image="${TORCHSPEC_CI_IMAGE}"
+model_cache_host="${TORCHSPEC_CI_MODEL_CACHE_HOST}"
 model="${TORCHSPEC_CI_MODEL:-Qwen/Qwen3.8-27B}"
 model_revision="${TORCHSPEC_CI_MODEL_REVISION:-1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0}"
 
@@ -34,7 +37,7 @@ esac
   echo "TorchSpec CI launcher is missing from ${source_dir}" >&2
   exit 2
 }
-[[ -f "${script_dir}/inkwell_2gpu.sbatch" ]] || {
+[[ -f "${script_dir}/gpu_2gpu.sbatch" ]] || {
   echo "Trusted Slurm batch script is missing" >&2
   exit 2
 }
@@ -60,11 +63,10 @@ submitted="$(sbatch \
   --parsable \
   --output="${run_root}/slurm-%j.log" \
   --export="${export_spec}" \
-  "${script_dir}/inkwell_2gpu.sbatch")"
+  "${script_dir}/gpu_2gpu.sbatch")"
 job_id="${submitted%%;*}"
 log_path="${run_root}/slurm-${job_id}.log"
-echo "SLURM_JOB_ID=${job_id}"
-echo "SLURM_LOG=${log_path}"
+echo "Submitted GPU cluster job"
 
 cancel_job() {
   if squeue -h -j "${job_id}" | grep -q .; then
@@ -78,9 +80,7 @@ while true; do
   state="$(squeue -h -j "${job_id}" -o '%T' | tr -d ' ')"
   [[ -n "${state}" ]] || break
   elapsed="$(squeue -h -j "${job_id}" -o '%M' | tr -d ' ')"
-  reason="$(squeue -h -j "${job_id}" -o '%R')"
-  printf 'SLURM_PROGRESS job=%s state=%s elapsed=%s node_or_reason=%s\n' \
-    "${job_id}" "${state}" "${elapsed}" "${reason}"
+  printf 'SLURM_PROGRESS state=%s elapsed=%s\n' "${state}" "${elapsed}"
   sleep 60
 done
 trap - INT TERM
@@ -92,15 +92,14 @@ for _ in 1 2 3 4 5 6; do
 done
 final_state="${final_state:-UNKNOWN}"
 
-sacct -j "${job_id}" --format=JobID,JobName,State,ExitCode,Elapsed,NodeList,AllocTRES -P \
+sacct -j "${job_id}" -X --format=State,ExitCode,Elapsed,AllocTRES -P \
   | tee "${report_dir}/sacct.txt"
 [[ -f "${log_path}" ]] && cp "${log_path}" "${report_dir}/slurm.log"
 [[ -d "${artifact_dir}" ]] && rsync -a "${artifact_dir}/" "${report_dir}/artifacts/"
 
 {
-  echo "## TorchSpec Inkwell GPU integration"
+  echo "## TorchSpec GPU integration"
   echo
-  echo "- Slurm job: \`${job_id}\`"
   echo "- Final state: \`${final_state}\`"
   echo "- Source SHA: \`${TORCHSPEC_CI_SOURCE_SHA:-${GITHUB_SHA:-unknown}}\`"
   echo "- Model revision: \`${model_revision}\`"

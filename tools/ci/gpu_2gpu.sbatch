@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=torchspec-qwen38-ci
+#SBATCH --job-name=torchspec-gpu-ci
 #SBATCH --partition=batch
 #SBATCH --nodes=1
 #SBATCH --exclusive

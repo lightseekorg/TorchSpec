@@ -1,8 +1,8 @@
 name: GPU Integration
 
 # GPU jobs execute PR code and therefore require an explicit WRITE-access
-# maintainer trigger. A trusted login-node runner dispatches the selected merge
-# commit into an isolated Inkwell Slurm container allocation.
+# maintainer trigger. A trusted runner dispatches the selected merge commit
+# into an isolated two-GPU Slurm container allocation.
 on:
   pull_request_target:
     types: [labeled]
@@ -105,7 +105,7 @@ jobs:
   integration:
     name: Qwen3.8 Eagle3 + DSpark (GB200, 2 GPUs)
     needs: authorize
-    runs-on: slurm-dispatch
+    runs-on: ${{ vars.TORCHSPEC_GPU_DISPATCHER_LABEL }}
     timeout-minutes: 720
     permissions:
       contents: read
@@ -113,6 +113,9 @@ jobs:
       TORCHSPEC_CI_MODEL: ${{ vars.TORCHSPEC_CI_MODEL || 'Qwen/Qwen3.8-27B' }}
       TORCHSPEC_CI_MODEL_REVISION: ${{ vars.TORCHSPEC_CI_MODEL_REVISION || '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0' }}
       TORCHSPEC_CI_SOURCE_SHA: ${{ needs.authorize.outputs.merge_sha }}
+      TORCHSPEC_SLURM_ROOT: ${{ secrets.TORCHSPEC_SLURM_ROOT }}
+      TORCHSPEC_CI_IMAGE: ${{ secrets.TORCHSPEC_CI_IMAGE }}
+      TORCHSPEC_CI_MODEL_CACHE_HOST: ${{ secrets.TORCHSPEC_CI_MODEL_CACHE_HOST }}
     steps:
       - name: Checkout trusted dispatcher
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
@@ -128,9 +131,9 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Submit and wait for Inkwell Slurm integration
+      - name: Submit and wait for Slurm integration
         run: >-
-          trusted/tools/ci/dispatch_inkwell_slurm.sh
+          trusted/tools/ci/dispatch_slurm.sh
           "$GITHUB_WORKSPACE/source"
           "$RUNNER_TEMP/slurm-report"
 
