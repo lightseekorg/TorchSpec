@@ -54,7 +54,7 @@ jobs:
           echo "should_run=true" >> "$GITHUB_OUTPUT"
           {
             echo "Relevant changes found in the preceding 24 hours:"
-            printf -- '- `%s`\n' "${changed_files[@]}"
+            printf -- '- %s\n' "${changed_files[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
 
   integration:
