@@ -1,0 +1,59 @@
+name: Build PP vLLM Docker Image
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/docker-vllm-pp.yml"
+      - "docker/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/**"
+      - "patches/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/**"
+      - "pyproject.toml"
+      - "torchspec/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build patched vLLM image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          provenance: false
+          build-args: |
+            TORCHSPEC_SOURCE_REV=${{ github.sha }}
+            VLLM_SOURCE_REV=e9d1398d9edfd90fcc1cf783805240e3effec013
+          cache-from: type=gha,scope=vllm-pp-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=vllm-pp-${{ matrix.platform }}

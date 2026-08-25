@@ -1,0 +1,4 @@
+# Patch stack for vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013
+# Keep PP extraction correctness isolated from later async-publication and
+# barrier-overlap changes.
+vllm_pp_hidden_states.patch
