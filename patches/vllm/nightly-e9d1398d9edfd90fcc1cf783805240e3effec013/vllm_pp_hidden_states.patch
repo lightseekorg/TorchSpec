@@ -120,52 +120,6 @@ index 3820f5e39b42464af8133b08c018664634bc4932..ee77e6c05c668db34ce455010885e9fb
  
          hidden_states, _ = self.norm(hidden_states, residual)
  
-diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index 51fd036f4e3984e9e09e793d92872c57b2667168..d98aaffce693ca6346e3de3598aae97c2d87bb0a 100644
---- a/vllm/model_executor/models/qwen3_next.py
-+++ b/vllm/model_executor/models/qwen3_next.py
-@@ -612,7 +612,11 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
-         positions: torch.Tensor,
-         intermediate_tensors: IntermediateTensors | None = None,
-         inputs_embeds: torch.Tensor | None = None,
--    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-+    ) -> (
-+        torch.Tensor
-+        | IntermediateTensors
-+        | tuple[torch.Tensor | IntermediateTensors, list[torch.Tensor]]
-+    ):
-         if get_pp_group().is_first_rank:
-             if inputs_embeds is not None:
-                 hidden_states = inputs_embeds
-@@ -629,7 +633,13 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
-             hidden_states = sequence_parallel_chunk(hidden_states)
-             assert residual is None
- 
--        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-+        # Capture ids are global layer positions. Only PP0 owns the embedding
-+        # output at id 0; later stages must not duplicate their stage input.
-+        aux_hidden_states: list[torch.Tensor] = []
-+        if self.start_layer == 0:
-+            self._maybe_add_hidden_state(
-+                aux_hidden_states, 0, hidden_states, residual
-+            )
-         for layer_idx, layer in enumerate(
-             islice(self.layers, self.start_layer, self.end_layer),
-             start=self.start_layer,
-@@ -644,9 +654,12 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
-             )
- 
-         if not get_pp_group().is_last_rank:
--            return IntermediateTensors(
-+            intermediate_tensors = IntermediateTensors(
-                 {"hidden_states": hidden_states, "residual": residual}
-             )
-+            if self.aux_hidden_state_layers:
-+                return intermediate_tensors, aux_hidden_states
-+            return intermediate_tensors
-         hidden_states, _ = self.norm(hidden_states, residual)
-         if self.use_sequence_parallel:
-             if aux_hidden_states:
 diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
 index 15ac51cd41a600acbff1de01bb03daa3588cf91e..a857319abd18011922bcb3d44c655e6854f03fd9 100644
 --- a/vllm/models/kimi_k3/nvidia/model.py
@@ -555,4 +509,3 @@ index 4ef7f5860a5fd3ff370cedad754e691e97320b2c..a359b7f89d100e9b49b70df7f1599e0f
  
          with record_function_or_nullcontext("gpu_model_runner: eplb"):
              self.eplb_step()
-

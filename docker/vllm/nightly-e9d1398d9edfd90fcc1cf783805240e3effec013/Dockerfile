@@ -28,7 +28,6 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
     python3 -m compileall -q \
       vllm/model_executor/models/extract_hidden_states.py \
       vllm/model_executor/models/qwen2.py \
-      vllm/model_executor/models/qwen3_next.py \
       vllm/models/kimi_k3/nvidia/model.py \
       vllm/v1/core/sched/async_scheduler.py \
       vllm/v1/core/sched/scheduler.py \
