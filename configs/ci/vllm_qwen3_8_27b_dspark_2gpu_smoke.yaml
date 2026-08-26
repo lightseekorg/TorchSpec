@@ -1,6 +1,6 @@
 # Two-GPU CI lane: the same Qwen3.8-27B target on one GB200 and a
-# one-layer DSpark draft on the other. This exercises block diffusion,
-# Markov, confidence, CE, and L1 training paths without a production-sized draft.
+# production-depth DSpark draft on the other. This exercises block diffusion,
+# Markov, confidence, CE, and L1 training paths with the standard DSpark shape.
 model:
   target_model_path: Qwen/Qwen3.8-27B
   target_model_backend: vllm
@@ -16,7 +16,7 @@ dataset:
   prompt_key: conversations
   shuffle_dataset: false
   length_group_size: 1
-  min_loss_tokens: 4
+  min_loss_tokens: 32
 
 training:
   attention_backend: flex_attention
@@ -36,8 +36,8 @@ training:
   training_num_gpus_per_node: 1
   training_num_nodes: 1
   warmup_ratio: 0.0
-  dflash_block_size: 2
-  dspark_num_anchors: 4
+  dflash_block_size: 7
+  dspark_num_anchors: 512
   dspark_num_target_layers: 5
   dspark_loss_decay_gamma: 4.0
   dspark_ce_loss_alpha: 0.1
@@ -80,5 +80,5 @@ logging:
   report_to: none
 
 debug:
-  enable_perf_metrics: false
+  enable_perf_metrics: true
   save_debug_train_data: null

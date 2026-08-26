@@ -37,9 +37,11 @@ Pins the DSpark wiring so future refactors can't silently break the objective:
 
 import math
 import unittest
+from pathlib import Path
 
 import torch
 
+from torchspec.config import load_config
 from torchspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.dflash import DFlashConfig
 from torchspec.models.draft.dspark import (
@@ -54,6 +56,7 @@ from torchspec.models.draft.llama3_eagle import LlamaYarnRotaryEmbedding, yarn_g
 from torchspec.models.dspark import DSparkModel
 
 CE_A, L1_A, CF_A = 0.1, 0.9, 1.0
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _make_dspark_config(
@@ -134,6 +137,22 @@ class TestDSparkConfig(unittest.TestCase):
         self.assertEqual(cfg.markov_rank, 32)
         self.assertTrue(cfg.enable_confidence_head)
         self.assertFalse(cfg.fc_norm)
+
+    def test_ci_config_uses_standard_dspark_shape(self):
+        config_path = ROOT / "configs" / "ci" / "vllm_qwen3_8_27b_dspark_2gpu_smoke.yaml"
+        config = load_config(str(config_path))
+        draft_config = AutoDraftModelConfig.from_file(config.model.draft_model_config)
+
+        self.assertIsInstance(draft_config, DSparkConfig)
+        self.assertEqual(config.training.dflash_block_size, 7)
+        self.assertEqual(config.training.dspark_num_anchors, 512)
+        self.assertEqual(config.dataset.min_loss_tokens, 32)
+        self.assertEqual(draft_config.num_hidden_layers, 5)
+        self.assertEqual(draft_config.markov_rank, 256)
+        self.assertEqual(
+            list(config.inference.aux_hidden_states_layers),
+            draft_config.target_layer_ids,
+        )
 
     def test_optional_fc_norm_normalizes_each_target_layer_before_projection(self):
         cfg = _make_dspark_config(H=16, num_target_layers=3, fc_norm=True)

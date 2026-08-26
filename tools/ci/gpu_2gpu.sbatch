@@ -24,6 +24,7 @@ srun --gpus=2 \
     export RUNNER_TEMP=/ci-tmp
     export HF_HOME=/ci-tmp/huggingface
     export PYTHONPATH="/workspace${PYTHONPATH:+:${PYTHONPATH}}"
+    export VLLM_USE_V2_MODEL_RUNNER=1
     export TORCHSPEC_CI_ARTIFACT_DIR=/artifacts
     export TORCHSPEC_CI_MODEL_PATH="/model-cache/snapshots/${TORCHSPEC_CI_MODEL_REVISION}"
     export TORCHSPEC_CI_MODEL_CACHE=/ci-tmp/huggingface

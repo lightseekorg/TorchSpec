@@ -103,7 +103,7 @@ jobs:
             });
 
   integration:
-    name: Qwen3.8 Eagle3 + DSpark (GB200, 2 GPUs)
+    name: Qwen3.8 Eagle3 + DSpark + DFlash2 (GB200, 2 GPUs)
     needs: authorize
     runs-on: ${{ vars.TORCHSPEC_GPU_DISPATCHER_LABEL }}
     timeout-minutes: 720

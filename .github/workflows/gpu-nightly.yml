@@ -58,7 +58,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   integration:
-    name: Qwen3.8 full-epoch GPU training
+    name: Qwen3.8 Eagle3 + DSpark + DFlash2 GPU training
     needs: changes
     if: needs.changes.outputs.should_run == 'true'
     runs-on: ${{ vars.TORCHSPEC_GPU_DISPATCHER_LABEL }}

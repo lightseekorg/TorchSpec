@@ -1,9 +1,10 @@
-# Two-GPU CI lane: Qwen3.8-27B target inference on one GB200 and a
-# deliberately small, one-layer Eagle3 draft training on the other.
+# Two-GPU CI lane: the same Qwen3.8-27B target on one GB200 and a
+# production-depth DFlash2 draft on the other. This exercises block diffusion,
+# grouped convolutions, candidate selection, and selector-loss training.
 model:
   target_model_path: Qwen/Qwen3.8-27B
   target_model_backend: vllm
-  draft_model_config: configs/ci/qwen3_8_27b_eagle3_draft.json
+  draft_model_config: configs/ci/qwen3_8_27b_dflash2_draft.json
   embedding_key: model.language_model.embed_tokens.weight
   lm_head_key: lm_head.weight
   norm_key: model.language_model.norm.weight
@@ -15,6 +16,7 @@ dataset:
   prompt_key: conversations
   shuffle_dataset: false
   length_group_size: 1
+  min_loss_tokens: 32
 
 training:
   attention_backend: flex_attention
@@ -23,8 +25,8 @@ training:
   learning_rate: 1e-4
   max_concurrent_batches: 1
   max_grad_norm: 0.5
-  # The repository sample dataset contains a 12,913-token conversation.
-  # Keep the complete final supervised turn instead of truncating it away.
+  # Keep the complete 12,913-token record so DFlash2 is exercised after
+  # multiple vLLM chunked-prefill iterations.
   max_seq_length: 16384
   num_epochs: 1
   prefetch_depth: 1
@@ -33,22 +35,24 @@ training:
   seed: 42
   training_num_gpus_per_node: 1
   training_num_nodes: 1
-  ttt_length: 2
   warmup_ratio: 0.0
+  dflash_block_size: 8
+  dflash_num_anchors: 512
+  dflash_num_target_layers: 5
+  dflash_loss_decay_gamma: 7.0
+  dflash2_selector_loss_alpha: 1.0
 
 inference:
   inference_engine_type: vllm
-  store_last_hidden_states: true
+  store_last_hidden_states: false
   inference_num_gpus: 1
   inference_num_gpus_per_engine: 1
   inference_num_gpus_per_node: 2
   inference_batch_size: 1
   inference_buffer_threshold: 2
   max_sample_pool_size: 4
-  # Qwen3.8 is hybrid GDN/full-attention. Capture only full-attention layers.
-  # Do not select layer 63: vLLM converts post-layer IDs to pre-next-layer IDs,
-  # and capture index 64 is outside the 64-layer decoder stack.
-  aux_hidden_states_layers: [3, 31, 59]
+  # These must match dflash_config.target_layer_ids in the draft config.
+  aux_hidden_states_layers: [3, 15, 31, 47, 59]
   vllm:
     tp_size: 1
     mem_fraction_static: 0.55
@@ -56,7 +60,6 @@ inference:
       enforce_eager: true
       language_model_only: true
       max_model_len: 16384
-      # Exercise vLLM chunked prefill for the long-context sample.
       max_num_batched_tokens: 4096
 
 mooncake:
@@ -67,7 +70,7 @@ mooncake:
   local_buffer_size: 1GB
 
 output_dir: ""
-cache_dir: ../../.ci-cache/qwen3-8-27b-eagle3-smoke
+cache_dir: ../../.ci-cache/qwen3-8-27b-dflash2-smoke
 model_download_dir: null
 
 logging:

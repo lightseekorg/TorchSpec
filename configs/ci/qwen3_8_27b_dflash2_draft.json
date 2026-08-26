@@ -1,0 +1,37 @@
+{
+  "architectures": ["DFlash2DraftModel"],
+  "model_type": "qwen3_dflash2",
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "hidden_size": 5120,
+  "intermediate_size": 8192,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 40,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "vocab_size": 248320,
+  "rms_norm_eps": 1e-6,
+  "max_position_embeddings": 262144,
+  "rope_theta": 10000000.0,
+  "num_target_layers": 5,
+  "target_hidden_size": 5120,
+  "target_num_hidden_layers": 64,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "is_causal": false,
+  "dflash_config": {
+    "block_size": 8,
+    "conv_kernel_size": 2,
+    "conv_group_size": 16,
+    "selector_rank": 256,
+    "selector_top_k": 16,
+    "target_layer_ids": [3, 15, 31, 47, 59],
+    "mask_token_id": 248044
+  },
+  "tie_word_embeddings": false
+}

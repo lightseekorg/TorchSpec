@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 eagle3_config="${TORCHSPEC_CI_EAGLE3_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_eagle3_2gpu_smoke.yaml}"
 dspark_config="${TORCHSPEC_CI_DSPARK_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_dspark_2gpu_smoke.yaml}"
+dflash2_config="${TORCHSPEC_CI_DFLASH2_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_dflash2_2gpu_smoke.yaml}"
 fixture="${TORCHSPEC_CI_FIXTURE:-${repo_root}/examples/data/sample_conversations.jsonl}"
 artifact_dir="${TORCHSPEC_CI_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}/torchspec-2gpu-training}"
 model="${TORCHSPEC_CI_MODEL:-Qwen/Qwen3.8-27B}"
@@ -11,6 +12,9 @@ model_revision="${TORCHSPEC_CI_MODEL_REVISION:-1d4bf0f2ff6012fd82039f2fa52739d0d
 long_context_dataset_id="${TORCHSPEC_CI_LONG_CONTEXT_DATASET_ID:-long_chunked_prefill_test}"
 model_cache="${TORCHSPEC_CI_MODEL_CACHE:-${HF_HOME:-${artifact_dir}/huggingface}}"
 compile_cache="${TORCHSPEC_CI_COMPILE_CACHE:-${RUNNER_TEMP:-/tmp}/torchspec-torchinductor}"
+profile_num_steps="${TORCHSPEC_CI_PROFILE_NUM_STEPS:-}"
+profile_step_start="${TORCHSPEC_CI_PROFILE_STEP_START:-}"
+profile_step_end="${TORCHSPEC_CI_PROFILE_STEP_END:-}"
 
 mkdir -p "${artifact_dir}" "${model_cache}" "${compile_cache}"
 export HF_HOME="${model_cache}"
@@ -48,7 +52,7 @@ print(f"CI_SAMPLE_INPUT={sample['input']}")
 print(f"CI_SAMPLE_TARGET_OUTPUT={sample['target_output']}")
 PY
 
-expected_steps="$(python3 - "${fixture}" "${long_context_dataset_id}" <<'PY'
+fixture_records="$(python3 - "${fixture}" "${long_context_dataset_id}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -70,7 +74,7 @@ print(len(records))
 PY
 )"
 echo "CI_LONG_CONTEXT_DATASET_ID=${long_context_dataset_id}"
-echo "CI_EPOCH_OPTIMIZER_STEPS=${expected_steps}"
+echo "CI_FIXTURE_RECORDS=${fixture_records}"
 
 if [[ -n "${TORCHSPEC_CI_MODEL_PATH:-}" ]]; then
   model_snapshot="${TORCHSPEC_CI_MODEL_PATH}"
@@ -103,22 +107,68 @@ echo "CI_MODEL_SNAPSHOT=${model_snapshot}"
 run_lane() {
   local lane="$1"
   local config="$2"
+  local expected_trainer="${3:-}"
   local lane_dir="${artifact_dir}/${lane}"
   local train_log="${lane_dir}/training.log"
+  local -a extra_args=()
 
   mkdir -p "${lane_dir}/actor-logs"
   export TORCHSPEC_LOG_DIR="${lane_dir}/actor-logs"
 
+  if [[ -n "${profile_num_steps}" ]]; then
+    [[ "${profile_num_steps}" =~ ^[1-9][0-9]*$ ]] || {
+      echo "TORCHSPEC_CI_PROFILE_NUM_STEPS must be a positive integer" >&2
+      exit 2
+    }
+    extra_args+=("training.num_train_steps=${profile_num_steps}")
+  fi
+  if [[ -n "${profile_step_start}" || -n "${profile_step_end}" ]]; then
+    [[ "${profile_step_start}" =~ ^[0-9]+$ && "${profile_step_end}" =~ ^[1-9][0-9]*$ ]] || {
+      echo "Both profile step bounds must be non-negative integers" >&2
+      exit 2
+    }
+    ((profile_step_end > profile_step_start)) || {
+      echo "Profile step end must be greater than profile step start" >&2
+      exit 2
+    }
+    mkdir -p "${lane_dir}/profiles"
+    extra_args+=(
+      "debug.enable_perf_metrics=true"
+      "debug.use_pytorch_profiler=true"
+      "debug.profile_target=[train_overall]"
+      "debug.profile_step_start=${profile_step_start}"
+      "debug.profile_step_end=${profile_step_end}"
+      "debug.profile_dir_name=${lane_dir}/profiles"
+    )
+  fi
+
   echo "CI_LANE_START=${lane}"
   cd "${repo_root}"
+  if [[ -n "${expected_trainer}" ]]; then
+    python3 - "${config}" "${expected_trainer}" <<'PY'
+import sys
+
+from torchspec import AutoDraftModelConfig
+from torchspec.config import load_config
+from torchspec.training.trainer_actor import _trainer_class_for_config
+
+config = load_config(sys.argv[1])
+draft_config = AutoDraftModelConfig.from_file(config.model.draft_model_config)
+trainer_name = _trainer_class_for_config(draft_config).__name__
+if trainer_name != sys.argv[2]:
+    raise SystemExit(f"Expected trainer {sys.argv[2]}, got {trainer_name}")
+print(f"CI_TRAINER lane={trainer_name.removesuffix('Trainer').lower()} class={trainer_name}")
+PY
+  fi
   python3 -m torchspec.train_entry \
     --config "${config}" \
     model.target_model_path="${model_snapshot}" \
     model_download_dir="${model_cache}" \
     cache_dir="${lane_dir}/cache" \
+    "${extra_args[@]}" \
     2>&1 | tee "${train_log}"
 
-  python3 - "${lane}" "${train_log}" "${lane_dir}/step-losses.json" "${expected_steps}" <<'PY'
+  python3 - "${lane}" "${train_log}" "${lane_dir}/step-losses.json" <<'PY'
 import json
 import math
 import re
@@ -126,20 +176,30 @@ import sys
 from pathlib import Path
 
 lane = sys.argv[1]
-pattern = re.compile(r"TRAIN_STEP step=(\d+) loss=([^ ]+)")
+lines = Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").splitlines()
+step_count_pattern = re.compile(r"num_train_steps=(\d+)")
+step_counts = [int(match.group(1)) for line in lines if (match := step_count_pattern.search(line))]
+if not step_counts:
+    raise SystemExit(f"{lane}: training log did not report num_train_steps")
+expected_step_count = step_counts[-1]
+if expected_step_count < 1:
+    raise SystemExit(f"{lane}: expected at least one optimizer step, got {expected_step_count}")
+
+loss_pattern = re.compile(r"TRAIN_STEP step=(\d+) loss=([^ ]+)")
 losses = []
-for line in Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace").splitlines():
-    match = pattern.search(line)
+for line in lines:
+    match = loss_pattern.search(line)
     if match:
         losses.append({"step": int(match.group(1)), "loss": float(match.group(2))})
 
-expected_steps = list(range(1, int(sys.argv[4]) + 1))
+expected_steps = list(range(1, expected_step_count + 1))
 if [item["step"] for item in losses] != expected_steps:
     raise SystemExit(f"{lane}: expected losses for steps {expected_steps}, got {losses}")
 if not all(math.isfinite(item["loss"]) and item["loss"] > 0 for item in losses):
     raise SystemExit(f"{lane}: losses must be finite and positive: {losses}")
 
 Path(sys.argv[3]).write_text(json.dumps(losses, indent=2) + "\n", encoding="utf-8")
+print(f"CI_EPOCH_OPTIMIZER_STEPS lane={lane} count={expected_step_count}")
 print(f"CI_STEP_LOSSES lane={lane} values={json.dumps(losses, separators=(',', ':'))}")
 PY
   echo "CI_LANE_COMPLETE=${lane}"
@@ -147,3 +207,4 @@ PY
 
 run_lane eagle3 "${eagle3_config}"
 run_lane dspark "${dspark_config}"
+run_lane dflash2 "${dflash2_config}" DFlash2Trainer

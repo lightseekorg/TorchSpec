@@ -35,6 +35,7 @@ from tools.convert_to_hf import (
     _convert_fsdp_to_hf,
     _fixup_export_config,
 )
+from torchspec.config import load_config
 from torchspec.models.dflash import _create_dflash_mask_mod
 from torchspec.models.dflash2 import DFlash2Model
 from torchspec.models.draft.auto import AutoDraftModelConfig
@@ -170,6 +171,28 @@ class TestDFlash2Config(unittest.TestCase):
         trainer_module.DFlash2Trainer = trainer_class
         with mock.patch.dict("sys.modules", {"torchspec.training.dflash2_trainer": trainer_module}):
             self.assertIs(_trainer_class_for_config(config), trainer_class)
+
+    def test_ci_config_dispatches_to_dflash2_with_matching_capture_layers(self):
+        config_path = ROOT / "configs" / "ci" / "vllm_qwen3_8_27b_dflash2_2gpu_smoke.yaml"
+        config = load_config(str(config_path))
+        draft_config = AutoDraftModelConfig.from_file(config.model.draft_model_config)
+
+        self.assertIsInstance(draft_config, DFlash2Config)
+        self.assertEqual(draft_config.architectures, ["DFlash2DraftModel"])
+        self.assertEqual(
+            list(config.inference.aux_hidden_states_layers),
+            draft_config.target_layer_ids,
+        )
+        self.assertEqual(config.training.dflash_block_size, draft_config.block_size)
+        self.assertEqual(config.training.dflash_num_anchors, 512)
+        self.assertEqual(config.dataset.min_loss_tokens, 32)
+        self.assertEqual(
+            config.training.dflash_num_target_layers,
+            draft_config.num_target_layers,
+        )
+        self.assertEqual(draft_config.num_hidden_layers, 5)
+        self.assertEqual(draft_config.selector_rank, 256)
+        self.assertEqual(draft_config.selector_top_k, 16)
 
     def test_legacy_dflash_dispatch_is_unchanged(self):
         config = AutoDraftModelConfig.from_dict(
