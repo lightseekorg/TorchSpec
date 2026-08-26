@@ -25,6 +25,8 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `sglang_qwen3_8b.yaml` | SGLang | Qwen3-8B | Single-node, 4+ GPUs |
 | `sglang_kimi_k25_2node.yaml` | SGLang | Kimi-K2.5 | 2-node H200, 16 GPUs |
 | `sglang_kimi_k25_3node.yaml` | SGLang | Kimi-K2.5 | 3-node H100, 24 GPUs |
+| `vllm_kimi_k3_dflash2_mla_swa_gb300.yaml` | vLLM | Kimi-K3 | DFlash2 MLA+SWA, six-node GB300 recipe; replace placeholders |
+| `vllm_kimi_k3_eagle3.yaml` | vLLM | Kimi-K3 | EAGLE3 MLA training recipe; replace placeholders |
 
 ## Key sections
 
@@ -143,7 +145,7 @@ Some `sgl.Engine` parameters are always set by TorchSpec after `extra_args` is a
 
 ## Draft model configs
 
-Architecture configs for Eagle3 draft models are in [`draft_models/`](draft_models/). These define the draft model architecture (hidden size, layers, attention heads, etc.) and are referenced via the `model.draft_model_config` field.
+Architecture configs for Eagle3 and DFlash2 draft models are in [`draft_models/`](draft_models/). These define the draft model architecture (hidden size, layers, attention heads, etc.) and are referenced via the `model.draft_model_config` field. K3 recipes use placeholder paths so private checkpoints and datasets are not committed.
 
 ## Creating a custom config
 

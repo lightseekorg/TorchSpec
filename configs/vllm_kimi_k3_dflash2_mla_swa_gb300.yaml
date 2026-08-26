@@ -1,0 +1,125 @@
+# Kimi-K3 DFlash2 MLA+SWA training on six 4xGB300 nodes.
+# Four inference nodes form two independent TP8/PP1 engines; two nodes train
+# the six-layer draft. Replace paths, node addresses, and network devices for
+# your environment.
+model:
+  target_model_path: ???  # local Kimi-K3 checkpoint or an accessible Hub id
+  target_model_backend: vllm
+  draft_model_config: configs/draft_models/kimi_k3_dflash2_mla_swa.json
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  norm_key: language_model.model.norm.weight
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ???  # pretokenized K3-compatible training view
+  eval_data_path: ???  # pretokenized evaluation view, or null
+  eval_interval: 100
+  eval_prompt_key: conversations
+  prompt_key: conversations
+  renderer: kimi-k3
+  chat_template: null
+  defer_tokenization: false
+  last_turn_loss_only: true
+  shuffle_dataset: true
+  length_group_size: 1
+  min_loss_tokens: 32
+
+training:
+  max_seq_length: 24000
+  seed: 42
+  micro_batch_size: 1
+  # Eight training ranks x one sequence x eight microbatches = global batch 64.
+  draft_accumulation_steps: 8
+  learning_rate: 0.0002
+  min_lr: 0.00002
+  warmup_ratio: 0.04
+  lr_decay_style: cosine
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  num_epochs: 3
+  ttt_length: 7
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 3
+  max_concurrent_batches: 1
+  prefetch_depth: 2
+  gradient_checkpointing: true
+  attention_backend: flex_attention
+  fsdp_strategy: REPLICATE
+  placement_strategy: custom
+  training_num_nodes: 2
+  training_num_gpus_per_node: 4
+  training_node_ips: ???  # list of two Ray node IPs or use node selectors
+  distributed_timeout_minutes: 60
+  dflash_block_size: 8
+  dflash_num_anchors: 512
+  dflash_loss_decay_gamma: 7.0
+  dflash_num_target_layers: 6
+  dflash2_selector_loss_alpha: 1.0
+  # Replace interface names with the training fabric used by your cluster.
+  train_env_vars: '{"NCCL_SOCKET_IFNAME":"<interface>","GLOO_SOCKET_IFNAME":"<interface>","NCCL_MNNVL_ENABLE":"1","NCCL_CUMEM_ENABLE":"1","NVIDIA_IMEX_CHANNELS":"all"}'
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 16
+  inference_num_gpus_per_engine: 8
+  inference_num_gpus_per_node: 4
+  inference_node_ips: ???  # list of four Ray node IPs or use node selectors
+  inference_batch_size: 1
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 8
+  max_sample_pool_size: 16
+  store_last_hidden_states: true
+  last_hidden_states_prenorm: true
+  aux_hidden_states_layers: [19, 37, 54, 66, 78, 90]
+  vllm:
+    tp_size: 8
+    pp_size: 1
+    nnodes: 2
+    init_timeout: 3600
+    dist_timeout: 1800
+    mem_fraction_static: 0.85
+    extra_args:
+      load_format: fastsafetensors
+      max_model_len: 24000
+      max_num_batched_tokens: 24000
+      enable_chunked_prefill: true
+      async_scheduling: true
+      enforce_eager: true
+      skip_mm_profiling: true
+      limit_mm_per_prompt:
+        image: 0
+        video: 0
+      kv_cache_memory_bytes: 64961380352
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: rdma
+  device_name: ???  # RDMA device visible on every participating node
+  enable_gpu_direct: false
+  hidden_dim: 7168
+  global_segment_size: 256GB
+  local_buffer_size: 16GB
+  enable_hard_pin: true
+  kv_lease_ttl_s: 180.0
+  get_retry_max_wait_seconds: 300.0
+
+output_dir: ./outputs/kimi-k3-dflash2-8lookahead
+cache_dir: ./cache/kimi-k3-dflash2-8lookahead
+model_download_dir: null
+
+logging:
+  report_to: wandb
+  use_wandb: true
+  wandb_key: null
+  wandb_project: ???
+  wandb_team: ???
+  wandb_group: kimi-k3-dflash2-8lookahead
+  wandb_mode: offline
+  wandb_random_suffix: false
+
+debug:
+  enable_perf_metrics: true
+  save_debug_train_data: null

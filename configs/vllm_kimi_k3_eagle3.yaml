@@ -1,0 +1,112 @@
+# Kimi-K3 EAGLE3 MLA training recipe for a multi-node vLLM + FSDP setup.
+# Replace every `???` value with paths and settings for your environment.
+# The initial draft path is optional when training from scratch; it is useful
+# for continuing from an existing serving-format EAGLE3 checkpoint.
+
+model:
+  target_model_path: ???  # local Kimi-K3 checkpoint or an accessible Hub id
+  draft_model_config: configs/draft_models/kimi_k3_eagle3_mla.json
+  initial_draft_model_path: ???  # serving-format draft checkpoint, or null
+  target_model_backend: vllm
+  trust_remote_code: true
+  embedding_key: language_model.model.embed_tokens.weight
+  lm_head_key: language_model.lm_head.weight
+  norm_key: language_model.model.norm.weight
+
+dataset:
+  train_data_path: ???  # pretokenized K3-compatible dataset view or JSONL
+  eval_data_path: ???  # eval view, or null to disable evaluation
+  eval_interval: 50
+  eval_prompt_key: conversations
+  prompt_key: conversations
+  renderer: kimi-k3
+  chat_template: null
+  defer_tokenization: false
+  last_turn_loss_only: true
+  shuffle_dataset: true
+  length_group_size: 1
+  min_loss_tokens: 1
+
+training:
+  max_seq_length: 46000
+  seed: 42
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.01
+  lr_decay_style: cosine
+  min_lr: 0.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  ttt_length: 4
+  loss_type: forward_kl
+  num_epochs: 1
+  save_interval: 1000
+  save_per_epoch: true
+  max_checkpoints: 0
+  max_concurrent_batches: 1
+  prefetch_depth: 2
+  gradient_checkpointing: true
+  attention_backend: flex_attention
+  training_num_nodes: 2
+  training_num_gpus_per_node: 4
+  distributed_timeout_minutes: 60
+  # Set cluster-specific NCCL/GLOO variables here when required. Keep these
+  # values outside the repository if they identify private network topology.
+  # train_env_vars: '{"NCCL_SOCKET_IFNAME":"<interface>","GLOO_SOCKET_IFNAME":"<interface>"}'
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 32
+  inference_num_gpus_per_engine: 16
+  inference_num_gpus_per_node: 4
+  inference_batch_size: 4
+  inference_buffer_threshold: 8
+  inference_fetch_batch: 8
+  max_sample_pool_size: 16
+  aux_hidden_states_layers: [1, 45, 89]
+  last_hidden_states_prenorm: true
+  vllm:
+    tp_size: 8
+    pp_size: 2
+    nnodes: 4
+    init_timeout: 3600
+    dist_timeout: 1800
+    mem_fraction_static: 0.85
+    extra_args:
+      load_format: fastsafetensors
+      max_num_batched_tokens: 46000
+      enable_chunked_prefill: true
+      async_scheduling: true
+      enforce_eager: true
+      kv_cache_memory_bytes: 46170898432
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: rdma
+  # device_name: <rdma-device>
+  enable_gpu_direct: false
+  hidden_dim: 7168
+  global_segment_size: 256GB
+  local_buffer_size: 16GB
+  enable_hard_pin: true
+  kv_lease_ttl_s: 180.0
+  get_retry_max_wait_seconds: 300.0
+
+output_dir: ./outputs/kimi-k3-eagle3
+cache_dir: ./cache/kimi-k3-eagle3
+model_download_dir: null
+
+debug:
+  save_debug_train_data: null
+  enable_perf_metrics: true
+
+logging:
+  report_to: none
+  wandb_key: null
+  wandb_project: null
+  wandb_team: null
+  wandb_group: kimi-k3-eagle3
+  wandb_mode: offline
+  wandb_random_suffix: true
