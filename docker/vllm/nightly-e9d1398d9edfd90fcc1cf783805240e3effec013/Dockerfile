@@ -37,8 +37,16 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
       vllm/v1/worker/gpu_model_runner.py && \
     rm -rf /tmp/patches
 
-# Keep the CUDA-13 Mooncake package shipped by the base image. Installing the
-# generic PyPI wheel here can replace it with a CUDA-12 binary.
+# The base image's Mooncake metadata identifies 0.3.12.post1, but its binaries
+# link against libcudart.so.12. Replace it explicitly with the CUDA 13 wheel
+# and fail the build unless the master resolves libcudart.so.13.
+RUN python3 -m pip uninstall -y \
+      mooncake-transfer-engine mooncake-transfer-engine-cuda13 && \
+    python3 -m pip install --no-cache-dir --no-deps \
+      mooncake-transfer-engine-cuda13==0.3.12.post1 && \
+    ldd /usr/local/lib/python3.12/dist-packages/mooncake/mooncake_master \
+      | grep -q 'libcudart.so.13'
+
 # Do not install TorchSpec's `fa` extra in this image. flash-attn-4 requires
 # apache-tvm-ffi>=0.1.12, while the pinned vLLM, TileLang, and TokenSpeed stack
 # requires apache-tvm-ffi==0.1.11. Routing-validation configs use
