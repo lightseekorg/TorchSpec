@@ -80,9 +80,9 @@ index 6d8a28933..2e78cde17 100644
 +            self.postprocess_num_computed_tokens(input_batch)
 +            self.model_state.postprocess_state(input_batch.idx_mapping, 0)
 +
++            # The connector owns the single PP completion/error barrier; a second
++            # barrier here would deadlock peers when one connector re-raises.
 +            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-+            if self.use_pp:
-+                get_pp_group().barrier()
 +            return ModelRunnerOutput(
 +                req_ids=input_batch.req_ids,
 +                req_id_to_index={
