@@ -149,6 +149,7 @@ class TestDSparkConfig(unittest.TestCase):
         self.assertEqual(config.dataset.min_loss_tokens, 32)
         self.assertEqual(draft_config.num_hidden_layers, 5)
         self.assertEqual(draft_config.markov_rank, 256)
+        self.assertEqual(draft_config.target_num_hidden_layers, 64)
         self.assertEqual(
             list(config.inference.aux_hidden_states_layers),
             draft_config.target_layer_ids,

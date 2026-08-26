@@ -191,6 +191,7 @@ class TestDFlash2Config(unittest.TestCase):
             draft_config.num_target_layers,
         )
         self.assertEqual(draft_config.num_hidden_layers, 5)
+        self.assertEqual(draft_config.target_num_hidden_layers, 64)
         self.assertEqual(draft_config.selector_rank, 256)
         self.assertEqual(draft_config.selector_top_k, 16)
 
