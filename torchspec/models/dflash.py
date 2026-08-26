@@ -267,6 +267,17 @@ class DFlashModel(nn.Module):
     def _block_mask_options(self) -> dict:
         return {}
 
+    def _block_mask_options_for_layer(self, layer_id: int) -> dict:
+        """Return the attention-mask options for one draft layer.
+
+        DFlash historically used one mask for every layer.  Keeping this
+        method separate from ``_block_mask_options`` lets model variants use
+        per-layer attention schedules without changing the public training
+        wrapper API.
+        """
+        del layer_id
+        return self._block_mask_options()
+
     def _compute_logits(
         self,
         draft_hidden: torch.Tensor,
@@ -331,21 +342,32 @@ class DFlashModel(nn.Module):
 
         block_mask = None
         if device.type == "cuda":
-            mask_mod = _create_dflash_mask_mod(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                ctx_len=seq_len,
-                block_size=self.block_size,
-                **self._block_mask_options(),
-            )
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=mask_mod,
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=kv_len,
-                device=device,
-            )
+            # A mixed full/SWA schedule needs a distinct BlockMask for each
+            # attention policy.  Cache equal policies so the common uniform
+            # schedule still creates exactly one mask.
+            mask_cache = {}
+            block_masks = []
+            for layer_id in range(self.draft_model.num_layers):
+                options = self._block_mask_options_for_layer(layer_id)
+                cache_key = tuple(sorted(options.items()))
+                if cache_key not in mask_cache:
+                    mask_mod = _create_dflash_mask_mod(
+                        anchor_positions=anchor_positions,
+                        block_keep_mask=block_keep_mask,
+                        ctx_len=seq_len,
+                        block_size=self.block_size,
+                        **options,
+                    )
+                    mask_cache[cache_key] = compile_friendly_create_block_mask(
+                        mask_mod=mask_mod,
+                        B=bsz,
+                        H=None,
+                        Q_LEN=draft_len,
+                        KV_LEN=kv_len,
+                        device=device,
+                    )
+                block_masks.append(mask_cache[cache_key])
+            block_mask = block_masks[0] if len(mask_cache) == 1 else block_masks
 
         # 6. Draft model forward — pass embeddings directly
         draft_hidden = self.draft_model(

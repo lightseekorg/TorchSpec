@@ -157,6 +157,56 @@ def _batch(seed=0, all_masked=False):
 
 
 class TestDFlash2Config(unittest.TestCase):
+    def test_mla_mode_builds_k3_mla_attention(self):
+        from torchspec.models.draft.dspark import K3DSparkMLAAttention
+
+        config = DFlash2Config(
+            **_tiny_config_kwargs(
+                num_hidden_layers=3,
+                attention_mode="mla",
+                layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+                sliding_window=2048,
+                is_causal=False,
+                q_lora_rank=4,
+                kv_lora_rank=4,
+                qk_nope_head_dim=2,
+                qk_rope_head_dim=2,
+                v_head_dim=2,
+                rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+            )
+        )
+
+        model = DFlash2DraftModel(config)
+
+        self.assertEqual(config.attention_mode, "mla")
+        self.assertTrue(
+            all(isinstance(layer.self_attn, K3DSparkMLAAttention) for layer in model.layers)
+        )
+
+    def test_mixed_layer_types_build_per_layer_mask_policies(self):
+        config = DFlash2Config(
+            **_tiny_config_kwargs(
+                num_hidden_layers=3,
+                layer_types=["sliding_attention", "sliding_attention", "full_attention"],
+                sliding_window=2048,
+                is_causal=False,
+            )
+        )
+        model = DFlash2Model(
+            DFlash2DraftModel(config),
+            block_size=config.block_size,
+            num_anchors=1,
+        )
+
+        self.assertEqual(
+            [model._block_mask_options_for_layer(i) for i in range(3)],
+            [
+                {"is_causal": False, "sliding_window": 2048},
+                {"is_causal": False, "sliding_window": 2048},
+                {"is_causal": False, "sliding_window": None},
+            ],
+        )
+
     def test_repository_config_dispatches_to_dflash2(self):
         config_path = ROOT / "torchspec" / "config" / "dflash2_draft_config.json"
         self.assertTrue(config_path.is_file())
@@ -372,7 +422,6 @@ class TestDFlash2Config(unittest.TestCase):
         invalid_layer_types = (
             (["full_attention", "full_attention"], 1, "one entry"),
             (["linear_attention"], 1, "Unsupported"),
-            (["full_attention", "sliding_attention"], 2, "mixed"),
         )
         for layer_types, num_hidden_layers, error in invalid_layer_types:
             with self.subTest(layer_types=layer_types):

@@ -44,6 +44,7 @@ _SERVING_KEY_REMAP = (
 )
 
 _NESTED_CONFIG_FIELDS = (
+    "attention_mode",
     "block_size",
     "conv_group_size",
     "conv_kernel_size",
@@ -101,6 +102,15 @@ class DFlash2Config(DFlashConfig):
         conv_group_size: int = 16,
         selector_rank: int = 256,
         selector_top_k: int = 16,
+        attention_mode: str = "gqa",
+        q_lora_rank: int | None = 1536,
+        kv_lora_rank: int = 512,
+        qk_nope_head_dim: int = 128,
+        qk_rope_head_dim: int = 64,
+        v_head_dim: int = 128,
+        mla_use_output_gate: bool = False,
+        rope_scaling: dict | None = None,
+        rope_parameters: dict | None = None,
         input_embedding_scale: float = 1.0,
         output_multiplier: float = 1.0,
         final_logit_softcapping: float | None = None,
@@ -119,6 +129,7 @@ class DFlash2Config(DFlashConfig):
         conv_group_size = int(nested.get("conv_group_size", conv_group_size))
         selector_rank = int(nested.get("selector_rank", selector_rank))
         selector_top_k = int(nested.get("selector_top_k", selector_top_k))
+        attention_mode = str(nested.get("attention_mode", attention_mode)).lower()
         input_embedding_scale = float(nested.get("input_embedding_scale", input_embedding_scale))
         output_multiplier = float(nested.get("output_multiplier", output_multiplier))
         final_logit_softcapping = nested.get("final_logit_softcapping", final_logit_softcapping)
@@ -181,8 +192,10 @@ class DFlash2Config(DFlashConfig):
         kwargs["mask_token_id"] = int(
             nested.get("mask_token_id", kwargs.get("mask_token_id", 151669))
         )
-        rope_parameters = kwargs.get("rope_parameters") or {}
-        kwargs.setdefault("rope_theta", rope_parameters.get("rope_theta", 10000.0))
+        rope_parameters = rope_scaling if rope_scaling is not None else rope_parameters
+        rope_parameters = dict(rope_parameters) if rope_parameters is not None else None
+        rope_parameters_for_validation = rope_parameters or {}
+        kwargs.setdefault("rope_theta", rope_parameters_for_validation.get("rope_theta", 10000.0))
         kwargs.pop("model_type", None)
 
         hidden_act = kwargs.get("hidden_act", "silu")
@@ -194,11 +207,22 @@ class DFlash2Config(DFlashConfig):
             raise ValueError("DFlash2 training requires attention_dropout=0")
         if kwargs.get("fc_norm", False):
             raise ValueError("DFlash2 training does not support fc_norm=True")
-        if kwargs.get("rope_scaling") is not None:
-            raise ValueError("DFlash2 training does not support rope_scaling")
-        unsupported_rope_keys = set(rope_parameters) - {"rope_theta", "rope_type"}
-        if rope_parameters.get("rope_type", "default") != "default" or unsupported_rope_keys:
-            raise ValueError("DFlash2 training supports only default rope_parameters")
+        if attention_mode not in {"gqa", "mla"}:
+            raise ValueError(
+                f"DFlash2 attention_mode must be 'gqa' or 'mla', got {attention_mode!r}"
+            )
+        if attention_mode == "gqa":
+            if rope_scaling is not None:
+                raise ValueError("GQA DFlash2 training does not support rope_scaling")
+            unsupported_rope_keys = set(rope_parameters_for_validation) - {
+                "rope_theta",
+                "rope_type",
+            }
+            if (
+                rope_parameters_for_validation.get("rope_type", "default") != "default"
+                or unsupported_rope_keys
+            ):
+                raise ValueError("GQA DFlash2 training supports only default rope_parameters")
 
         num_hidden_layers = int(kwargs.get("num_hidden_layers", 5))
         use_sliding_window = bool(kwargs.get("use_sliding_window", False))
@@ -226,8 +250,6 @@ class DFlash2Config(DFlashConfig):
         attention_types = set(layer_types)
         if not attention_types <= {"full_attention", "sliding_attention"}:
             raise ValueError(f"Unsupported DFlash2 layer types: {sorted(attention_types)}")
-        if len(attention_types) > 1:
-            raise ValueError("DFlash2 training does not support mixed full and sliding layers")
         if "sliding_attention" in attention_types:
             if sliding_window is None:
                 raise ValueError(
@@ -275,6 +297,31 @@ class DFlash2Config(DFlashConfig):
             )
 
         super().__init__(**kwargs)
+        self.attention_mode = attention_mode
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = int(kv_lora_rank)
+        self.qk_nope_head_dim = int(qk_nope_head_dim)
+        self.qk_rope_head_dim = int(qk_rope_head_dim)
+        self.v_head_dim = int(v_head_dim)
+        self.mla_use_output_gate = bool(mla_use_output_gate)
+        self.rope_parameters = rope_parameters
+        if self.attention_mode == "mla":
+            # DeepSeekMLAAttention's shared rotary builder reads the legacy
+            # ``rope_scaling`` name.  Keep it populated for Transformers
+            # versions where it is not an alias of ``rope_parameters``.
+            self.rope_scaling = rope_parameters
+        if rope_parameters is not None:
+            nested_rope_theta = rope_parameters.get("rope_theta")
+            if nested_rope_theta is not None:
+                self.rope_theta = float(nested_rope_theta)
+            if rope_parameters.get("rope_type", rope_parameters.get("type")) == "yarn":
+                for key, default in {
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "mscale": 1.0,
+                    "mscale_all_dim": 0.0,
+                }.items():
+                    rope_parameters.setdefault(key, default)
         self.block_size = block_size
         self.conv_kernel_size = conv_kernel_size
         self.conv_group_size = conv_group_size
@@ -286,6 +333,7 @@ class DFlash2Config(DFlashConfig):
 
         nested.update(
             {
+                "attention_mode": self.attention_mode,
                 "block_size": self.block_size,
                 "conv_kernel_size": self.conv_kernel_size,
                 "conv_group_size": self.conv_group_size,
@@ -418,6 +466,10 @@ class CandidateSelector(nn.Module):
 
 class DFlash2DecoderLayer(DFlashDecoderLayer):
     def __init__(self, config: DFlash2Config):
+        if config.attention_mode == "mla":
+            from torchspec.models.draft.dspark import K3DSparkMLAAttention
+
+            self.attention_class = K3DSparkMLAAttention
         super().__init__(config)
         conv_args = {
             "hidden_size": config.hidden_size,

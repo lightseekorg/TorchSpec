@@ -446,7 +446,8 @@ class DFlashDraftModel(PreTrainedModel):
             context_feature: [B, ctx_len, D] — projected context from target
             draft_position_ids: [B, draft_len]
             context_position_ids: [B, ctx_len]
-            block_mask: FlexAttention BlockMask
+            block_mask: FlexAttention BlockMask, or a per-layer sequence of
+                BlockMasks for mixed attention schedules
             noise_embedding: [B, draft_len, D] — pre-computed embeddings (from training wrapper)
 
         Returns:
@@ -457,13 +458,16 @@ class DFlashDraftModel(PreTrainedModel):
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
-        for layer in self.layers:
+        for layer_id, layer in enumerate(self.layers):
+            layer_block_mask = block_mask
+            if isinstance(block_mask, (list, tuple)):
+                layer_block_mask = block_mask[layer_id]
             draft_hidden = layer(
                 draft_hidden=draft_hidden,
                 context_hidden=context_feature,
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
-                block_mask=block_mask,
+                block_mask=layer_block_mask,
             )
 
         return self.final_norm(draft_hidden)

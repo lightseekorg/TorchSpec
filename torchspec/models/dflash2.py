@@ -48,28 +48,41 @@ class DFlash2Model(DFlashModel):
         attention_types = set(layer_types or ["full_attention"])
         if not attention_types <= {"full_attention", "sliding_attention"}:
             raise ValueError(f"Unsupported DFlash2 layer types: {sorted(attention_types)}")
-        if len(attention_types) > 1:
-            raise ValueError("DFlash2 training does not support mixed full and sliding layers")
-
-        uses_sliding_window = "sliding_attention" in attention_types
         explicit_causality = getattr(config, "is_causal", None)
-        self.attention_is_causal = (
-            uses_sliding_window if explicit_causality is None else bool(explicit_causality)
-        )
         configured_window = getattr(config, "sliding_window", None)
-        self.sliding_window = (
-            int(configured_window)
-            if uses_sliding_window and configured_window is not None
-            else None
-        )
-        if self.sliding_window is not None and self.sliding_window < 1:
-            raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
+        if "sliding_attention" in attention_types:
+            if configured_window is None:
+                raise ValueError(
+                    "DFlash2 sliding_attention layers require an explicit positive sliding_window"
+                )
+            configured_window = int(configured_window)
+            if configured_window < 1:
+                raise ValueError(f"sliding_window must be positive, got {configured_window}")
+
+        normalized_layer_types = layer_types or ["full_attention"] * config.num_hidden_layers
+        self.layer_block_mask_options = []
+        for layer_type in normalized_layer_types:
+            uses_sliding_window = layer_type == "sliding_attention"
+            self.layer_block_mask_options.append(
+                {
+                    "is_causal": (
+                        uses_sliding_window
+                        if explicit_causality is None
+                        else bool(explicit_causality)
+                    ),
+                    "sliding_window": configured_window if uses_sliding_window else None,
+                }
+            )
+
+        # Retain the uniform-policy attributes for callers that inspect them.
+        self.attention_is_causal = self.layer_block_mask_options[0]["is_causal"]
+        self.sliding_window = self.layer_block_mask_options[0]["sliding_window"]
 
     def _block_mask_options(self) -> dict:
-        return {
-            "is_causal": self.attention_is_causal,
-            "sliding_window": self.sliding_window,
-        }
+        return self.layer_block_mask_options[0]
+
+    def _block_mask_options_for_layer(self, layer_id: int) -> dict:
+        return self.layer_block_mask_options[layer_id]
 
     def _compute_logits(
         self,
