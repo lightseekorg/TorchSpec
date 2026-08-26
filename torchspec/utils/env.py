@@ -23,7 +23,14 @@ _TORCHSPEC_ENV_KEYS = [
     "TP_SOCKET_IFNAME",
     "CUTE_DSL_CACHE_DIR",
     "TORCHSPEC_FLASH_ATTN_OPT_LEVEL",
+    "VLLM_USE_V2_MODEL_RUNNER",
 ]
+
+_TORCHSPEC_DEFAULT_ENV_VARS = {
+    # TorchSpec's vLLM hidden-state extraction path requires Model Runner V2.
+    # An explicit process environment value still takes precedence below.
+    "VLLM_USE_V2_MODEL_RUNNER": "1",
+}
 
 # Prevent Ray from overriding VISIBLE_DEVICES so actors manage GPU assignment themselves.
 # Reference: https://github.com/ray-project/ray/blob/161849364/python/ray/_private/accelerators/
@@ -49,6 +56,9 @@ def get_torchspec_env_vars() -> dict[str, str]:
     Intended for use with ``ray.remote(runtime_env={"env_vars": ...})``.
     Call-site env vars merged after this dict take higher priority.
     """
-    env = {k: "1" for k in _RAY_NOSET_VISIBLE_DEVICES_KEYS}
+    env = {
+        **_TORCHSPEC_DEFAULT_ENV_VARS,
+        **{k: "1" for k in _RAY_NOSET_VISIBLE_DEVICES_KEYS},
+    }
     env.update({k: os.environ[k] for k in _TORCHSPEC_ENV_KEYS if k in os.environ})
     return env
