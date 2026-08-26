@@ -71,12 +71,17 @@ def _extract_from_kv_cache(
     slot_mapping: torch.Tensor,
     num_tokens: int,
 ) -> torch.Tensor:
-    """Extract data from KV cache.
+    """Extract data from an LBNHC hidden-state cache view.
 
-    Assumes kv_cache shape: (num_pages, page_size, num_heads, head_size)
+    ``kv_cache`` has shape ``(num_blocks, num_heads, block_size, head_size)``.
+    This matches latest vLLM's standardized hidden-state connector layout.
     """
-    padded_kv = kv_cache.flatten(0, 1)[slot_mapping]
-    return padded_kv[:num_tokens]
+    block_size = kv_cache.shape[2]
+    return kv_cache[
+        slot_mapping // block_size,
+        :,
+        slot_mapping % block_size,
+    ][:num_tokens]
 
 
 def _slot_mapping_from_block_ids(
@@ -85,45 +90,22 @@ def _slot_mapping_from_block_ids(
     num_tokens: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Compute slot_mapping from accumulated block_ids instead of attn_metadata.
-
-    We cannot use ``attn_metadata.slot_mapping`` for two reasons:
-    1. Chunked prefill: attn_metadata only has the current chunk's slots, but
-       we need the full sequence's mapping (block_ids are accumulated across
-       chunks in ``build_connector_meta``).
-    2. HMA models: ``cache_config.block_size`` differs from the CacheOnly
-       group's actual page_size.  Reading ``page_size`` from
-       ``kv_layer.shape[1]`` handles both cases correctly.
-    """
+    """Compute a complete slot mapping from finished-request block IDs."""
     block_ids_gpu = torch.tensor(block_ids, dtype=torch.int64, device=device)
     offsets = torch.arange(page_size, dtype=torch.int64, device=device)
     return (block_ids_gpu.unsqueeze(1) * page_size + offsets).flatten()[:num_tokens]
 
 
 @dataclass
-class _ReqMeta:
+class _PendingSave:
     req_id: str
     token_ids: torch.Tensor
-    block_ids: list[int] = field(default_factory=list)
+    block_ids: list[int]
 
 
 @dataclass
 class MooncakeConnectorMetadata(KVConnectorMetadata):
-    requests: list[_ReqMeta] = field(default_factory=list)
-
-    def add_request(
-        self,
-        req_id: str,
-        token_ids: list[int],
-        block_ids: list[int],
-    ) -> None:
-        self.requests.append(
-            _ReqMeta(
-                req_id=req_id,
-                token_ids=torch.tensor(token_ids),
-                block_ids=list(block_ids),
-            )
-        )
+    pending_saves: list[_PendingSave] = field(default_factory=list)
 
 
 class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
@@ -149,9 +131,13 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             role=role,
             kv_cache_config=kv_cache_config,
         )
-        self._block_size = vllm_config.cache_config.block_size
-        self.cache_layers: list[str] = []
         self._cache_layer_group_id: int = self._find_cache_layer_group_id(kv_cache_config)
+        self._block_size = self._get_cache_block_size(
+            vllm_config,
+            kv_cache_config,
+            self._cache_layer_group_id,
+        )
+        self.cache_layers: list[str] = []
 
         assert self._vllm_config.speculative_config is not None, (
             "MooncakeHiddenStatesConnector requires 'extract_hidden_states' speculative method"
@@ -167,9 +153,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._num_training_layers = max(self.num_hidden_states - 1, 1)
 
         # Scheduler-side state: track requests and pre-computed metadata
-        self._active_requests: dict[str, Any] = {}
-        self._req_blocks: dict[str, list[int]] = {}
+        self._request_token_ids: dict[str, list[int]] = {}
         self._req_metadata: dict[str, dict[str, Any]] = {}
+        self._pending_saves: dict[str, _PendingSave] = {}
 
         self._mooncake_store = None
         self._mooncake_setup_done = False
@@ -177,6 +163,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._pp_rank: int | None = None
         self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self._num_target_layers = vllm_config.model_config.get_total_num_hidden_layers()
+        self._kv_cache: torch.Tensor | None = None
         self._check_layer_layout()
         self._check_mooncake_env()
 
@@ -201,29 +188,36 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
     @staticmethod
     def _find_cache_layer_group_id(kv_cache_config) -> int:
-        """Find the KV cache group that contains the CacheOnlyAttentionLayer.
+        """Find the isolated ``HiddenStateCacheSpec`` group.
 
-        When ``kv_cache_config`` is available (worker side), we look for the
-        group whose layer name contains ``cache_only_layers``.  On the
-        scheduler side (``kv_cache_config is None``) we return ``None``
-        and resolve it lazily in ``build_connector_meta`` by picking the
-        group with ``ceil(num_tokens / block_size)`` blocks.
+        Latest vLLM places the hidden-state cache in group zero on the
+        scheduler side and exposes the concrete group specs on workers.
         """
         if kv_cache_config is None:
-            return None  # type: ignore[return-value]
-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            for name in group.layer_names:
-                if "cache_only_layers" in name:
-                    logger.info(
-                        f"Cache-only layer found in KV group {gid}: {name} "
-                        f"(total groups={len(kv_cache_config.kv_cache_groups)})"
-                    )
-                    return gid
-        logger.warning(
-            f"Cache-only layer NOT found in KV cache groups "
-            f"(groups={[g.layer_names for g in kv_cache_config.kv_cache_groups]})"
+            return 0
+
+        from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+
+        groups = kv_cache_config.kv_cache_groups
+        group_ids = [
+            gid
+            for gid, group in enumerate(groups)
+            if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
+        ]
+        if len(group_ids) == 1:
+            return group_ids[0]
+        if not group_ids and len(groups) == 1:
+            return 0
+        raise ValueError(
+            "Could not uniquely identify the hidden-state KV cache group "
+            f"among {len(groups)} groups: {group_ids}"
         )
-        return None  # type: ignore[return-value]
+
+    @staticmethod
+    def _get_cache_block_size(vllm_config, kv_cache_config, group_id: int) -> int:
+        if kv_cache_config is None:
+            return vllm_config.cache_config.block_size
+        return kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size
 
     def _get_tp_rank(self) -> int:
         if self._tp_rank is None:
@@ -325,6 +319,12 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         assert len(self.cache_layers) == 1, (
             f"Expected 1 CacheOnlyAttentionLayer, got {len(self.cache_layers)}"
         )
+        self._kv_cache = kv_caches[self.cache_layers[0]]
+        if self._block_size != self._kv_cache.shape[2]:
+            raise ValueError(
+                "Hidden-state block-size mismatch: "
+                f"derived {self._block_size}, cache view has {self._kv_cache.shape[2]}"
+            )
 
     def save_kv_layer(
         self,
@@ -333,77 +333,97 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
-        if layer_name not in self.cache_layers:
+        # Latest vLLM extracts completed hidden-state caches from get_finished.
+        # Per-layer metadata is not guaranteed to contain a complete request.
+        pass
+
+    def _publish_pending_save(self, pending: _PendingSave) -> None:
+        local_positions = self._local_layer_positions()
+        if self._pp_size > 1 and not local_positions:
             return
-
-        from vllm.model_executor.models.extract_hidden_states import (
-            CacheOnlyAttentionMetadata,
-        )
-
-        assert isinstance(attn_metadata, CacheOnlyAttentionMetadata)
-
-        connector_metadata = self._get_connector_metadata()
-        assert isinstance(connector_metadata, MooncakeConnectorMetadata)
-
-        # Non-writer TP ranks return here; a writer that cannot reach the store
-        # has already raised inside _ensure_mooncake_store.
         if not self._ensure_mooncake_store():
             return
+        assert self._kv_cache is not None
 
-        # Use tensor's actual page_size, not cache_config.block_size
-        # (they differ on HMA models).
-        page_size = kv_layer.shape[1]
-
-        for request in connector_metadata.requests:
-            num_tokens = request.token_ids.shape[0]
-            mooncake_key = _sanitize_mooncake_key(request.req_id)
-
-            # Recompute from accumulated block_ids — attn_metadata.slot_mapping
-            # only covers the current chunk, not the full sequence.
-            slot_mapping = _slot_mapping_from_block_ids(
-                request.block_ids,
-                page_size,
-                num_tokens,
-                device=kv_layer.device,
+        num_tokens = pending.token_ids.shape[0]
+        slot_mapping = _slot_mapping_from_block_ids(
+            pending.block_ids,
+            self._block_size,
+            num_tokens,
+            device=self._kv_cache.device,
+        )
+        if slot_mapping.shape[0] < num_tokens:
+            raise RuntimeError(
+                f"Completed request {pending.req_id} has only "
+                f"{slot_mapping.shape[0]} hidden-state slots for {num_tokens} tokens"
             )
-            num_slots = slot_mapping.shape[0]
 
-            # With chunked prefill, save_kv_layer is called per chunk.
-            # Skip partial chunks — only store when all blocks are allocated.
-            if num_slots < num_tokens:
-                continue
+        hidden_states_3d = _extract_from_kv_cache(
+            self._kv_cache,
+            slot_mapping,
+            num_tokens,
+        )
+        input_ids = pending.token_ids.to(hidden_states_3d.device)
+        mooncake_key = _sanitize_mooncake_key(pending.req_id)
 
-            hidden_states_3d = _extract_from_kv_cache(kv_layer, slot_mapping, num_tokens)
+        if self._pp_size == 1:
+            all_hidden = hidden_states_3d.reshape(num_tokens, -1)
+            split_at = self._num_training_layers * self._hidden_size
+            self._mooncake_store.put(
+                key=mooncake_key,
+                hidden_states=all_hidden[:, :split_at],
+                input_ids=input_ids,
+                last_hidden_states=all_hidden[:, -self._hidden_size :],
+                target=None,
+            )
+            return
 
-            input_ids = request.token_ids.to(hidden_states_3d.device)
+        for position in local_positions:
+            layer_id = self._layer_ids[position]
+            self._mooncake_store.put(
+                key=f"{mooncake_key}_layer{layer_id}",
+                hidden_states=hidden_states_3d[:, position, :],
+                input_ids=input_ids,
+                last_hidden_states=None,
+                target=None,
+            )
 
-            try:
-                if self._pp_size == 1:
-                    all_hidden = hidden_states_3d.reshape(num_tokens, -1)
-                    split_at = self._num_training_layers * self._hidden_size
-                    self._mooncake_store.put(
-                        key=mooncake_key,
-                        hidden_states=all_hidden[:, :split_at],
-                        input_ids=input_ids,
-                        last_hidden_states=all_hidden[:, -self._hidden_size :],
-                        target=None,
-                    )
-                else:
-                    for position in self._local_layer_positions():
-                        layer_id = self._layer_ids[position]
-                        layer_key = f"{mooncake_key}_layer{layer_id}"
-                        self._mooncake_store.put(
-                            key=layer_key,
-                            hidden_states=hidden_states_3d[:, position, :],
-                            input_ids=input_ids,
-                            last_hidden_states=None,
-                            target=None,
-                        )
-            except Exception:
-                # Fatal at every PP size: a dropped sample is a hole in the
-                # training data that no consumer can detect.
-                logger.exception(f"save_kv_layer: failed to store to Mooncake for {request.req_id}")
-                raise
+    def get_finished(
+        self,
+        finished_req_ids: set[str],
+    ) -> tuple[set[str] | None, set[str] | None]:
+        del finished_req_ids
+        pending_saves: list[_PendingSave] = []
+        if self.has_connector_metadata():
+            metadata = self._get_connector_metadata()
+            if isinstance(metadata, MooncakeConnectorMetadata):
+                pending_saves = metadata.pending_saves
+
+        if not pending_saves:
+            return None, None
+
+        local_error: BaseException | None = None
+        try:
+            for pending in pending_saves:
+                self._publish_pending_save(pending)
+            if self._mooncake_store is not None:
+                # Correctness-first completion: do not release cache blocks or
+                # report the request sent until every local PUT has completed.
+                self._mooncake_store.flush()
+        except BaseException as exc:
+            local_error = exc
+
+        if self._pp_size > 1:
+            from vllm.distributed import get_pp_group
+
+            # All stages reach the collective even if a local PUT failed, so a
+            # single-stage exception cannot strand its peer before propagation.
+            get_pp_group().barrier()
+
+        if local_error is not None:
+            raise local_error
+
+        return {pending.req_id for pending in pending_saves}, None
 
     # ==============================
     # Scheduler-side methods
@@ -425,35 +445,12 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
         meta = MooncakeConnectorMetadata()
+        meta.pending_saves = list(self._pending_saves.values())
+        self._pending_saves.clear()
+
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = new_req.prompt_token_ids or []
-            group_sizes = [len(g) for g in new_req.block_ids]
-            gid = self._cache_layer_group_id
-            if gid is None:
-                # On the scheduler side kv_cache_config is unavailable, so we
-                # pick the group with the most blocks.  The CacheOnly group
-                # uses the smallest page_size and therefore always has the
-                # highest block count for a given token count.
-                gid = max(range(len(new_req.block_ids)), key=lambda i: len(new_req.block_ids[i]))
-                self._cache_layer_group_id = gid
-                logger.warning(f"Resolved cache-only KV group id={gid} (group_sizes={group_sizes})")
-            meta.add_request(
-                new_req.req_id,
-                token_ids=token_ids,
-                block_ids=new_req.block_ids[gid],
-            )
-            logger.debug(
-                "build_connector_meta: req_id=%s key=%s num_tokens=%d gid=%d "
-                "group_sizes=%s chosen_blocks=%d",
-                new_req.req_id,
-                _sanitize_mooncake_key(new_req.req_id),
-                len(token_ids),
-                gid,
-                group_sizes,
-                len(new_req.block_ids[gid]),
-            )
-            self._active_requests[new_req.req_id] = new_req
-            self._req_blocks[new_req.req_id] = list(new_req.block_ids[gid])
+            self._request_token_ids[new_req.req_id] = list(token_ids)
 
             seq_len = len(token_ids)
             training_hidden_size = self._num_training_layers * self._hidden_size
@@ -487,27 +484,6 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     for layer_id in self._layer_ids
                 ]
 
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(cached_reqs.req_ids):
-            if req_id not in self._active_requests:
-                continue
-
-            new_block_ids = cached_reqs.new_block_ids[i]
-            if new_block_ids is None:
-                continue
-
-            cached_req = self._active_requests[req_id]
-            req_block_ids = self._req_blocks[req_id]
-
-            block_ids = new_block_ids[self._cache_layer_group_id]
-            req_block_ids.extend(block_ids)
-
-            meta.add_request(
-                req_id=req_id,
-                token_ids=cached_req.prompt_token_ids or [],
-                block_ids=req_block_ids,
-            )
-
         return meta
 
     def request_finished(
@@ -516,20 +492,28 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         req_id = request.request_id
-        _ = self._active_requests.pop(req_id, None)
-        _ = self._req_blocks.pop(req_id, None)
-
+        token_ids = self._request_token_ids.pop(
+            req_id,
+            list(request.prompt_token_ids or []),
+        )
         mooncake_meta = self._req_metadata.pop(req_id, None)
-        return False, mooncake_meta
+        self._pending_saves[req_id] = _PendingSave(
+            req_id=req_id,
+            token_ids=torch.tensor(token_ids, dtype=torch.long),
+            block_ids=list(block_ids),
+        )
+        # Delay freeing the hidden-state cache blocks until get_finished has
+        # completed every local Mooncake PUT.
+        return True, mooncake_meta
 
     def request_finished_all_groups(
         self,
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        group0_ids = block_ids[0] if block_ids else []
-        return self.request_finished(request, group0_ids)
+        cache_group_ids = block_ids[self._cache_layer_group_id] if block_ids else []
+        return self.request_finished(request, cache_group_ids)
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
-        return "NHD"
+        return "LBNHC"

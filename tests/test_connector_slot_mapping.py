@@ -123,19 +123,22 @@ class TestExtractFromKvCache:
     def test_basic_extraction(self):
         num_pages, page_size, num_heads, head_size = 4, 3, 2, 4
         kv_cache = torch.arange(num_pages * page_size * num_heads * head_size, dtype=torch.float32)
-        kv_cache = kv_cache.view(num_pages, page_size, num_heads, head_size)
+        kv_cache = kv_cache.view(num_pages, num_heads, page_size, head_size)
 
         slot_mapping = torch.tensor([0, 1, 5], dtype=torch.int64)
         result = _extract_from_kv_cache(kv_cache, slot_mapping, num_tokens=3)
 
-        flat = kv_cache.flatten(0, 1)
-        expected = flat[slot_mapping][:3]
+        expected = kv_cache[
+            slot_mapping // page_size,
+            :,
+            slot_mapping % page_size,
+        ][:3]
         assert torch.equal(result, expected)
 
     def test_with_block_ids_mapping(self):
         """End-to-end: block_ids -> slot_mapping -> extract."""
         num_pages, page_size, num_heads, head_size = 10, 4, 2, 8
-        kv_cache = torch.randn(num_pages, page_size, num_heads, head_size)
+        kv_cache = torch.randn(num_pages, num_heads, page_size, head_size)
 
         block_ids = [3, 7]
         num_tokens = 6
@@ -148,11 +151,10 @@ class TestExtractFromKvCache:
         result = _extract_from_kv_cache(kv_cache, slot_mapping, num_tokens)
         assert result.shape == (num_tokens, num_heads, head_size)
 
-        flat = kv_cache.flatten(0, 1)
-        assert torch.equal(result[0], flat[3 * 4 + 0])
-        assert torch.equal(result[3], flat[3 * 4 + 3])
-        assert torch.equal(result[4], flat[7 * 4 + 0])
-        assert torch.equal(result[5], flat[7 * 4 + 1])
+        assert torch.equal(result[0], kv_cache[3, :, 0])
+        assert torch.equal(result[3], kv_cache[3, :, 3])
+        assert torch.equal(result[4], kv_cache[7, :, 0])
+        assert torch.equal(result[5], kv_cache[7, :, 1])
 
 
 if __name__ == "__main__":
