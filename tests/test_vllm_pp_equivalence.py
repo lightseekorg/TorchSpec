@@ -9,8 +9,9 @@ Both arms go through production code: the ``MooncakeHiddenStatesConnector``
 publishes, and ``MooncakeDataset._load_from_mooncake`` reads -- which is the
 only place that knows the per-layer fragment layout.
 
-Requires a vLLM built with ``patches/vllm/<image-tag>/vllm_pp_hidden_states.patch``;
-stock vLLM captures aux states on the last stage only.
+Requires a vLLM built with both PP extraction patches under
+``patches/vllm/<image-tag>/`` and ``VLLM_USE_V2_MODEL_RUNNER=1``; stock vLLM
+rejects extract-hidden-states with pipeline parallelism in Model Runner V2.
 
 The arms must share a batch composition, which is why one request per
 ``generate()`` call is the default.  Batching the same three prompts together
@@ -122,6 +123,7 @@ def build_engine(model_path: str, tp_size: int, pp_size: int, aux_ids: list[int]
             "kv_role": "kv_producer",
         },
         compilation_config={"cudagraph_mode": "NONE"},
+        attention_config={"backend": "FLEX_ATTENTION"},
     )
 
 

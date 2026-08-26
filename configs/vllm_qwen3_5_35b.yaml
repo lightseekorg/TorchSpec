@@ -61,6 +61,8 @@ inference:
       max_num_batched_tokens: 65536
       enable_chunked_prefill: true
       enforce_eager: true
+      attention_config:
+        backend: FLEX_ATTENTION
 
 mooncake:
   protocol: tcp

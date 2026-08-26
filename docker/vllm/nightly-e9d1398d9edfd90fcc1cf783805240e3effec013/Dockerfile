@@ -1,5 +1,7 @@
 FROM vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013@sha256:95bed119f39e2414973cf7224df31c9a3ed213566138722346d7bd360edf842b
 
+ENV VLLM_USE_V2_MODEL_RUNNER=1
+
 ARG TORCHSPEC_SOURCE_REV=unknown
 ARG VLLM_SOURCE_REV=e9d1398d9edfd90fcc1cf783805240e3effec013
 
@@ -34,6 +36,8 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
       vllm/v1/engine/input_processor.py \
       vllm/v1/outputs.py \
       vllm/v1/spec_decode/extract_hidden_states.py \
+      vllm/v1/worker/gpu/model_runner.py \
+      vllm/v1/worker/gpu/spec_decode/extract_hidden_states.py \
       vllm/v1/worker/gpu_model_runner.py && \
     rm -rf /tmp/patches
 

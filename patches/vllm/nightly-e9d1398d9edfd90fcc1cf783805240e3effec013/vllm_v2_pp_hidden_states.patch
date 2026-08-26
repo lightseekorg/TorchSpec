@@ -1,0 +1,203 @@
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6d8a28933..2e78cde17 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -137,6 +137,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
+ )
++from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
++    ExtractHiddenStatesSpeculator,
++)
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+     RejectionSampler,
+     get_max_chunk_logits,
+@@ -243,8 +246,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.speculator = None
+         self.use_aux_hidden_state_outputs = False
+         self.num_speculative_steps = vllm_config.num_speculative_tokens
++        self.extract_hidden_states = (
++            self.speculative_config is not None
++            and self.speculative_config.uses_extract_hidden_states()
++        )
+         if self.speculative_config is not None:
+-            if self.is_last_pp_rank:
++            if self.is_last_pp_rank or self.extract_hidden_states:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
+ 
+             if self.speculative_config.method in (
+@@ -255,7 +262,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             ):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+-                if self.use_pp:
++                if self.use_pp and not self.extract_hidden_states:
+                     raise ValueError(
+                         f"{self.speculative_config.method} with pipeline parallel "
+                         "is not supported."
+@@ -1670,19 +1677,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     # Eager (NONE): call the raw model directly.
+                     model_output = self.model(**model_inputs)
+ 
++        if self.use_aux_hidden_state_outputs:
++            assert isinstance(model_output, tuple)
++            model_output, aux_hidden_states = model_output
++        else:
++            aux_hidden_states = None
++
+         if self.is_last_pp_rank:
+-            if self.use_aux_hidden_state_outputs:
+-                assert isinstance(model_output, tuple)
+-                hidden_states, aux_hidden_states = model_output
+-            else:
+-                assert isinstance(model_output, torch.Tensor)
+-                hidden_states = model_output
+-                aux_hidden_states = None
++            assert isinstance(model_output, torch.Tensor)
++            hidden_states = model_output
+             output_intermediate_tensors = None
+         else:
+             assert isinstance(model_output, IntermediateTensors)
+             hidden_states = None
+-            aux_hidden_states = None
+             output_intermediate_tensors = model_output
+ 
+         routed_experts = None
+@@ -1726,6 +1733,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         routed_experts = self.execute_model_state.routed_experts
+         self.execute_model_state = None
+ 
++        if self.extract_hidden_states:
++            assert isinstance(self.speculator, ExtractHiddenStatesSpeculator)
++            assert attn_metadata is not None
++            assert slot_mappings_by_layer is not None
++            self.speculator.cache_hidden_states(
++                input_batch=input_batch,
++                attn_metadata=attn_metadata,
++                slot_mappings=slot_mappings_by_layer,
++                aux_hidden_states=aux_hidden_states,
++            )
++            self.postprocess_num_computed_tokens(input_batch)
++            self.model_state.postprocess_state(input_batch.idx_mapping, 0)
++
++            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
++            if self.use_pp:
++                get_pp_group().barrier()
++            return ModelRunnerOutput(
++                req_ids=input_batch.req_ids,
++                req_id_to_index={
++                    req_id: index for index, req_id in enumerate(input_batch.req_ids)
++                },
++                sampled_token_ids=[[] for _ in input_batch.req_ids],
++                prefill_only=True,
++                kv_connector_output=kv_connector_output,
++                ec_connector_output=ec_connector_output,
++            )
++
+         if not self.is_last_pp_rank:
+             # Non-last PP rank: hidden_states is None because this rank produced
+             # IntermediateTensors instead of final hidden states. Receive the
+diff --git a/vllm/v1/worker/gpu/spec_decode/extract_hidden_states.py b/vllm/v1/worker/gpu/spec_decode/extract_hidden_states.py
+index efcdec801..7951f1558 100644
+--- a/vllm/v1/worker/gpu/spec_decode/extract_hidden_states.py
++++ b/vllm/v1/worker/gpu/spec_decode/extract_hidden_states.py
+@@ -8,6 +8,8 @@ import torch.nn as nn
+ from vllm.compilation.backends import set_model_tag
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
++from vllm.distributed.parallel_state import get_pp_group
++from vllm.distributed.utils import get_pp_indices
+ from vllm.forward_context import set_forward_context
+ from vllm.model_executor.model_loader import get_model
+ from vllm.v1.worker.gpu.input_batch import InputBatch
+@@ -47,7 +49,9 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
+                 "model config for extract_hidden_states method"
+             )
+ 
+-        self.num_hidden_states = len(layer_ids)
++        self.layer_ids = tuple(layer_ids)
++        self.num_hidden_states = len(self.layer_ids)
++        self.local_hidden_state_indices = self._get_local_hidden_state_indices()
+         assert isinstance(self.dtype, torch.dtype)
+         self.hidden_states = torch.zeros(
+             self.max_num_tokens,
+@@ -57,6 +61,21 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
+             device=device,
+         )
+ 
++    def _get_local_hidden_state_indices(self) -> tuple[int, ...]:
++        pp_size = self.vllm_config.parallel_config.pipeline_parallel_size
++        if pp_size == 1:
++            return tuple(range(self.num_hidden_states))
++
++        num_layers = self.vllm_config.model_config.get_total_num_hidden_layers()
++        pp_rank = get_pp_group().rank_in_group
++        start_layer, end_layer = get_pp_indices(num_layers, pp_rank, pp_size)
++        return tuple(
++            index
++            for index, layer_id in enumerate(self.layer_ids)
++            if (layer_id == 0 and pp_rank == 0)
++            or (start_layer < layer_id <= end_layer)
++        )
++
+     def load_draft_model(
+         self,
+         target_model: nn.Module,
+@@ -118,19 +137,46 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
+         draft_tokens = last_sampled[input_batch.idx_mapping, :1]
+         if skip_attn_for_dummy_run:
+             return draft_tokens
++        self.cache_hidden_states(
++            input_batch=input_batch,
++            attn_metadata=attn_metadata,
++            slot_mappings=slot_mappings,
++            aux_hidden_states=aux_hidden_states,
++            num_tokens_across_dp=num_tokens_across_dp,
++        )
++
++        return draft_tokens
++
++    def cache_hidden_states(
++        self,
++        input_batch: InputBatch,
++        attn_metadata: dict[str, Any],
++        slot_mappings: dict[str, torch.Tensor],
++        aux_hidden_states: list[torch.Tensor] | None,
++        num_tokens_across_dp: torch.Tensor | None = None,
++    ) -> int:
++        """Cache the auxiliary hidden states owned by this pipeline stage."""
+         if aux_hidden_states is None:
+             raise ValueError(
+                 "aux_hidden_states are required when using extract_hidden_states"
+             )
+-        if len(aux_hidden_states) != self.num_hidden_states:
++        if len(aux_hidden_states) != len(self.local_hidden_state_indices):
+             raise ValueError(
+-                f"Expected {self.num_hidden_states} auxiliary hidden states, "
++                f"Expected {len(self.local_hidden_state_indices)} local auxiliary "
++                "hidden states, "
+                 f"got {len(aux_hidden_states)}"
+             )
+ 
+-        stacked_hidden_states = torch.stack(aux_hidden_states, dim=1)
+-        num_tokens = stacked_hidden_states.shape[0]
+-        self.hidden_states[:num_tokens].copy_(stacked_hidden_states)
++        num_tokens = (
++            aux_hidden_states[0].shape[0]
++            if aux_hidden_states
++            else input_batch.num_tokens_after_padding
++        )
++        self.hidden_states[:num_tokens].zero_()
++        for index, hidden_state in zip(
++            self.local_hidden_state_indices, aux_hidden_states
++        ):
++            self.hidden_states[:num_tokens, index].copy_(hidden_state)
+ 
+         draft_attn_metadata = {
+             name: attn_metadata[name] for name in self.draft_attn_layer_names
+@@ -150,4 +196,4 @@ class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
+         ):
+             self.model(hidden_states=self.hidden_states[:num_tokens])
+ 
+-        return draft_tokens
++        return num_tokens
