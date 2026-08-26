@@ -30,7 +30,7 @@ dataset:
 
 
 training:
-  attention_backend: fa4
+  attention_backend: flex_attention
   micro_batch_size: 1
   draft_accumulation_steps: 1
   learning_rate: 1e-4

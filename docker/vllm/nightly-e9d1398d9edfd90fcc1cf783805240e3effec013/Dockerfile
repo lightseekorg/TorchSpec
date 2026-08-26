@@ -39,6 +39,10 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
 
 # Keep the CUDA-13 Mooncake package shipped by the base image. Installing the
 # generic PyPI wheel here can replace it with a CUDA-12 binary.
+# Do not install TorchSpec's `fa` extra in this image. flash-attn-4 requires
+# apache-tvm-ffi>=0.1.12, while the pinned vLLM, TileLang, and TokenSpeed stack
+# requires apache-tvm-ffi==0.1.11. Routing-validation configs use
+# flex_attention instead.
 COPY . /root/torchspec
 RUN cd /root/torchspec && pip install --no-cache-dir -e .
 
