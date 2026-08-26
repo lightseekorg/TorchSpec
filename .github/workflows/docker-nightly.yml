@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Optional Docker image tag. Defaults to nightly-<short SHA>-vllm-pp.
+        description: Optional Docker image tag. Defaults to nightly-<short SHA>-vllm-v0.22.1.
         required: false
         type: string
 
@@ -17,7 +17,7 @@ permissions:
 
 env:
   IMAGE: lightseekorg/torchspec
-  VLLM_VERSION: nightly-e9d1398d9edfd90fcc1cf783805240e3effec013
+  VLLM_VERSION: v0.22.1
 
 jobs:
   build:
@@ -63,7 +63,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/Dockerfile
+          file: docker/vllm/v0.22.1/Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           no-cache: true
@@ -115,8 +115,8 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          immutable_tag="${INPUT_TAG:-nightly-${GITHUB_SHA::7}-vllm-pp}"
-          moving_tag="nightly-vllm-pp"
+          immutable_tag="${INPUT_TAG:-nightly-${GITHUB_SHA::7}-vllm-${VLLM_VERSION}}"
+          moving_tag="nightly-vllm-${VLLM_VERSION}"
           for tag in "$immutable_tag" "$moving_tag"; do
             if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
               echo "::error::Invalid image tag: ${tag}" >&2
