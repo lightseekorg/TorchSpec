@@ -68,6 +68,7 @@ jobs:
       TORCHSPEC_CI_MODEL_REVISION: 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
       TORCHSPEC_CI_SOURCE_SHA: ${{ github.sha }}
       TORCHSPEC_SLURM_ROOT: ${{ secrets.TORCHSPEC_SLURM_ROOT }}
+      # ARM64 .sqsh built from lightseekorg/torchspec:nightly-vllm-pp.
       TORCHSPEC_CI_IMAGE: ${{ secrets.TORCHSPEC_CI_IMAGE }}
       TORCHSPEC_CI_MODEL_CACHE_HOST: ${{ secrets.TORCHSPEC_CI_MODEL_CACHE_HOST }}
     steps:

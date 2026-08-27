@@ -24,6 +24,8 @@ image="${TORCHSPEC_CI_IMAGE}"
 model_cache_host="${TORCHSPEC_CI_MODEL_CACHE_HOST}"
 model="${TORCHSPEC_CI_MODEL:-Qwen/Qwen3.8-27B}"
 model_revision="${TORCHSPEC_CI_MODEL_REVISION:-1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0}"
+expected_vllm_commit="${TORCHSPEC_CI_EXPECTED_VLLM_COMMIT:-e9d1398d9edfd90fcc1cf783805240e3effec013}"
+expected_vllm_image_tag="${TORCHSPEC_CI_EXPECTED_VLLM_IMAGE_TAG:-vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013}"
 
 case "${run_key}" in
   *[!0-9-]*) echo "Unsafe run key: ${run_key}" >&2; exit 2 ;;
@@ -58,7 +60,7 @@ fi
 mkdir -p "${repo_dir}" "${artifact_dir}" "${tmp_dir}"
 rsync -a --exclude=.git -- "${source_dir}/" "${repo_dir}/"
 
-export_spec="TORCHSPEC_CI_IMAGE=${image},TORCHSPEC_CI_REPO_DIR=${repo_dir},TORCHSPEC_CI_ARTIFACT_DIR=${artifact_dir},TORCHSPEC_CI_TMP_DIR=${tmp_dir},TORCHSPEC_CI_MODEL_CACHE_HOST=${model_cache_host},TORCHSPEC_CI_MODEL=${model},TORCHSPEC_CI_MODEL_REVISION=${model_revision}"
+export_spec="TORCHSPEC_CI_IMAGE=${image},TORCHSPEC_CI_REPO_DIR=${repo_dir},TORCHSPEC_CI_ARTIFACT_DIR=${artifact_dir},TORCHSPEC_CI_TMP_DIR=${tmp_dir},TORCHSPEC_CI_MODEL_CACHE_HOST=${model_cache_host},TORCHSPEC_CI_MODEL=${model},TORCHSPEC_CI_MODEL_REVISION=${model_revision},TORCHSPEC_CI_EXPECTED_VLLM_COMMIT=${expected_vllm_commit},TORCHSPEC_CI_EXPECTED_VLLM_IMAGE_TAG=${expected_vllm_image_tag}"
 submitted="$(sbatch \
   --parsable \
   --output="${run_root}/slurm-%j.log" \
@@ -103,6 +105,8 @@ sacct -j "${job_id}" -X --format=State,ExitCode,Elapsed,AllocTRES -P \
   echo "- Final state: \`${final_state}\`"
   echo "- Source SHA: \`${TORCHSPEC_CI_SOURCE_SHA:-${GITHUB_SHA:-unknown}}\`"
   echo "- Model revision: \`${model_revision}\`"
+  echo "- Expected vLLM commit: \`${expected_vllm_commit}\`"
+  echo "- Expected vLLM image: \`${expected_vllm_image_tag}\`"
 } | tee "${report_dir}/summary.md"
 
 if [[ "${final_state}" != COMPLETED ]]; then

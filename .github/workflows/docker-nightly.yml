@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Optional Docker image tag. Defaults to nightly-<short SHA>-vllm-v0.22.1.
+        description: Optional Docker image tag. Defaults to nightly-<short SHA>-vllm-pp.
         required: false
         type: string
 
@@ -17,7 +17,7 @@ permissions:
 
 env:
   IMAGE: lightseekorg/torchspec
-  VLLM_VERSION: v0.22.1
+  VLLM_BASE_TAG: nightly-e9d1398d9edfd90fcc1cf783805240e3effec013
 
 jobs:
   build:
@@ -63,15 +63,17 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/vllm/v0.22.1/Dockerfile
+          file: docker/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           no-cache: true
           provenance: false
+          build-args: |
+            TORCHSPEC_SOURCE_REV=${{ github.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=nightly-${{ github.sha }}-vllm-${{ env.VLLM_VERSION }}
+            org.opencontainers.image.version=nightly-${{ github.sha }}-vllm-pp
 
       - name: Export digest
         env:
@@ -115,8 +117,8 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          immutable_tag="${INPUT_TAG:-nightly-${GITHUB_SHA::7}-vllm-${VLLM_VERSION}}"
-          moving_tag="nightly-vllm-${VLLM_VERSION}"
+          immutable_tag="${INPUT_TAG:-nightly-${GITHUB_SHA::7}-vllm-pp}"
+          moving_tag="nightly-vllm-pp"
           for tag in "$immutable_tag" "$moving_tag"; do
             if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
               echo "::error::Invalid image tag: ${tag}" >&2
@@ -154,5 +156,5 @@ jobs:
             echo "- Digest: \`${digest}\`"
             echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
             echo "- TorchSpec commit: \`${GITHUB_SHA}\`"
-            echo "- vLLM base: \`${VLLM_VERSION}\`"
+            echo "- vLLM base: \`${VLLM_BASE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
