@@ -53,6 +53,11 @@ class ModelState(Stateful):
         )
 
 
+def _fp32_param_names(optimizer) -> list[str]:
+    """Names for a ``BF16Optimizer``'s fp32 master copies, in ``fp32_params`` order."""
+    return [name for name, param in optimizer.model.named_parameters() if param.requires_grad]
+
+
 class OptimizerState(Stateful):
     """Wrapper for optimizer + fp32 master params."""
 
@@ -63,9 +68,15 @@ class OptimizerState(Stateful):
 
     def state_dict(self):
         if self._is_bf16_optimizer:
+            names = _fp32_param_names(self.optimizer)
             return {
                 "optim": self.optimizer.state_dict(),
-                "fp32_params": {str(i): p.data for i, p in enumerate(self.optimizer.fp32_params)},
+                # Keyed by name: which parameters are trainable can differ between the run
+                # that saved and the run that loads.
+                "fp32_params": {
+                    name: param.data
+                    for name, param in zip(names, self.optimizer.fp32_params, strict=True)
+                },
             }
         _, optimizer_state_dict = get_state_dict(self.model, optimizers=[self.optimizer])
         return {"optim": optimizer_state_dict}
@@ -73,10 +84,21 @@ class OptimizerState(Stateful):
     def load_state_dict(self, state_dict):
         if self._is_bf16_optimizer:
             self.optimizer.load_state_dict(state_dict["optim"])
-            if "fp32_params" in state_dict:
+            saved = state_dict.get("fp32_params")
+            if saved:
+                names = _fp32_param_names(self.optimizer)
+                missing = [name for name in names if name not in saved]
+                if missing:
+                    raise ValueError(
+                        "Optimizer checkpoint does not cover every trainable parameter: "
+                        f"{missing[:5]}{'...' if len(missing) > 5 else ''}. The saved run trained "
+                        "a different parameter set (for example it froze the lm_head and this one "
+                        "does not). Use training.continual_training=true to start a fresh "
+                        "optimizer from those weights instead of resuming this one."
+                    )
                 with torch.no_grad():
-                    for i, mp in enumerate(self.optimizer.fp32_params):
-                        mp.data.copy_(state_dict["fp32_params"][str(i)])
+                    for name, master in zip(names, self.optimizer.fp32_params, strict=True):
+                        master.data.copy_(saved[name])
                 logger.info("Restored fp32 master params from checkpoint")
             return
         set_state_dict(
@@ -151,13 +173,14 @@ def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
     return checkpoint_path
 
 
-def load(actor: Any) -> dict[str, Any] | None:
-    """Load checkpoint from disk.
+def resolve_resume_model_dir(args: Any) -> Path | None:
+    """Model directory ``training.load_path`` resolves to, or None if there is nothing to resume.
 
-    Loads model weights and optionally optimizer state from separate directories.
-    This allows loading weights without optimizer or deleting optimizer before loading.
+    Resolution is deliberately soft so a run can point at an output directory that has no
+    checkpoint yet, but callers that need weights to actually arrive must check the result
+    rather than the path string.
     """
-    load_root = getattr(actor.args, "load_path", None)
+    load_root = getattr(args, "load_path", None)
     if load_root is None:
         return None
 
@@ -166,23 +189,36 @@ def load(actor: Any) -> dict[str, Any] | None:
         logger.info(f"Checkpoint directory {root_path} not found; skipping load.")
         return None
 
-    target_step = getattr(actor.args, "ckpt_step", None)
+    target_step = getattr(args, "ckpt_step", None)
     if target_step is None:
         tracker_file = root_path / "latest_checkpointed_iteration.txt"
         if not tracker_file.exists():
             logger.info(f"No tracker file at {tracker_file}; skipping load.")
             return None
-        tracker_text = tracker_file.read_text().strip()
-        target_step = int(tracker_text)
+        target_step = int(tracker_file.read_text().strip())
 
-    checkpoint_dir = root_path / f"iter_{target_step:07d}"
-    model_dir = checkpoint_dir / "model"
-    optimizer_dir = checkpoint_dir / "optimizer"
-    lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
-
+    model_dir = root_path / f"iter_{target_step:07d}" / "model"
     if not model_dir.exists():
         logger.info(f"Model checkpoint {model_dir} not found; skipping load.")
         return None
+    return model_dir
+
+
+def load(actor: Any) -> dict[str, Any] | None:
+    """Load checkpoint from disk.
+
+    Model weights and optimizer state live in separate directories. A resume requires both:
+    restoring weights without the matching optimizer state would leave the fp32 masters stale.
+    Use training.continual_training=true to start from the weights alone.
+    """
+    model_dir = resolve_resume_model_dir(actor.args)
+    if model_dir is None:
+        return None
+
+    checkpoint_dir = model_dir.parent
+    target_step = int(checkpoint_dir.name.removeprefix("iter_"))
+    optimizer_dir = checkpoint_dir / "optimizer"
+    lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
 
     # Load model weights (always)
     model_state = ModelState(actor.model)
@@ -206,9 +242,21 @@ def load(actor: Any) -> dict[str, Any] | None:
             dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir))
             logger.info(f"Loaded optimizer from {optimizer_dir}")
         except Exception as e:
-            logger.warning(f"Failed to load optimizer from {optimizer_dir}: {e}")
+            # The model is already restored but the fp32 masters still hold their pre-load
+            # values, and the first step would copy those back over the loaded weights.
+            raise RuntimeError(
+                f"Failed to load optimizer from {optimizer_dir}: {e}. The model weights were "
+                "restored, so continuing would let stale fp32 master params overwrite them on "
+                "the first optimizer step. Set training.continual_training=true to start a "
+                "fresh optimizer from these weights."
+            ) from e
     elif load_optimizer:
-        logger.info(f"Optimizer checkpoint not found at {optimizer_dir}, skipping optimizer load.")
+        raise RuntimeError(
+            f"No optimizer checkpoint at {optimizer_dir}. Resuming without it would leave the "
+            "fp32 master params holding their pre-load values, which the first optimizer step "
+            "would copy over the restored weights. Set training.continual_training=true to "
+            "start a fresh optimizer from these weights."
+        )
 
     # Load LR scheduler state (optional)
     load_lr_scheduler = (

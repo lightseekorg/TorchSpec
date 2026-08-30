@@ -89,8 +89,15 @@ class Eagle3Trainer(Trainer):
                 torch_dtype=torch.bfloat16,
             )
 
+        initial_draft_model_path = getattr(self.args, "initial_draft_model_path", None)
+        freeze_lm_head = getattr(self.args, "freeze_lm_head", False)
+        # A head loaded from a checkpoint is frozen as-is; only a fresh one is seeded. The
+        # resume path is resolved rather than merely present: load() skips a load_path that
+        # resolves to nothing, which would otherwise freeze a randomly initialized head.
+        seed_lm_head_from_target = freeze_lm_head and not (
+            initial_draft_model_path or checkpoint.resolve_resume_model_dir(self.args)
+        )
         if dist.get_rank() == 0:
-            initial_draft_model_path = getattr(self.args, "initial_draft_model_path", None)
             if initial_draft_model_path:
                 loaded_from = checkpoint.load_initial_draft_weights(
                     draft_model, initial_draft_model_path
@@ -103,7 +110,18 @@ class Eagle3Trainer(Trainer):
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens"),
             )
 
+            if seed_lm_head_from_target:
+                draft_model.load_lm_head(
+                    target_model_path,
+                    lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+                )
+                logger.info(f"[Rank 0] Seeded draft lm_head from {target_model_path}")
+
         draft_model.freeze_embedding()
+        frozen_parts = ["embedding"]
+        if freeze_lm_head:
+            draft_model.freeze_lm_head()
+            frozen_parts.append("lm_head")
 
         dist.barrier(group=get_gloo_group())
 
@@ -111,7 +129,7 @@ class Eagle3Trainer(Trainer):
         trainable_count = sum(p.numel() for p in draft_model.parameters() if p.requires_grad)
         logger.info(
             f"[Rank {self.dp_rank}] Draft model: {trainable_count:,} trainable, "
-            f"{frozen_count:,} frozen (embedding) parameters"
+            f"{frozen_count:,} frozen ({', '.join(frozen_parts)}) parameters"
         )
 
         eagle3_model = Eagle3Model(

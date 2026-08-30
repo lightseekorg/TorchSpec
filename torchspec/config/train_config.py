@@ -87,6 +87,7 @@ class ModelConfig:
     initial_draft_model_path: Optional[str] = None
     keep_initial_vocab_mapping: bool = False
     embedding_key: str = "model.embed_tokens.weight"
+    freeze_lm_head: bool = False
     lm_head_key: str = "lm_head.weight"
     norm_key: str = "model.norm.weight"
     target_model_backend: str = "sglang"
