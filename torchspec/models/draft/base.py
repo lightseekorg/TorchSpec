@@ -27,6 +27,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Tuple
 
 import torch
+import torch.nn as nn
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers.modeling_utils import PreTrainedModel
@@ -89,6 +90,43 @@ def prepare_decoder_attention_mask(
         )
 
     return combined_attention_mask
+
+
+class LowRankHead(nn.Module):
+    """Factorized output projection of rank ``hidden_size // divisor``.
+
+    ``down.weight`` is ``[rank, hidden]`` and ``up.weight`` is ``[vocab, rank]``; the dense
+    product is never materialized.
+    """
+
+    def __init__(self, hidden_size: int, vocab_size: int, divisor: int) -> None:
+        super().__init__()
+        if divisor < 2:
+            raise ValueError(f"lm_head_rank_divisor must be at least 2, got {divisor}")
+        rank = hidden_size // divisor
+        if rank < 1:
+            raise ValueError(
+                f"lm_head_rank_divisor={divisor} leaves no rank for hidden_size={hidden_size}"
+            )
+        self.rank = rank
+        self.down = nn.Linear(hidden_size, rank, bias=False)
+        self.up = nn.Linear(rank, vocab_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(hidden_states))
+
+
+def build_lm_head(config, hidden_size: int, vocab_size: int, target_vocab_size: int) -> nn.Module:
+    """Dense head, or a ``LowRankHead`` when the config sets ``lm_head_rank_divisor``."""
+    divisor = getattr(config, "lm_head_rank_divisor", None)
+    if not divisor:
+        return nn.Linear(hidden_size, vocab_size, bias=False)
+    if vocab_size != target_vocab_size:
+        raise ValueError(
+            f"lm_head_rank_divisor is not supported with a pruned draft vocabulary "
+            f"(draft_vocab_size={vocab_size} < vocab_size={target_vocab_size})."
+        )
+    return LowRankHead(hidden_size, vocab_size, divisor)
 
 
 class Eagle3DraftModel(PreTrainedModel, ABC):
@@ -176,12 +214,22 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         The backbone of the draft model.
         """
 
-    def get_lm_head_params(self) -> Tuple[torch.Tensor, torch.Tensor, float]:
-        """Return (norm_weight, lm_head_weight, norm_eps) for fused loss computation.
+    @property
+    def is_lm_head_factorized(self) -> bool:
+        return isinstance(self.lm_head, LowRankHead)
 
-        Override if your model uses a different normalization scheme.
+    def get_lm_head_params(self) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Return (norm_weight, projection_weight, norm_eps) for fused loss computation.
+
+        For a factorized head the projection is the down weight; pair it with
+        ``get_lm_head_up_weight()``. Override for a different normalization scheme.
         """
-        return self.norm.weight, self.lm_head.weight, self.norm.variance_epsilon
+        weight = self.lm_head.down.weight if self.is_lm_head_factorized else self.lm_head.weight
+        return self.norm.weight, weight, self.norm.variance_epsilon
+
+    def get_lm_head_up_weight(self) -> Optional[torch.Tensor]:
+        """Second factor ``[vocab, rank]`` of a factorized head, or None when it is dense."""
+        return self.lm_head.up.weight if self.is_lm_head_factorized else None
 
     @property
     def has_vocab_pruning(self) -> bool:
@@ -225,7 +273,8 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         """
         Freeze the lm_head of the draft model so that it is not updated during training.
         """
-        self.lm_head.weight.requires_grad = False
+        for param in self.lm_head.parameters():
+            param.requires_grad = False
 
     @torch.no_grad()
     def load_embedding(
@@ -258,6 +307,11 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
                 "load_lm_head does not support a pruned draft vocabulary: the head's rows are "
                 "ordered by a t2d mapping that is only computed after model init. Seed the head "
                 "from model.initial_draft_model_path or training.load_path instead."
+            )
+        if self.is_lm_head_factorized:
+            raise ValueError(
+                "load_lm_head does not support a factorized lm_head (lm_head_rank_divisor); "
+                "the target head is dense and has no factors to seed."
             )
         weight = load_tensor_from_pretrained(model_path, lm_head_key)
         if weight.shape != self.lm_head.weight.shape:

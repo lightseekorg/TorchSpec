@@ -152,6 +152,7 @@ class Eagle3Model(nn.Module):
         norm_weight: torch.Tensor,
         lm_head_weight: torch.Tensor,
         norm_eps: float,
+        lm_head_up: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (loss_sum, correct_sum, count, alpha_sum).
 
@@ -182,7 +183,7 @@ class Eagle3Model(nn.Module):
         if isinstance(target, PrecomputedTarget):
             target_p_step = target.target_p_padded[:, idx : idx + seq_length, :]
             tp_flat = target_p_step.reshape(-1, target_p_step.shape[-1])
-            args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, norm_eps)
+            args = (hs_flat, tp_flat, valid_idx, norm_weight, lm_head_weight, lm_head_up, norm_eps)
             if self.loss_type == "lk_alpha":
                 fn = compiled_lk_alpha_loss
                 args = args + (self._coverage_flat(target, idx, seq_length, tp_flat),)
@@ -194,6 +195,7 @@ class Eagle3Model(nn.Module):
                     valid_idx,
                     norm_weight,
                     lm_head_weight,
+                    lm_head_up,
                     norm_eps,
                     coverage_flat,
                 )
@@ -220,6 +222,7 @@ class Eagle3Model(nn.Module):
                 valid_idx,
                 norm_weight,
                 lm_head_weight,
+                lm_head_up,
                 target.lm_head_weight,
                 norm_eps,
             )
@@ -271,6 +274,7 @@ class Eagle3Model(nn.Module):
         past_key_values_length = 0
 
         norm_weight, lm_head_weight, norm_eps = self.draft_model.get_lm_head_params()
+        lm_head_up = self.draft_model.get_lm_head_up_weight()
         hidden_states = self.draft_model.project_hidden_states(hidden_states)
 
         if past_key_values is not None:
@@ -387,6 +391,7 @@ class Eagle3Model(nn.Module):
                 norm_weight=norm_weight,
                 lm_head_weight=lm_head_weight,
                 norm_eps=norm_eps,
+                lm_head_up=lm_head_up,
             )
 
             # Model takes its own normed hidden states as input for the next step, so apply norm here if needed.

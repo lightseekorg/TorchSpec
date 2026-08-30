@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
-from torchspec.models.draft.base import Eagle3DraftModel
+from torchspec.models.draft.base import Eagle3DraftModel, build_lm_head
 
 # TODO: Extract shared components into a common module to reduce duplication:
 # - LlamaMLP, LlamaRMSNorm, RoPE classes → torchspec/models/draft/modules.py
@@ -471,7 +471,9 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
 
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_output = getattr(config, "norm_output", False)
-        self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
+        self.lm_head = build_lm_head(
+            config, config.hidden_size, self.vocab_size, self.target_vocab_size
+        )
 
         if self.vocab_size != self.target_vocab_size:
             self.register_buffer("t2d", torch.ones(self.target_vocab_size, dtype=torch.bool))

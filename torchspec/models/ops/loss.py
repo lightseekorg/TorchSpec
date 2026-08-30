@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -32,17 +34,30 @@ def _softmax_from_logits(logits: torch.Tensor) -> torch.Tensor:
     return torch.exp(logits_f32 - torch.logsumexp(logits_f32, dim=-1, keepdim=True))
 
 
+def _project(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_up: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Draft logits. ``lm_head_up`` is None for a dense head, the up projection otherwise."""
+    logits = F.linear(hidden, lm_head_weight)
+    if lm_head_up is not None:
+        logits = F.linear(logits, lm_head_up)
+    return logits
+
+
 def _rmsnorm_logits(
     hs_flat: torch.Tensor,
     norm_weight: torch.Tensor,
     lm_head_weight: torch.Tensor,
+    lm_head_up: Optional[torch.Tensor],
     norm_eps: float,
 ) -> torch.Tensor:
     hs_f32 = hs_flat.float()
     variance = hs_f32.pow(2).mean(-1, keepdim=True)
     rstd = torch.rsqrt(variance + norm_eps)
     norm_hs = (hs_f32 * rstd).to(hs_flat.dtype) * norm_weight
-    return F.linear(norm_hs, lm_head_weight)
+    return _project(norm_hs, lm_head_weight, lm_head_up)
 
 
 @torch.compile(dynamic=None)
@@ -52,6 +67,7 @@ def compiled_sum_forward_kl_loss(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     norm_eps,
 ):
     hs = prenorm_hidden_states_flat.index_select(0, valid_idx)
@@ -62,7 +78,7 @@ def compiled_sum_forward_kl_loss(
     rstd = torch.rsqrt(variance + norm_eps)
     norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
 
-    logits = F.linear(norm_hs, lm_head_weight)
+    logits = _project(norm_hs, lm_head_weight, lm_head_up)
     token_loss = _forward_kl_from_logits(logits, tp)
     correct = (logits.argmax(-1) == tp.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
@@ -76,6 +92,7 @@ def compiled_forward_kl_loss(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     norm_eps,
 ):
     """torch.compile'd index_select + RMSNorm + lm_head + Forward KL loss.
@@ -100,7 +117,7 @@ def compiled_forward_kl_loss(
     rstd = torch.rsqrt(variance + norm_eps)
     norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
 
-    logits = F.linear(norm_hs, lm_head_weight)  # (N, V_out)
+    logits = _project(norm_hs, lm_head_weight, lm_head_up)  # (N, V_out)
 
     token_loss = _forward_kl_from_logits(logits, tp)
     correct = (logits.argmax(-1) == tp.argmax(-1)).float()
@@ -115,6 +132,7 @@ def compiled_lk_alpha_loss(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     norm_eps,
     coverage_flat,
 ):
@@ -135,7 +153,7 @@ def compiled_lk_alpha_loss(
     tp_tilde = target_p_flat.index_select(0, valid_idx)
     coverage = coverage_flat.index_select(0, valid_idx)
 
-    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, lm_head_up, norm_eps)
     q = _softmax_from_logits(logits)
 
     tp = tp_tilde * coverage.unsqueeze(-1)
@@ -153,6 +171,7 @@ def compiled_lk_lambda_loss(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     norm_eps,
     coverage_flat,
     external_mean_alpha,
@@ -181,7 +200,7 @@ def compiled_lk_lambda_loss(
     tp_tilde = target_p_flat.index_select(0, valid_idx)
     coverage = coverage_flat.index_select(0, valid_idx)
 
-    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, lm_head_up, norm_eps)
     q = _softmax_from_logits(logits)
     log_q = F.log_softmax(logits.float(), dim=-1)
 
@@ -206,6 +225,7 @@ def compiled_sum_forward_kl_loss_from_hs(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     target_lm_head_weight,
     norm_eps,
 ):
@@ -220,7 +240,7 @@ def compiled_sum_forward_kl_loss_from_hs(
     rstd = torch.rsqrt(variance + norm_eps)
     norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
 
-    logits = F.linear(norm_hs, lm_head_weight)
+    logits = _project(norm_hs, lm_head_weight, lm_head_up)
     token_loss = _forward_kl_from_logits(logits, tp)
     correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()
     count = torch.ones_like(token_loss, dtype=torch.float32).sum()
@@ -234,6 +254,7 @@ def compiled_lk_alpha_loss_from_hs(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     target_lm_head_weight,
     norm_eps,
 ):
@@ -244,7 +265,7 @@ def compiled_lk_alpha_loss_from_hs(
     target_logits = F.linear(ths, target_lm_head_weight)
     tp = _softmax_from_logits(target_logits)
 
-    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, lm_head_up, norm_eps)
     q = _softmax_from_logits(logits)
 
     alpha = torch.min(tp, q).sum(-1)
@@ -261,6 +282,7 @@ def compiled_lk_lambda_loss_from_hs(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     target_lm_head_weight,
     norm_eps,
     external_mean_alpha,
@@ -274,7 +296,7 @@ def compiled_lk_lambda_loss_from_hs(
     target_logits = F.linear(ths, target_lm_head_weight)
     tp = _softmax_from_logits(target_logits)
 
-    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, norm_eps)
+    logits = _rmsnorm_logits(hs, norm_weight, lm_head_weight, lm_head_up, norm_eps)
     q = _softmax_from_logits(logits)
     log_q = F.log_softmax(logits.float(), dim=-1)
 
@@ -302,6 +324,7 @@ def compiled_forward_kl_loss_from_hs(
     valid_idx,
     norm_weight,
     lm_head_weight,
+    lm_head_up,
     target_lm_head_weight,
     norm_eps,
 ):
@@ -327,7 +350,7 @@ def compiled_forward_kl_loss_from_hs(
     rstd = torch.rsqrt(variance + norm_eps)
     norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight
 
-    logits = F.linear(norm_hs, lm_head_weight)
+    logits = _project(norm_hs, lm_head_weight, lm_head_up)
 
     token_loss = _forward_kl_from_logits(logits, tp)
     correct = (logits.argmax(-1) == target_logits.argmax(-1)).float()

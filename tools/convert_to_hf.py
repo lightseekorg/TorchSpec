@@ -308,6 +308,13 @@ def _save_with_vocab_pruning(
     tensors["t2d"] = t2d
     tensors["d2t"] = d2t
 
+    if "lm_head.up.weight" in tensors:
+        raise ValueError(
+            "Post-training vocabulary pruning is not supported for a factorized lm_head "
+            "(lm_head_rank). The head is stored as lm_head.down / lm_head.up, so trimming rows "
+            "would mean re-factorizing it. Train with a dense head to use --prune-vocab."
+        )
+
     lm_head_key = "lm_head.weight"
     if lm_head_key in tensors:
         current_size = tensors[lm_head_key].shape[0]

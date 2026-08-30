@@ -187,7 +187,7 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         target_p = F.softmax(raw_logits + torch.randn_like(raw_logits) * 0.5, dim=-1)
 
         loss_sum, correct, count = compiled_forward_kl_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, norm_eps
         )
         loss = loss_sum / count
         acc = correct / count
@@ -218,7 +218,7 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         expected_entropy = -(target_p * target_p.log()).sum(-1).mean()
 
         loss_sum, correct, count = compiled_forward_kl_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, norm_eps
         )
         loss = loss_sum / count
         acc = correct / count
@@ -235,7 +235,7 @@ class TestCompiledForwardKLLoss(unittest.TestCase):
         valid_idx = torch.arange(N)
 
         loss_sum, correct, count = compiled_forward_kl_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, 1e-6
         )
         loss = loss_sum / count
         acc = correct / count
@@ -262,7 +262,7 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, norm_eps, coverage
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
         ref_loss, ref_acc, ref_alpha = _reference_lk_alpha_loss(
@@ -288,10 +288,17 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
         coverage = torch.rand(N) * 0.5 + 0.3  # in [0.3, 0.8): meaningful vocab pruning
 
         _, _, _, alpha_sum_no_coverage = compiled_lk_alpha_loss(
-            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, torch.ones(N)
+            hs,
+            target_p_tilde,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            None,
+            norm_eps,
+            torch.ones(N),
         )
         _, _, _, alpha_sum_with_coverage = compiled_lk_alpha_loss(
-            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
+            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, None, norm_eps, coverage
         )
         # Rescaling by coverage < 1 can only shrink (never inflate) alpha,
         # since it shrinks every component of the min(p, q) sum.
@@ -300,7 +307,7 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
             hs, target_p_tilde, norm_weight, lm_head_weight, norm_eps, coverage
         )
         loss_sum, _, count, alpha_sum = compiled_lk_alpha_loss(
-            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
+            hs, target_p_tilde, valid_idx, norm_weight, lm_head_weight, None, norm_eps, coverage
         )
         torch.testing.assert_close(loss_sum / count, ref_loss, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(alpha_sum / count, ref_alpha, atol=1e-4, rtol=1e-4)
@@ -323,7 +330,7 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, norm_eps, coverage
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
         self.assertAlmostEqual(loss.item(), 0.0, places=3)
@@ -341,7 +348,7 @@ class TestCompiledLkAlphaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_alpha_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, 1e-6, coverage
         )
         loss, alpha = loss_sum / count, alpha_sum / count
         self.assertTrue(torch.isfinite(loss))
@@ -367,7 +374,16 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, correct, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, eta
+            hs,
+            target_p,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            None,
+            norm_eps,
+            coverage,
+            None,
+            eta,
         )
         loss, acc, alpha = loss_sum / count, correct / count, alpha_sum / count
         ref_loss, ref_acc, ref_alpha = _reference_lk_lambda_loss(
@@ -390,10 +406,10 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_eta3, _, count3, _ = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, None, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, 1e-6, coverage, None, 3.0
         )
         loss_eta10, _, count10, _ = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, None, 10.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, 1e-6, coverage, None, 10.0
         )
         self.assertFalse(torch.allclose(loss_eta3 / count3, loss_eta10 / count10))
 
@@ -418,6 +434,7 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage,
             None,
@@ -454,7 +471,16 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, _, _count, _alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, eta
+            hs,
+            target_p,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            None,
+            norm_eps,
+            coverage,
+            None,
+            eta,
         )
 
         variance = hs.pow(2).mean(-1, keepdim=True)
@@ -494,7 +520,16 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_local, _, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, eta
+            hs,
+            target_p,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            None,
+            norm_eps,
+            coverage,
+            None,
+            eta,
         )
         local_mean_alpha = alpha_sum / count
 
@@ -508,6 +543,7 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage,
             external_mean_alpha,
@@ -545,7 +581,16 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, _correct, count, alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, norm_eps, coverage, None, 3.0
+            hs,
+            target_p,
+            valid_idx,
+            norm_weight,
+            lm_head_weight,
+            None,
+            norm_eps,
+            coverage,
+            None,
+            3.0,
         )
         loss, alpha = loss_sum / count, alpha_sum / count
         self.assertAlmostEqual(loss.item(), 0.0, places=3)
@@ -562,7 +607,7 @@ class TestCompiledLkLambdaLoss(unittest.TestCase):
         coverage = torch.ones(N)
 
         loss_sum, _correct, count, _alpha_sum = compiled_lk_lambda_loss(
-            hs, target_p, valid_idx, norm_weight, lm_head_weight, 1e-6, coverage, None, 3.0
+            hs, target_p, valid_idx, norm_weight, lm_head_weight, None, 1e-6, coverage, None, 3.0
         )
         loss = loss_sum / count
         self.assertTrue(torch.isfinite(loss))
@@ -623,6 +668,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
                 seq_length=seq_length,
                 norm_weight=norm_weight,
                 lm_head_weight=lm_head_weight,
+                lm_head_up=None,
                 norm_eps=norm_eps,
             )
         mock_reduce.assert_called_once()
@@ -642,6 +688,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage_flat,
             None,
@@ -660,6 +707,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage_flat,
             expected_mean_alpha,
@@ -684,6 +732,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
                 seq_length=mask.shape[1],
                 norm_weight=norm_weight,
                 lm_head_weight=lm_head_weight,
+                lm_head_up=None,
                 norm_eps=norm_eps,
             )
 
@@ -725,6 +774,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
                 seq_length=seq_length,
                 norm_weight=norm_weight,
                 lm_head_weight=lm_head_weight,
+                lm_head_up=None,
                 norm_eps=norm_eps,
             )
 
@@ -738,6 +788,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
                 valid_idx,
                 norm_weight,
                 lm_head_weight,
+                None,
                 target.lm_head_weight,
                 norm_eps,
                 None,
@@ -755,6 +806,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             target.lm_head_weight,
             norm_eps,
             expected_mean_alpha,
@@ -779,6 +831,7 @@ class TestUspLambdaAlphaReduction(unittest.TestCase):
                 seq_length=mask.shape[1],
                 norm_weight=norm_weight,
                 lm_head_weight=lm_head_weight,
+                lm_head_up=None,
                 norm_eps=norm_eps,
             )
         mock_reduce.assert_not_called()
@@ -1062,6 +1115,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
         )
         loss = loss_sum / count
@@ -1076,6 +1130,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             all_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
         )
         loss_ref = loss_sum_ref / count_ref
@@ -1099,6 +1154,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             target_lm_head_weight,
             norm_eps,
         )
@@ -1114,6 +1170,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             all_idx,
             norm_weight,
             lm_head_weight,
+            None,
             target_lm_head_weight,
             norm_eps,
         )
@@ -1138,6 +1195,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage_flat,
         )
@@ -1153,6 +1211,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             all_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage_valid,
         )
@@ -1180,6 +1239,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             valid_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage_flat,
             None,
@@ -1197,6 +1257,7 @@ class TestValidIdxSubsetting(unittest.TestCase):
             all_idx,
             norm_weight,
             lm_head_weight,
+            None,
             norm_eps,
             coverage_valid,
             None,
