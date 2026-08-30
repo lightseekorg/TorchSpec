@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig, AutoEagle3DraftModel, Eagle3Model
+from torchspec.models.anchored_eagle3 import AnchoredEagle3Model
 from torchspec.models.eagle3 import compute_lazy_target_padded, compute_target_p_padded
 from torchspec.training import checkpoint
 from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
@@ -132,7 +133,9 @@ class Eagle3Trainer(Trainer):
             f"{frozen_count:,} frozen ({', '.join(frozen_parts)}) parameters"
         )
 
-        eagle3_model = Eagle3Model(
+        num_anchors = getattr(self.args, "eagle3_num_anchors", 0)
+        anchor_max_gap = getattr(self.args, "eagle3_anchor_max_gap", None)
+        model_kwargs = dict(
             draft_model=draft_model,
             length=self.args.ttt_length,
             attention_backend=self.args.attention_backend,
@@ -140,6 +143,16 @@ class Eagle3Trainer(Trainer):
             loss_type=getattr(self.args, "loss_type", "forward_kl"),
             lk_eta=getattr(self.args, "lk_eta", 3.0),
         )
+        if num_anchors:
+            eagle3_model = AnchoredEagle3Model(
+                num_anchors=num_anchors, anchor_max_gap=anchor_max_gap, **model_kwargs
+            )
+            logger.info(
+                f"[Rank {self.dp_rank}] Anchored Eagle3: {num_anchors} anchors per sample "
+                f"(max gap {anchor_max_gap})"
+            )
+        else:
+            eagle3_model = Eagle3Model(**model_kwargs)
 
         full_state = eagle3_model.state_dict() if dist.get_rank() == 0 else {}
 

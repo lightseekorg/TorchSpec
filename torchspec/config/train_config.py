@@ -103,6 +103,8 @@ class TrainingConfig:
     distributed_backend: str = "nccl"
     distributed_timeout_minutes: int = 10
     draft_accumulation_steps: int = 1
+    eagle3_num_anchors: int = 0
+    eagle3_anchor_max_gap: Optional[int] = None
     fsdp_reduce_dtype: str = "float32"  # "float32" or "bfloat16"
     fsdp_strategy: str = "REPLICATE"
     # Controls which workload claims head-node GPUs first under PACK strategy.

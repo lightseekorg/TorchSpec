@@ -1267,10 +1267,15 @@ class TestDFlashTrainingQuality(unittest.TestCase):
         self.assertLess(losses[-1], losses[0])
 
     def test_accuracy_improves(self):
-        """Accuracy should improve over training when overfitting on a small batch."""
+        """Accuracy should improve over training when overfitting on a small batch.
+
+        30 steps left the accuracy in the noise -- it improved on only 9 of 12 seeds, so
+        the assertion turned on which anchors happened to be drawn rather than on whether
+        the model learned. 100 steps improves on every seed by at least 0.18.
+        """
         torch.manual_seed(42)
         model, *data = self._make_model_and_data(seq_len=64, batch_size=1)
-        _, accs = self._train_steps(model, *data, steps=30)
+        _, accs = self._train_steps(model, *data, steps=100)
         avg_first5 = sum(accs[:5]) / 5
         avg_last5 = sum(accs[-5:]) / 5
         self.assertGreater(

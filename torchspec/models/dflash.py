@@ -32,8 +32,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torchspec.models.ops.anchors import sample_anchor_positions
 from torchspec.models.ops.flex_attention import compile_friendly_create_block_mask
-from torchspec.utils.logging import logger
 
 _VALID_DFLASH_LOSS_OBJECTIVES = {"decay", "dpace"}
 
@@ -154,67 +154,9 @@ class DFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample anchor positions per sample; returns (anchors, keep_mask).
-
-        Always returns exactly ``self.num_anchors`` anchor slots so that
-        ``Q_LEN = num_anchors * block_size`` is constant across steps,
-        preventing FlexAttention recompilation from shape changes.  Samples
-        with fewer valid positions use ``block_keep_mask=False`` for the
-        excess slots (those blocks are skipped by the block-sparse kernel).
-
-        Args:
-            seq_len: sequence length
-            loss_mask: [B, seq_len] — 1 for valid positions, 0 for padding
-            device: torch device
-
-        Returns:
-            anchors: [B, num_anchors] — sampled anchor positions (sorted)
-            keep_mask: [B, num_anchors] — True for valid sampled anchors
-        """
-        bs = self.block_size
-        bsz = loss_mask.shape[0]
-        max_anchor = max(seq_len - bs, 0)
-        max_n = self.num_anchors
-
-        if max_anchor == 0:
-            logger.warning(
-                f"Sequence too short for anchor sampling (seq_len={seq_len}, "
-                f"block_size={bs}). Returning dummy anchors so loss is zero."
-            )
-            anchors = torch.zeros(bsz, max_n, dtype=torch.long, device=device)
-            keep_mask = torch.zeros(bsz, max_n, dtype=torch.bool, device=device)
-            return anchors, keep_mask
-
-        # An anchor is only usable if its own position and the position right
-        # after it are both supervised: the block's first prediction target is
-        # ``anchor + 1``, so an isolated supervised token yields no gradient.
-        num_candidates = min(max_anchor + 1, seq_len - 1)
-        valid = (loss_mask[:, :num_candidates] > 0.5) & (loss_mask[:, 1 : num_candidates + 1] > 0.5)
-        valid_counts = valid.sum(dim=1)
-
-        indices = torch.arange(num_candidates, device=device).unsqueeze(0).expand(bsz, -1)
-        masked_indices = torch.where(valid, indices, seq_len + 1)
-
-        random_vals = torch.rand(bsz, num_candidates, device=device)
-        random_vals = torch.where(valid, random_vals, 2.0)
-
-        _, sorted_idx = random_vals.sort(dim=1)
-        gathered = torch.gather(masked_indices, 1, sorted_idx)
-
-        # Take up to num_anchors slots; pad with zeros if fewer valid positions
-        take_n = min(max_n, gathered.shape[1])
-        selected = gathered[:, :take_n].sort(dim=1).values
-        if take_n < max_n:
-            pad = torch.zeros(bsz, max_n - take_n, dtype=torch.long, device=device)
-            selected = torch.cat([selected, pad], dim=1)
-        anchors = selected
-
-        keep_mask = torch.arange(max_n, device=device).unsqueeze(0) < valid_counts.unsqueeze(
-            1
-        ).clamp(max=max_n)
-        anchors = torch.where(keep_mask, anchors, 0)
-
-        return anchors, keep_mask
+        return sample_anchor_positions(
+            seq_len, loss_mask, self.num_anchors, self.block_size, device
+        )
 
     def _create_position_ids(
         self, anchor_positions: torch.Tensor, seq_len: int
