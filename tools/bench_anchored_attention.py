@@ -33,6 +33,8 @@ def _compiled_builder():
 
 
 DEPTHS, HEADS, KV_HEADS, HEAD_DIM = 7, 32, 8, 128  # DEPTHS overridden by --depths
+QK_DIM, V_DIM = HEAD_DIM, HEAD_DIM  # MLA splits these: 192 for Q/K, 128 for V
+B16 = torch.bfloat16
 
 
 def _mask_mod(anchors, keep, ctx_len, num_anchors):
@@ -81,13 +83,11 @@ def _dense_step(seq, query, cache, device):
 
 def measure(kind, seq, num_anchors, device, reps, warmup, layers=1):
     if kind == "dense-ttt":
-        query = torch.randn(1, HEADS, seq, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        query = torch.randn(1, HEADS, seq, QK_DIM, device=device, dtype=torch.bfloat16)
         cache = [
-            tuple(
-                torch.randn(
-                    1, KV_HEADS, seq * (d + 1), HEAD_DIM, device=device, dtype=torch.bfloat16
-                )
-                for _ in range(2)
+            (
+                torch.randn(1, KV_HEADS, seq * (d + 1), QK_DIM, device=device, dtype=B16),
+                torch.randn(1, KV_HEADS, seq * (d + 1), V_DIM, device=device, dtype=B16),
             )
             for d in range(DEPTHS)
         ]
@@ -96,25 +96,18 @@ def measure(kind, seq, num_anchors, device, reps, warmup, layers=1):
         anchors = torch.sort(torch.randperm(seq - DEPTHS, device=device)[:num_anchors]).values
         anchors = anchors.unsqueeze(0)
         keep = torch.ones(1, num_anchors, dtype=torch.bool, device=device)
-        query = torch.randn(1, HEADS, num_anchors, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        query = torch.randn(1, HEADS, num_anchors, QK_DIM, device=device, dtype=torch.bfloat16)
         cache = [
-            tuple(
-                torch.randn(
-                    1,
-                    KV_HEADS,
-                    seq + d * num_anchors,
-                    HEAD_DIM,
-                    device=device,
-                    dtype=torch.bfloat16,
-                )
-                for _ in range(2)
+            (
+                torch.randn(1, KV_HEADS, seq + d * num_anchors, QK_DIM, device=device, dtype=B16),
+                torch.randn(1, KV_HEADS, seq + d * num_anchors, V_DIM, device=device, dtype=B16),
             )
             for d in range(DEPTHS)
         ]
         args = (anchors, keep, seq, num_anchors, query, cache, device)
         # With more than one layer the depth-0 context K/V are no longer pointwise: layer L
         # needs layer L-1 outputs at every position, so depth 0 becomes a dense pass per layer.
-        dense_q = torch.randn(1, HEADS, seq, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        dense_q = torch.randn(1, HEADS, seq, QK_DIM, device=device, dtype=torch.bfloat16)
         dense_kv = cache[0]
 
         def run():
@@ -139,12 +132,18 @@ KINDS = ["dense-ttt", "sdpa", "flex+blockmask"]
 
 
 def main():
-    global DEPTHS
+    global DEPTHS, KV_HEADS, QK_DIM, V_DIM
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seq", type=int, nargs="+", default=[384, 4096, 16384])
     parser.add_argument("--anchors", type=int, nargs="+", default=[128, 256])
     parser.add_argument("--depths", type=int, default=7, help="ttt_length")
     parser.add_argument("--layers", type=int, default=1, help="draft decoder layers")
+    parser.add_argument(
+        "--mla",
+        action="store_true",
+        help="MLA head shape: keys carry qk_nope+qk_rope (192) and values v_head_dim "
+        "(128), across all heads rather than a smaller KV group",
+    )
     parser.add_argument(
         "--kinds", nargs="+", default=KINDS, choices=KINDS, help="strategies to measure"
     )
@@ -158,6 +157,8 @@ def main():
         "would otherwise inherit, which silently equalises them.",
     )
     args = parser.parse_args()
+    if args.mla:
+        KV_HEADS, QK_DIM, V_DIM = HEADS, 192, 128
     DEPTHS = args.depths
 
     if args.kind:
@@ -191,6 +192,7 @@ def main():
                 *map(str, args.seq),
                 "--anchors",
                 *map(str, args.anchors),
+                *(["--mla"] if args.mla else []),
             ],
             capture_output=True,
             text=True,

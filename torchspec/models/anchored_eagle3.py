@@ -93,6 +93,18 @@ def _heads(projected: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tens
     return projected.view(bsz, length, num_heads, head_dim).transpose(1, 2)
 
 
+def _mla_kv(attn, layer_input: torch.Tensor):
+    """MLA's K/V halves alone: (k_nope, k_rope_raw, value), skipping the query projection."""
+    bsz, length, _ = layer_input.shape
+    compressed, k_rope = torch.split(
+        attn.kv_a_proj_with_mqa(layer_input), [attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1
+    )
+    kv = attn.kv_b_proj(attn.kv_a_layernorm(compressed))
+    kv = kv.view(bsz, length, attn.num_heads, attn.qk_nope_head_dim + attn.v_head_dim)
+    k_nope, value = torch.split(kv, [attn.qk_nope_head_dim, attn.v_head_dim], dim=-1)
+    return k_nope.transpose(1, 2), value.transpose(1, 2), k_rope.unsqueeze(1)
+
+
 def _gather_target(
     target: Union[PrecomputedTarget, LazyTarget], positions: torch.Tensor
 ) -> Union[PrecomputedTarget, LazyTarget]:
@@ -145,13 +157,23 @@ class AnchoredEagle3Model(Eagle3Model):
         only the rope-side dims, and carries its own softmax scale.
         """
         if self.is_mla:
-            q, k_nope, k_rope, value = attn._project_qkv(layer_input)
-            q_nope, q_rope = q.split([attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1)
-            q_rope, k_rope = _apply_rotary_pos_emb_interleaved(
-                q_rope, k_rope, rope[0], rope[1], positions
-            )
+            if query:
+                q, k_nope, k_rope, value = attn._project_qkv(layer_input)
+                q_nope, q_rope = q.split([attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1)
+                q_rope, k_rope = _apply_rotary_pos_emb_interleaved(
+                    q_rope, k_rope, rope[0], rope[1], positions
+                )
+                q = torch.cat([q_nope, q_rope], dim=-1)
+            else:
+                # _project_qkv would also run q_a_proj/q_b_proj, which is most of the
+                # projection cost and is thrown away for a context that needs only K/V.
+                k_nope, value, k_rope = _mla_kv(attn, layer_input)
+                _, k_rope = _apply_rotary_pos_emb_interleaved(
+                    k_rope, k_rope, rope[0], rope[1], positions
+                )
+                q = k_rope
             k_rope = k_rope.expand(-1, attn.num_heads, -1, -1)
-            return torch.cat([q_nope, q_rope], dim=-1), torch.cat([k_nope, k_rope], dim=-1), value
+            return q, torch.cat([k_nope, k_rope], dim=-1), value
 
         key = _heads(attn.k_proj(layer_input), attn.num_key_value_heads, attn.head_dim)
         value = _heads(attn.v_proj(layer_input), attn.num_key_value_heads, attn.head_dim)
