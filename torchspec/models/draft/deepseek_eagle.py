@@ -32,16 +32,25 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 
 from torchspec.models.draft.base import Eagle3DraftModel, build_lm_head
 
-# TODO: Extract shared components into a common module to reduce duplication:
-# - LlamaMLP, LlamaRMSNorm, RoPE classes → torchspec/models/draft/modules.py
-# - DecoderLayer.forward() is line-for-line identical to LlamaDecoderLayer.forward()
-# - embed_input_ids/project_hidden_states/compute_logits/backbone are identical
-#   to LlamaForCausalLMEagle3 and could live in Eagle3DraftModel base class
-# - Suffix attention loop could be batched (einsum instead of Python loop) for
+# Shared modules extracted to reduce duplication between architecture implementations.
+# See torchspec/models/draft/modules.py for details.
+from torchspec.models.draft.modules import (
+    EagleMLP,
+    EagleRMSNorm,
+    eagle_backbone,
+    eagle_compute_logits,
+    eagle_decoder_layer_forward,
+    eagle_embed_input_ids,
+    eagle_project_hidden_states,
+)
+
+# Backward-compatible aliases for existing code references
+LlamaMLP = EagleMLP
+LlamaRMSNorm = EagleRMSNorm
+
+# TODO: Suffix attention loop could be batched (einsum instead of Python loop) for
 #   both this file and llama3_eagle.py
 from torchspec.models.draft.llama3_eagle import (
-    LlamaMLP,
-    LlamaRMSNorm,
     build_rotary_embedding,
     rope_config_get,
     yarn_get_mscale,
@@ -413,16 +422,9 @@ class DeepSeekDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        residual = hidden_states
-
-        hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
-
-        # Eagle3: concatenate input embedding and hidden states
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
-
-        # Self Attention
-        hidden_states, cache_keys, cache_values = self.self_attn(
+        return eagle_decoder_layer_forward(
+            self=self,
+            input_emb=input_emb,
             hidden_states=hidden_states,
             cache_keys=cache_keys,
             cache_values=cache_values,
@@ -430,15 +432,6 @@ class DeepSeekDecoderLayer(nn.Module):
             position_ids=position_ids,
             use_cache=use_cache,
         )
-        hidden_states = residual + hidden_states
-
-        # MLP
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states, cache_keys, cache_values
 
 
 class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
@@ -490,25 +483,13 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return eagle_embed_input_ids(self, input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        expected_size = self.fc.in_features
-        if hidden_states.size(-1) != expected_size:
-            raise ValueError(
-                f"Target hidden states size mismatch: {hidden_states.size(-1)} != expected: {expected_size}"
-            )
-        if self.fc_norm is not None:
-            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
-            hidden_states = torch.cat(
-                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
-                dim=-1,
-            )
-        return self.fc(hidden_states)
+        return eagle_project_hidden_states(self, hidden_states, use_fp32_proj=True)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        norm_hidden_states = self.norm(hidden_states)
-        return self.lm_head(norm_hidden_states)
+        return eagle_compute_logits(self, hidden_states)
 
     def backbone(
         self,
@@ -520,12 +501,13 @@ class Eagle3DeepseekV2ForCausalLM(Eagle3DraftModel):
         cache_values: Optional[torch.Tensor] = None,
         use_cache: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        return self.midlayer(
-            input_emb=input_embeds,
+        return eagle_backbone(
+            self=self,
+            input_embeds=input_embeds,
             hidden_states=hidden_states,
-            cache_keys=cache_keys,
-            cache_values=cache_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            cache_keys=cache_keys,
+            cache_values=cache_values,
             use_cache=use_cache,
         )

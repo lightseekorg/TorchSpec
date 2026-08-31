@@ -33,6 +33,15 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 from torchspec.config.utils import resolve_rope_theta
 from torchspec.models.draft.base import Eagle3DraftModel, build_lm_head
+from torchspec.models.draft.modules import (
+    EagleMLP,
+    EagleRMSNorm,
+    eagle_backbone,
+    eagle_compute_logits,
+    eagle_decoder_layer_forward,
+    eagle_embed_input_ids,
+    eagle_project_hidden_states,
+)
 from torchspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
     eagle3_block_mask,
@@ -2317,61 +2326,9 @@ def warmup_flash_attention_masked(
     print_with_rank(f"flash_attn cute DSL warmup complete ({len(buckets)} bucket(s)).")
 
 
-class LlamaMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
-            gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
-            up_proj_slices = self.up_proj.weight.split(slice, dim=0)
-            down_proj_slices = self.down_proj.weight.split(slice, dim=1)
-
-            gate_proj = torch.cat(
-                [F.linear(x, gate_proj_slices[i]) for i in range(self.config.pretraining_tp)],
-                dim=-1,
-            )
-            up_proj = torch.cat(
-                [F.linear(x, up_proj_slices[i]) for i in range(self.config.pretraining_tp)],
-                dim=-1,
-            )
-
-            intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
-            down_proj = [
-                F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
-            ]
-            down_proj = sum(down_proj)
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-        return down_proj
-
-
-class LlamaRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        LlamaRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    @torch.compile(dynamic=True)
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+# Aliases for backward compatibility with existing code references
+LlamaMLP = EagleMLP
+LlamaRMSNorm = EagleRMSNorm
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -2409,14 +2366,9 @@ class LlamaDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        residual = hidden_states
-
-        hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
-
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
-        # Self Attention
-        hidden_states, cache_keys, cache_values = self.self_attn(
+        return eagle_decoder_layer_forward(
+            self=self,
+            input_emb=input_emb,
             hidden_states=hidden_states,
             cache_keys=cache_keys,
             cache_values=cache_values,
@@ -2424,15 +2376,6 @@ class LlamaDecoderLayer(nn.Module):
             position_ids=position_ids,
             use_cache=use_cache,
         )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states, cache_keys, cache_values
 
 
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
@@ -2476,33 +2419,15 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             self.register_buffer("d2t", torch.zeros(self.vocab_size, dtype=torch.int64))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        return eagle_embed_input_ids(self, input_ids)
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers
-        expected_size = self.fc.in_features
-        if hidden_states.size(-1) != expected_size:
-            raise ValueError(
-                f"Target hidden states size mismatch: {hidden_states.size(-1)} != expected: {expected_size}"
-            )
-        if self.fc_norm is not None:
-            chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
-            hidden_states = torch.cat(
-                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
-                dim=-1,
-            )
-        if os.environ.get("TORCHSPEC_EAGLE3_PROJ_FP32", "1") in {"0", "false", "False"}:
-            return self.fc(hidden_states.to(self.fc.weight.dtype))
-        proj = F.linear(
-            hidden_states.to(torch.float32),
-            self.fc.weight.to(torch.float32),
-            None if self.fc.bias is None else self.fc.bias.to(torch.float32),
-        )
-        return proj.to(self.fc.weight.dtype)
+        use_fp32 = os.environ.get("TORCHSPEC_EAGLE3_PROJ_FP32", "1") not in {"0", "false", "False"}
+        return eagle_project_hidden_states(self, hidden_states, use_fp32_proj=use_fp32)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        norm_hidden_states = self.norm(hidden_states)
-        return self.lm_head(norm_hidden_states)
+        return eagle_compute_logits(self, hidden_states)
 
     def backbone(
         self,
@@ -2514,12 +2439,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         cache_values: Optional[torch.Tensor] = None,
         use_cache: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        return self.midlayer(
-            input_emb=input_embeds,
+        return eagle_backbone(
+            self=self,
+            input_embeds=input_embeds,
             hidden_states=hidden_states,
-            cache_keys=cache_keys,
-            cache_values=cache_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            cache_keys=cache_keys,
+            cache_values=cache_values,
             use_cache=use_cache,
         )
