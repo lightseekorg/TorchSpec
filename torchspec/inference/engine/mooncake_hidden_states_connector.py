@@ -305,7 +305,10 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
     def wait_for_save(self):
         if self._mooncake_store is not None:
-            self._mooncake_store.flush()
+            # Do not serialize the engine step behind the RDMA write.  Readers
+            # wait for the published keys before moving bytes; here we only
+            # surface failures from puts that have already completed.
+            self._mooncake_store.check_async_errors()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         from vllm.model_executor.models.extract_hidden_states import (
@@ -337,12 +340,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         # Per-layer metadata is not guaranteed to contain a complete request.
         pass
 
-    def _publish_pending_save(self, pending: _PendingSave) -> None:
-        local_positions = self._local_layer_positions()
-        if self._pp_size > 1 and not local_positions:
-            return
-        if not self._ensure_mooncake_store():
-            return
+    def _pending_save_tensors(
+        self,
+        pending: _PendingSave,
+        local_positions: list[int],
+    ) -> list[tuple[str, torch.Tensor]]:
         assert self._kv_cache is not None
 
         num_tokens = pending.token_ids.shape[0]
@@ -363,30 +365,65 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             slot_mapping,
             num_tokens,
         )
+        if hidden_states_3d.dtype != torch.bfloat16:
+            hidden_states_3d = hidden_states_3d.to(torch.bfloat16)
         input_ids = pending.token_ids.to(hidden_states_3d.device)
         mooncake_key = _sanitize_mooncake_key(pending.req_id)
 
         if self._pp_size == 1:
             all_hidden = hidden_states_3d.reshape(num_tokens, -1)
             split_at = self._num_training_layers * self._hidden_size
-            self._mooncake_store.put(
-                key=mooncake_key,
-                hidden_states=all_hidden[:, :split_at],
-                input_ids=input_ids,
-                last_hidden_states=all_hidden[:, -self._hidden_size :],
-                target=None,
-            )
-            return
+            return [
+                (f"{mooncake_key}_hs", all_hidden[:, :split_at]),
+                (f"{mooncake_key}_ids", input_ids),
+                (f"{mooncake_key}_lhs", all_hidden[:, -self._hidden_size :]),
+            ]
 
+        tensors: list[tuple[str, torch.Tensor]] = []
         for position in local_positions:
-            layer_id = self._layer_ids[position]
-            self._mooncake_store.put(
-                key=f"{mooncake_key}_layer{layer_id}",
-                hidden_states=hidden_states_3d[:, position, :],
-                input_ids=input_ids,
-                last_hidden_states=None,
-                target=None,
+            layer_key = f"{mooncake_key}_layer{self._layer_ids[position]}"
+            tensors.extend(
+                [
+                    (f"{layer_key}_hs", hidden_states_3d[:, position, :]),
+                    (f"{layer_key}_ids", input_ids),
+                ]
             )
+        return tensors
+
+    def _publish_pending_saves(self, pending_saves: list[_PendingSave]) -> None:
+        local_positions = self._local_layer_positions()
+        if self._pp_size > 1 and not local_positions:
+            return
+        if not self._ensure_mooncake_store():
+            return
+        assert self._kv_cache is not None
+        capacity = int(self._mooncake_store.config.host_buffer_size)
+        keys: list[str] = []
+        tensors: list[torch.Tensor] = []
+        used_bytes = 0
+
+        def submit() -> None:
+            nonlocal keys, tensors, used_bytes
+            if keys:
+                self._mooncake_store.put_raw_tensors(keys, tensors)
+            keys = []
+            tensors = []
+            used_bytes = 0
+
+        for pending in pending_saves:
+            for key, tensor in self._pending_save_tensors(pending, local_positions):
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                if tensor_bytes > capacity:
+                    raise RuntimeError(
+                        f"Mooncake tensor {key} needs {tensor_bytes} bytes, "
+                        f"host buffer has {capacity}"
+                    )
+                if keys and used_bytes + tensor_bytes > capacity:
+                    submit()
+                keys.append(key)
+                tensors.append(tensor)
+                used_bytes += tensor_bytes
+        submit()
 
     def get_finished(
         self,
@@ -404,12 +441,14 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
         local_error: BaseException | None = None
         try:
-            for pending in pending_saves:
-                self._publish_pending_save(pending)
+            self._publish_pending_saves(pending_saves)
             if self._mooncake_store is not None:
-                # Correctness-first completion: do not release cache blocks or
-                # report the request sent until every local PUT has completed.
-                self._mooncake_store.flush()
+                # The cache gather above creates independent GPU tensors. The
+                # store records them on its DtoH stream, so hidden-cache blocks
+                # can be released after scheduling while PUTs finish in the
+                # background. Surface any already-completed failure without
+                # draining the async manager; readers wait for every key.
+                self._mooncake_store.check_async_errors()
         except BaseException as exc:
             local_error = exc
 

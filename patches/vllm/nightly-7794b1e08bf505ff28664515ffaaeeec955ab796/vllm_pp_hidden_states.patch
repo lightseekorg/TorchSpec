@@ -112,7 +112,7 @@ diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qw
 +            return intermediate_tensors
  
          hidden_states, _ = self.norm(hidden_states, residual)
- 
+
 diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
 index 7efe92893..8f536e497 100644
 --- a/vllm/models/kimi_k3/nvidia/model.py
@@ -424,7 +424,7 @@ index d500b6720..78a7128c4 100644
              else:
                  # Rare case.
                  assert not self.is_pooling_model
-@@ -4542,11 +4568,23 @@ class GPUModelRunner(
+@@ -4542,11 +4568,21 @@ class GPUModelRunner(
          self, grammar_output: "GrammarOutput | None"
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
          if self.execute_model_state is None:
@@ -444,12 +444,10 @@ index d500b6720..78a7128c4 100644
 +                and not get_pp_group().is_last_rank
 +            ):
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
-+            if extract_hidden_states and get_pp_group().world_size > 1:
-+                get_pp_group().barrier()
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4567,6 +4605,40 @@ class GPUModelRunner(
+@@ -4567,6 +4603,38 @@ class GPUModelRunner(
          # Clear ephemeral state.
          self.execute_model_state = None
  
@@ -464,8 +462,6 @@ index d500b6720..78a7128c4 100644
 +                "sampling, token proposal, and decode"
 +            )
 +            self.finalize_kv_connector()
-+            if get_pp_group().world_size > 1:
-+                get_pp_group().barrier()
 +            self.eplb_step()
 +
 +            kv_connector_output = self.kv_connector_output
@@ -490,15 +486,3 @@ index d500b6720..78a7128c4 100644
          # Apply structured output bitmasks if present.
          if grammar_output is not None:
              apply_grammar_bitmask(
-@@ -4743,6 +4815,11 @@ class GPUModelRunner(
-         # draft model to also save its KV cache.
-         if spec_config is not None:
-             self.finalize_kv_connector()
-+            if (
-+                spec_config.uses_extract_hidden_states()
-+                and get_pp_group().world_size > 1
-+            ):
-+                get_pp_group().barrier()
- 
-         with record_function_or_nullcontext("gpu_model_runner: eplb"):
-             self.eplb_step()

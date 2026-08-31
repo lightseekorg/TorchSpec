@@ -61,7 +61,10 @@ class HostBuffer:
 
         # PyTorch .copy_() handles CUDA→pinned-CPU directly in one DMA.
         # No need for .cpu() which would create an intermediate unpinned copy.
-        host_view.copy_(tensor.view(torch.uint8).view(-1))
+        # The destination is pinned, so CUDA sources can enqueue the DtoH copy
+        # on the caller's copy stream.  AsyncPutManager waits on the recorded
+        # copy_done event before handing the buffer to Mooncake.
+        host_view.copy_(tensor.view(torch.uint8).view(-1), non_blocking=True)
 
         return nbytes
 
@@ -136,6 +139,24 @@ class AsyncPutManager:
             err = self._last_error
             self._last_error = None
             raise err
+
+    def check_errors(self) -> None:
+        """Surface completed async failures without waiting for active puts.
+
+        Successful completed futures are retired here as well, which makes
+        their host buffers immediately reusable.  Futures that are still
+        running remain in ``_in_flight`` and this method returns immediately.
+        """
+        self.check_last_error()
+        for buffer_ptr, future in list(self._in_flight.items()):
+            if not future.done():
+                continue
+            self._in_flight.pop(buffer_ptr, None)
+            try:
+                future.result()
+            except Exception as exc:
+                self._last_error = exc
+                self.check_last_error()
 
     def wait_for_buffer(self, buffer_ptr: int) -> None:
         """Block until the in-flight transfer using *buffer_ptr* finishes.

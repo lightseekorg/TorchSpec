@@ -2,8 +2,8 @@ TorchSpec PP hidden-state extraction patch for
 vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013.
 
 The patch is forward-ported against vLLM project commit
-e9d1398d9edfd90fcc1cf783805240e3effec013 and keeps PP extraction-only
-execution separate from the later async-publication and barrier-overlap work.
+e9d1398d9edfd90fcc1cf783805240e3effec013 and includes asynchronous
+publication and pipeline-overlap support.
 diff --git a/vllm/model_executor/models/extract_hidden_states.py b/vllm/model_executor/models/extract_hidden_states.py
 index d94db2c692da2059fe1efa97352dd5fec8908b21..6fc5f892dda539811158c130fa47653aee752904 100644
 --- a/vllm/model_executor/models/extract_hidden_states.py
@@ -353,7 +353,7 @@ index 6325c1bf5daaf61c81ac501889efc74797849ea1..c8aa9b9f79a30986c81b1480e50711e0
      def _get_slot_mapping(
          self,
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 4ef7f5860a5fd3ff370cedad754e691e97320b2c..a359b7f89d100e9b49b70df7f1599e0f7e303473 100644
+index 4ef7f5860..0a9fa2d6b 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -487,7 +487,7 @@ class ExecuteModelState(NamedTuple):
@@ -431,7 +431,7 @@ index 4ef7f5860a5fd3ff370cedad754e691e97320b2c..a359b7f89d100e9b49b70df7f1599e0f
              else:
                  # Rare case.
                  assert not self.is_pooling_model
-@@ -4664,11 +4690,23 @@ class GPUModelRunner(
+@@ -4664,10 +4690,20 @@ class GPUModelRunner(
          self, grammar_output: "GrammarOutput | None"
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
          if self.execute_model_state is None:
@@ -451,12 +451,9 @@ index 4ef7f5860a5fd3ff370cedad754e691e97320b2c..a359b7f89d100e9b49b70df7f1599e0f
 +                and not get_pp_group().is_last_rank
 +            ):
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
-+            if extract_hidden_states and get_pp_group().world_size > 1:
-+                get_pp_group().barrier()
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
-             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4689,6 +4727,40 @@ class GPUModelRunner(
+@@ -4689,6 +4725,38 @@ class GPUModelRunner(
          # Clear ephemeral state.
          self.execute_model_state = None
  
@@ -471,8 +468,6 @@ index 4ef7f5860a5fd3ff370cedad754e691e97320b2c..a359b7f89d100e9b49b70df7f1599e0f
 +                "sampling, token proposal, and decode"
 +            )
 +            self.finalize_kv_connector()
-+            if get_pp_group().world_size > 1:
-+                get_pp_group().barrier()
 +            self.eplb_step()
 +
 +            kv_connector_output = self.kv_connector_output
@@ -497,15 +492,3 @@ index 4ef7f5860a5fd3ff370cedad754e691e97320b2c..a359b7f89d100e9b49b70df7f1599e0f
          # Apply structured output bitmasks if present.
          if grammar_output is not None:
              apply_grammar_bitmask(
-@@ -4866,6 +4938,11 @@ class GPUModelRunner(
-         # draft model to also save its KV cache.
-         if spec_config is not None:
-             self.finalize_kv_connector()
-+            if (
-+                spec_config.uses_extract_hidden_states()
-+                and get_pp_group().world_size > 1
-+            ):
-+                get_pp_group().barrier()
- 
-         with record_function_or_nullcontext("gpu_model_runner: eplb"):
-             self.eplb_step()

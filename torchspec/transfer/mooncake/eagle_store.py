@@ -68,6 +68,21 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
 
     TENSOR_SUFFIXES = ["_hs", "_tgt", "_ids", "_lhs"]
 
+    def put_raw_tensors(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
+        """Publish an already-normalized group of tensors in one batch.
+
+        The vLLM completed-request connector uses this to pack fragments from
+        multiple requests into each registered host buffer. This avoids one
+        serialized ``batch_put_from`` call per layer while retaining the same
+        per-layer Mooncake keys consumed by ``MooncakeDataset``.
+        """
+        self._ensure_initialized()
+        if not keys or len(keys) != len(tensors):
+            raise ValueError(
+                f"Expected equal non-empty keys/tensors, got {len(keys)}/{len(tensors)}"
+            )
+        self._put_raw_tensors(keys, tensors)
+
     def _put_raw_tensors(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         if self._gpu_direct_available and self._gpu_send_buffer is not None:
             buf = self._gpu_send_buffer
@@ -385,6 +400,12 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
                     dtypes.get("hidden_states", HIDDEN_STATES_STORAGE_DTYPE),
                 )
             )
+
+        # Publication is asynchronous on inference workers.  Wait for a
+        # complete metadata census before attempting either byte-transfer
+        # path; this also gives GPUDirect the retry/fail-closed behavior that
+        # previously existed only in the host-buffer fallback.
+        self.wait_for_keys(keys)
 
         tensor_map = None
         if self._gpu_direct_available and self._gpu_receive_buffer is not None:

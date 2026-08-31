@@ -19,8 +19,9 @@
 # SOFTWARE.
 
 import threading
+import time
 from abc import ABC
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 from mooncake.store import MooncakeDistributedStore
@@ -241,6 +242,77 @@ class MooncakeHiddenStateStore(ABC):
             return result == 1
         except Exception:
             return False
+
+    def batch_exists(self, keys: Sequence[str]) -> Dict[str, bool]:
+        """Return a metadata-only existence census for *keys*.
+
+        Newer Mooncake clients provide a one-RPC ``batch_is_exist`` API.  Keep
+        a per-key fallback for older supported clients, while preserving
+        errors so readers fail closed rather than mistaking a metadata failure
+        for a missing object.
+        """
+        self._ensure_initialized()
+        key_list = list(keys)
+        batch_is_exist = getattr(self._store, "batch_is_exist", None)
+        if callable(batch_is_exist):
+            results = list(batch_is_exist(key_list))
+            if len(results) != len(key_list):
+                raise RuntimeError(
+                    "Mooncake batch_is_exist returned "
+                    f"{len(results)} results for {len(key_list)} keys"
+                )
+        else:
+            results = [self._store.is_exist(key) for key in key_list]
+        return {key: result == 1 for key, result in zip(key_list, results)}
+
+    def wait_for_keys(
+        self,
+        keys: Sequence[str],
+        *,
+        timeout: Optional[float] = None,
+        poll_interval: Optional[float] = None,
+    ) -> None:
+        """Wait until every key is visible in Mooncake metadata.
+
+        This is deliberately called before either GPUDirect or host-buffer
+        byte movement.  A timeout reports the exact missing keys, which turns
+        an incomplete pipeline fragment into a fail-closed sample.
+        """
+        key_list = list(keys)
+        if not key_list:
+            return
+        if timeout is None:
+            timeout = self.config.get_retry_max_wait_seconds
+        if poll_interval is None:
+            poll_interval = self.config.get_retry_wait_seconds
+        poll_interval = max(float(poll_interval), 0.001)
+        timeout = float(timeout)
+        start = time.monotonic()
+        deadline = None if timeout <= 0 else start + timeout
+        last_missing = key_list
+
+        while True:
+            census = self.batch_exists(key_list)
+            last_missing = [key for key in key_list if not census[key]]
+            if not last_missing:
+                return
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                missing = ", ".join(last_missing)
+                raise TimeoutError(
+                    "Timed out waiting for Mooncake keys after "
+                    f"{now - start:.3f}s; missing: {missing}"
+                )
+            sleep_for = poll_interval
+            if deadline is not None:
+                sleep_for = min(sleep_for, max(deadline - now, 0.0))
+            time.sleep(sleep_for)
+
+    def check_async_errors(self) -> None:
+        """Surface completed background put failures without draining puts."""
+        self._ensure_initialized()
+        if self._async_put_manager is not None:
+            self._async_put_manager.check_errors()
 
     def _verify_force_delete(self) -> None:
         """Fail-fast if Mooncake doesn't support batch_remove(force=True).
