@@ -95,6 +95,9 @@ def compile_friendly_flex_attention(
     )
 
 
+_compiled_create_block_mask = None
+
+
 def compile_friendly_create_block_mask(
     mask_mod,
     B,
@@ -104,12 +107,25 @@ def compile_friendly_create_block_mask(
     device,
     BLOCK_SIZE: "int | tuple[int, int]" = 128,
 ):
-    """Create block mask directly (no compilation wrapper).
+    """Create a BlockMask, compiling the builder when the shape allows it.
 
-    Matches SpecForge behavior — create_block_mask is fast enough without
-    torch.compile, and compiling it adds overhead with torch 2.9.1.
+    DFlash rebuilds its BlockMask every step, and building it eagerly dominates the
+    attention it saves: at ctx 4096 the eager build is 5.4ms against ~1.5ms for the
+    attention itself. Compiling the builder is the documented way to speed it up.
+
+    torch.compile of ``create_block_mask`` fails when the whole mask fits in one block
+    (Q_LEN <= 128 and KV_LEN <= 128), so that case stays eager. DFlash is far above it —
+    Q_LEN is ``num_anchors * block_size``.
     """
-    return create_block_mask(
+    global _compiled_create_block_mask
+
+    if Q_LEN <= 128 and KV_LEN <= 128:
+        return create_block_mask(mask_mod, B, H, Q_LEN, KV_LEN, device, BLOCK_SIZE=BLOCK_SIZE)
+
+    if _compiled_create_block_mask is None:
+        _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
+
+    return _compiled_create_block_mask(
         mask_mod,
         B,
         H,

@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch._dynamo as dynamo
+from torch.nn.attention.flex_attention import create_block_mask
 from transformers import LlamaConfig
 
 import torchspec.models.draft.llama3_eagle as llama_mod
@@ -442,6 +443,37 @@ class TestFlashAttentionCachedPath(unittest.TestCase):
             llama_mod._std_flash_attn_forward = old_std_fwd
             llama_mod._std_flash_attn_backward = old_std_bwd
             llama_mod._std_flash_attn_mod = old_std_mod
+
+
+class TestCompiledBlockMask(unittest.TestCase):
+    """The builder is compiled for speed; it must not change the mask it produces.
+
+    DFlash rebuilds its BlockMask every step and the eager build dominates the attention
+    it saves, so compile_friendly_create_block_mask compiles create_block_mask. Inductor
+    cannot codegen it when the whole mask is a single block, which is why shapes at or
+    under one block stay eager.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "create_block_mask needs CUDA")
+    def test_compiled_build_matches_eager(self):
+        q_len, kv_len = 1024, 2048
+        mask_mod = generate_eagle3_mask(Q_LEN=q_len, KV_LEN=kv_len)
+
+        compiled = compile_friendly_create_block_mask(mask_mod, 1, None, q_len, kv_len, "cuda")
+        eager = create_block_mask(mask_mod, 1, None, q_len, kv_len, "cuda")
+
+        torch.testing.assert_close(compiled.to_dense(), eager.to_dense())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "create_block_mask needs CUDA")
+    def test_single_block_shape_still_builds(self):
+        """Q_LEN and KV_LEN both within one block: the eager fallback must be taken."""
+        q_len, kv_len = 64, 128
+        mask_mod = generate_eagle3_mask(Q_LEN=q_len, KV_LEN=kv_len)
+
+        built = compile_friendly_create_block_mask(mask_mod, 1, None, q_len, kv_len, "cuda")
+        eager = create_block_mask(mask_mod, 1, None, q_len, kv_len, "cuda")
+
+        torch.testing.assert_close(built.to_dense(), eager.to_dense())
 
 
 if __name__ == "__main__":
