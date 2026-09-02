@@ -1,0 +1,80 @@
+# Four-GPU CI lane comparing the same Eagle3 training job with vLLM TP and PP.
+#
+# Two GPUs run training and two GPUs run one vLLM target engine. The launcher
+# runs this config twice: once with pp_size=1 (TP2 reference) and once with
+# pp_size=2 (TP1 x PP2). Both runs use the same seed, fixture, and optimizer
+# step count; the launcher compares every logged TRAIN_STEP loss.
+model:
+  target_model_path: Qwen/Qwen3.8-27B
+  target_model_backend: vllm
+  draft_model_config: configs/ci/qwen3_8_27b_eagle3_draft.json
+  embedding_key: model.language_model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  norm_key: model.language_model.norm.weight
+  trust_remote_code: true
+
+dataset:
+  train_data_path: ../../examples/data/sample_conversations.jsonl
+  chat_template: qwen
+  prompt_key: conversations
+  shuffle_dataset: false
+  length_group_size: 1
+
+training:
+  attention_backend: flex_attention
+  micro_batch_size: 1
+  draft_accumulation_steps: 1
+  learning_rate: 1e-4
+  lr_total_steps: 4
+  max_concurrent_batches: 1
+  max_grad_norm: 0.5
+  max_seq_length: 16384
+  num_epochs: 1
+  num_train_steps: 4
+  prefetch_depth: 1
+  save_interval: 0
+  save_per_epoch: false
+  seed: 42
+  training_num_gpus_per_node: 2
+  training_num_nodes: 1
+  ttt_length: 2
+  warmup_ratio: 0.0
+
+inference:
+  inference_engine_type: vllm
+  store_last_hidden_states: true
+  inference_num_gpus: 2
+  inference_num_gpus_per_engine: 2
+  inference_num_gpus_per_node: 4
+  inference_batch_size: 1
+  inference_buffer_threshold: 2
+  max_sample_pool_size: 4
+  # Qwen3.8 is hybrid GDN/full-attention. Capture only full-attention layers.
+  aux_hidden_states_layers: [3, 31, 59]
+  vllm:
+    tp_size: 2
+    pp_size: 1
+    mem_fraction_static: 0.55
+    extra_args:
+      enforce_eager: true
+      language_model_only: true
+      max_model_len: 16384
+      max_num_batched_tokens: 4096
+
+mooncake:
+  master_server_address: null
+  metadata_server: null
+  protocol: tcp
+  global_segment_size: 4GB
+  local_buffer_size: 1GB
+
+output_dir: ""
+cache_dir: ../../.ci-cache/qwen3-8-27b-eagle3-pp-convergence
+model_download_dir: null
+
+logging:
+  report_to: none
+
+debug:
+  enable_perf_metrics: true
+  save_debug_train_data: null

@@ -2,7 +2,7 @@ name: GPU Integration
 
 # GPU jobs execute PR code and therefore require an explicit WRITE-access
 # maintainer trigger. A trusted runner dispatches the selected merge commit
-# into an isolated two-GPU Slurm container allocation.
+# into isolated Slurm container allocations.
 on:
   pull_request_target:
     types: [labeled]
@@ -95,12 +95,17 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ steps.source.outputs.head_sha }}', state: 'pending',
-              context: 'gpu-integration/train-2gpu', description: 'Waiting for GB200 runner…',
-              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
+            for (const contextName of [
+              'gpu-integration/train-2gpu',
+              'gpu-integration/train-4gpu-pp-convergence',
+            ]) {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo,
+                sha: '${{ steps.source.outputs.head_sha }}', state: 'pending',
+                context: contextName, description: 'Waiting for GB200 runner…',
+                target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            }
 
   integration:
     name: Qwen3.8 Eagle3 + DSpark + DFlash2 (GB200, 2 GPUs)
@@ -155,9 +160,65 @@ jobs:
           path: ${{ runner.temp }}/slurm-report
           if-no-files-found: warn
 
+  pp_convergence:
+    name: Eagle3 TP vs PP convergence (GB200, 4 GPUs)
+    needs: authorize
+    runs-on: ${{ vars.TORCHSPEC_GPU_DISPATCHER_LABEL }}
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    env:
+      TORCHSPEC_CI_MODEL: ${{ vars.TORCHSPEC_CI_MODEL || 'Qwen/Qwen3.8-27B' }}
+      TORCHSPEC_CI_MODEL_REVISION: ${{ vars.TORCHSPEC_CI_MODEL_REVISION || '1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0' }}
+      TORCHSPEC_CI_SOURCE_SHA: ${{ needs.authorize.outputs.merge_sha }}
+      TORCHSPEC_SLURM_ROOT: ${{ secrets.TORCHSPEC_SLURM_ROOT }}
+      TORCHSPEC_CI_IMAGE: ${{ secrets.TORCHSPEC_CI_IMAGE }}
+      TORCHSPEC_CI_MODEL_CACHE_HOST: ${{ secrets.TORCHSPEC_CI_MODEL_CACHE_HOST }}
+      TORCHSPEC_CI_GPU_COUNT: 4
+      TORCHSPEC_CI_RUN_SCRIPT: tools/ci/run_2gpu_training_smoke.sh
+      TORCHSPEC_CI_MODE: pp_convergence
+      TORCHSPEC_CI_PP_MAX_REL_LOSS_DIFF: 0.01
+    steps:
+      - name: Checkout trusted dispatcher
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout PR merge without credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          ref: ${{ needs.authorize.outputs.merge_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Submit and wait for Slurm PP convergence test
+        run: >-
+          trusted/tools/ci/dispatch_slurm.sh
+          "$GITHUB_WORKSPACE/source"
+          "$RUNNER_TEMP/slurm-report"
+
+      - name: Publish Slurm summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/slurm-report/summary.md" ]]; then
+            cat "$RUNNER_TEMP/slurm-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Slurm dispatcher exited before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload PP convergence artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: gpu-training-4gpu-pp-${{ needs.authorize.outputs.head_sha }}
+          path: ${{ runner.temp }}/slurm-report
+          if-no-files-found: warn
+
   report:
     name: Publish GPU result
-    needs: [authorize, integration]
+    needs: [authorize, integration, pp_convergence]
     if: always() && needs.authorize.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -179,13 +240,27 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8
         with:
           script: |
-            const ok = '${{ needs.integration.result }}' === 'success';
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ needs.authorize.outputs.head_sha }}',
-              state: ok ? 'success' : 'failure',
-              context: 'gpu-integration/train-2gpu',
-              description: ok ? 'Passed on GB200' : 'Failed on GB200',
-              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
-            if (!ok) core.setFailed('GPU integration failed');
+            const results = [
+              {
+                result: '${{ needs.integration.result }}',
+                context: 'gpu-integration/train-2gpu',
+                description: 'Passed on GB200',
+              },
+              {
+                result: '${{ needs.pp_convergence.result }}',
+                context: 'gpu-integration/train-4gpu-pp-convergence',
+                description: 'Passed on GB200 with TP/PP convergence match',
+              },
+            ];
+            for (const item of results) {
+              const ok = item.result === 'success';
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner, repo: context.repo.repo,
+                sha: '${{ needs.authorize.outputs.head_sha }}',
+                state: ok ? 'success' : 'failure',
+                context: item.context,
+                description: ok ? item.description : 'Failed on GB200',
+                target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              });
+            }
+            if (results.some(item => item.result !== 'success')) core.setFailed('GPU integration failed');

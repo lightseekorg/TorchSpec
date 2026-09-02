@@ -3,10 +3,13 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 eagle3_config="${TORCHSPEC_CI_EAGLE3_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_eagle3_2gpu_smoke.yaml}"
+pp_convergence_config="${TORCHSPEC_CI_PP_CONVERGENCE_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_eagle3_pp_convergence.yaml}"
 dspark_config="${TORCHSPEC_CI_DSPARK_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_dspark_2gpu_smoke.yaml}"
 dflash2_config="${TORCHSPEC_CI_DFLASH2_CONFIG:-${repo_root}/configs/ci/vllm_qwen3_8_27b_dflash2_2gpu_smoke.yaml}"
 fixture="${TORCHSPEC_CI_FIXTURE:-${repo_root}/examples/data/sample_conversations.jsonl}"
 artifact_dir="${TORCHSPEC_CI_ARTIFACT_DIR:-${RUNNER_TEMP:-/tmp}/torchspec-2gpu-training}"
+ci_mode="${TORCHSPEC_CI_MODE:-standard}"
+expected_gpu_count="${TORCHSPEC_CI_GPU_COUNT:-2}"
 model="${TORCHSPEC_CI_MODEL:-Qwen/Qwen3.8-27B}"
 model_revision="${TORCHSPEC_CI_MODEL_REVISION:-1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0}"
 long_context_dataset_id="${TORCHSPEC_CI_LONG_CONTEXT_DATASET_ID:-long_chunked_prefill_test}"
@@ -23,13 +26,15 @@ export TORCHINDUCTOR_CACHE_DIR="${compile_cache}"
 node_ip="$(hostname -i | awk '{print $1}')"
 export TORCHSPEC_PIN_NODE_IP="${node_ip}"
 
-python3 - <<'PY'
+python3 - "${expected_gpu_count}" <<'PY'
+import sys
 import torch
 
 count = torch.cuda.device_count()
 print(f"CI_CUDA_DEVICE_COUNT={count}")
-if count != 2:
-    raise SystemExit(f"Expected exactly 2 visible CUDA devices, got {count}")
+expected = int(sys.argv[1])
+if count != expected:
+    raise SystemExit(f"Expected exactly {expected} visible CUDA devices, got {count}")
 for index in range(count):
     props = torch.cuda.get_device_properties(index)
     print(f"CI_GPU index={index} name={props.name} memory={props.total_memory}")
@@ -110,7 +115,12 @@ run_lane() {
   local expected_trainer="${3:-}"
   local lane_dir="${artifact_dir}/${lane}"
   local train_log="${lane_dir}/training.log"
-  local -a extra_args=()
+  if (( $# >= 3 )); then
+    shift 3
+  else
+    shift $#
+  fi
+  local -a extra_args=("$@")
 
   mkdir -p "${lane_dir}/actor-logs"
   export TORCHSPEC_LOG_DIR="${lane_dir}/actor-logs"
@@ -204,6 +214,27 @@ print(f"CI_STEP_LOSSES lane={lane} values={json.dumps(losses, separators=(',', '
 PY
   echo "CI_LANE_COMPLETE=${lane}"
 }
+
+if [[ "${ci_mode}" == "pp_convergence" ]]; then
+  run_lane tp "${pp_convergence_config}" "" \
+    inference.inference_num_gpus=2 \
+    inference.inference_num_gpus_per_engine=2 \
+    inference.inference_num_gpus_per_node=4 \
+    inference.vllm.pp_size=1
+  run_lane pp "${pp_convergence_config}" "" \
+    inference.inference_num_gpus=2 \
+    inference.inference_num_gpus_per_engine=2 \
+    inference.inference_num_gpus_per_node=4 \
+    inference.vllm.pp_size=2
+
+  max_relative_diff="${TORCHSPEC_CI_PP_MAX_REL_LOSS_DIFF:-0.01}"
+  python3 "${repo_root}/tools/ci/compare_eagle3_convergence.py" \
+    "${artifact_dir}/tp/step-losses.json" \
+    "${artifact_dir}/pp/step-losses.json" \
+    "${artifact_dir}/pp-convergence.json" \
+    --max-relative-diff "${max_relative_diff}"
+  exit 0
+fi
 
 run_lane eagle3 "${eagle3_config}"
 run_lane dspark "${dspark_config}"
