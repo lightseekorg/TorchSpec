@@ -76,6 +76,7 @@ _PER_STAGE_AUX_CAPTURE_ARCHITECTURES = frozenset(
         "KimiLinearForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
     }
 )
 

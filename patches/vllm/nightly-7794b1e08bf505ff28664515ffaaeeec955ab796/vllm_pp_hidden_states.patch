@@ -113,6 +113,32 @@ diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qw
  
          hidden_states, _ = self.norm(hidden_states, residual)
 
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -652 +652,5 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
++    ) -> (
++        torch.Tensor
++        | IntermediateTensors
++        | tuple[torch.Tensor | IntermediateTensors, list[torch.Tensor]]
++    ):
+@@ -665 +669,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        # Capture ids are global layer positions.  Only PP0 owns the embedding
++        # output at id 0; later stages must not duplicate their stage input.
++        aux_hidden_states: list[torch.Tensor] = []
++        if self.start_layer == 0:
++            self._maybe_add_hidden_state(
++                aux_hidden_states, 0, hidden_states, residual
++            )
+@@ -699 +709 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+-            return IntermediateTensors(
++            intermediate_tensors = IntermediateTensors(
+@@ -701,0 +712,3 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
++            if self.aux_hidden_state_layers:
++                return intermediate_tensors, aux_hidden_states
++            return intermediate_tensors
 diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
 index 7efe92893..8f536e497 100644
 --- a/vllm/models/kimi_k3/nvidia/model.py

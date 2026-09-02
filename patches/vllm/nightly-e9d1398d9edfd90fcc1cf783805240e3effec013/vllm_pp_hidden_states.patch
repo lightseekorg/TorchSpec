@@ -5,7 +5,7 @@ The patch is forward-ported against vLLM project commit
 e9d1398d9edfd90fcc1cf783805240e3effec013 and includes asynchronous
 publication and pipeline-overlap support.
 diff --git a/vllm/model_executor/models/extract_hidden_states.py b/vllm/model_executor/models/extract_hidden_states.py
-index d94db2c692da2059fe1efa97352dd5fec8908b21..6fc5f892dda539811158c130fa47653aee752904 100644
+index d94db2c69..6fc5f892d 100644
 --- a/vllm/model_executor/models/extract_hidden_states.py
 +++ b/vllm/model_executor/models/extract_hidden_states.py
 @@ -23,7 +23,12 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
@@ -67,7 +67,7 @@ index d94db2c692da2059fe1efa97352dd5fec8908b21..6fc5f892dda539811158c130fa47653a
          # Output is ignored - we only care about the KV cache side effects
          _ = self.cache_only_layers[str(self.target_num_hidden_layers)](hidden_states)
 diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
-index 3820f5e39b42464af8133b08c018664634bc4932..ee77e6c05c668db34ce455010885e9fb18f39559 100644
+index 3820f5e39..ee77e6c05 100644
 --- a/vllm/model_executor/models/qwen2.py
 +++ b/vllm/model_executor/models/qwen2.py
 @@ -400,7 +400,11 @@ class Qwen2Model(nn.Module, EagleModelMixin):
@@ -120,8 +120,35 @@ index 3820f5e39b42464af8133b08c018664634bc4932..ee77e6c05c668db34ce455010885e9fb
  
          hidden_states, _ = self.norm(hidden_states, residual)
  
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 51fd036f4..d98aaffce 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -615 +615,5 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
++    ) -> (
++        torch.Tensor
++        | IntermediateTensors
++        | tuple[torch.Tensor | IntermediateTensors, list[torch.Tensor]]
++    ):
+@@ -632 +636,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
++        # Capture ids are global layer positions. Only PP0 owns the embedding
++        # output at id 0; later stages must not duplicate their stage input.
++        aux_hidden_states: list[torch.Tensor] = []
++        if self.start_layer == 0:
++            self._maybe_add_hidden_state(
++                aux_hidden_states, 0, hidden_states, residual
++            )
+@@ -647 +657 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
+-            return IntermediateTensors(
++            intermediate_tensors = IntermediateTensors(
+@@ -649,0 +660,3 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
++            if self.aux_hidden_state_layers:
++                return intermediate_tensors, aux_hidden_states
++            return intermediate_tensors
 diff --git a/vllm/models/kimi_k3/nvidia/model.py b/vllm/models/kimi_k3/nvidia/model.py
-index 15ac51cd41a600acbff1de01bb03daa3588cf91e..a857319abd18011922bcb3d44c655e6854f03fd9 100644
+index 15ac51cd4..a857319ab 100644
 --- a/vllm/models/kimi_k3/nvidia/model.py
 +++ b/vllm/models/kimi_k3/nvidia/model.py
 @@ -1341,7 +1341,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
@@ -148,7 +175,7 @@ index 15ac51cd41a600acbff1de01bb03daa3588cf91e..a857319abd18011922bcb3d44c655e68
          if self.use_attn_res:
              assert prefix_sum is not None
 diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
-index 56a532b809a97873998fddf8c4d10029297b5fa9..456d1823342475008d6a7fce688325c8ebae2c4f 100644
+index 56a532b80..456d18233 100644
 --- a/vllm/v1/core/sched/async_scheduler.py
 +++ b/vllm/v1/core/sched/async_scheduler.py
 @@ -25,7 +25,7 @@ class AsyncScheduler(Scheduler):
@@ -161,7 +188,7 @@ index 56a532b809a97873998fddf8c4d10029297b5fa9..456d1823342475008d6a7fce688325c8
  
              scheduler_output.pending_structured_output_tokens |= (
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 26674154c648bcb34372a69cfb68dae0328df594..1fab558262fe278de0b48ebb6a54e8ed2dcc498e 100644
+index 26674154c..1fab55826 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -126,9 +126,15 @@ class Scheduler(SchedulerInterface):
@@ -196,7 +223,7 @@ index 26674154c648bcb34372a69cfb68dae0328df594..1fab558262fe278de0b48ebb6a54e8ed
                  # Pooling stops as soon as there is output.
                  request.status = RequestStatus.FINISHED_STOPPED
 diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
-index 4cc433cbfe38afa781ad704ab8f2fc46aa5329b1..b8177fc4ad0dd8b34a7763f9d9a7b172e346e934 100644
+index 4cc433cbf..b8177fc4a 100644
 --- a/vllm/v1/engine/input_processor.py
 +++ b/vllm/v1/engine/input_processor.py
 @@ -49,6 +49,10 @@ class InputProcessor:
@@ -224,7 +251,7 @@ index 4cc433cbfe38afa781ad704ab8f2fc46aa5329b1..b8177fc4ad0dd8b34a7763f9d9a7b172
                  "Make sure that `max_model_len` is no smaller than the "
                  "number of text tokens (prompt + requested output tokens)."
 diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
-index 80b909afbc8d4a69016ef9f43d6bb18fbc889a5a..04bf2da889c3263c6f2aa22a913538a098099303 100644
+index 80b909afb..04bf2da88 100644
 --- a/vllm/v1/outputs.py
 +++ b/vllm/v1/outputs.py
 @@ -359,6 +359,10 @@ class ModelRunnerOutput:
@@ -239,7 +266,7 @@ index 80b909afbc8d4a69016ef9f43d6bb18fbc889a5a..04bf2da889c3263c6f2aa22a913538a0
      def with_kv_conn_output_only(
          kv_connector_output: KVConnectorOutput | None,
 diff --git a/vllm/v1/spec_decode/extract_hidden_states.py b/vllm/v1/spec_decode/extract_hidden_states.py
-index 6325c1bf5daaf61c81ac501889efc74797849ea1..c8aa9b9f79a30986c81b1480e50711e0b833a963 100644
+index 6325c1bf5..c8aa9b9f7 100644
 --- a/vllm/v1/spec_decode/extract_hidden_states.py
 +++ b/vllm/v1/spec_decode/extract_hidden_states.py
 @@ -6,10 +6,11 @@ from __future__ import annotations

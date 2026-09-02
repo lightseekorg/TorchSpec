@@ -495,6 +495,7 @@ class TestPerStageCaptureGate:
 
     def test_supported_architecture_passes(self):
         self._check(2, ["Qwen3ForCausalLM"])
+        self._check(2, ["Qwen3_5ForConditionalGeneration"])
         self._check(4, ["KimiK3ForConditionalGeneration"])
 
     def test_unsupported_architecture_is_rejected(self):
