@@ -4,6 +4,13 @@
 # runs this config twice: once with pp_size=1 (TP2 reference) and once with
 # pp_size=2 (TP1 x PP2). Both runs use the same seed, fixture, and optimizer
 # step count; the launcher compares every logged TRAIN_STEP loss.
+#
+# Runtime requirement: the PP2 lane must use the image built from
+# docker/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/Dockerfile.
+# That Dockerfile pins the vLLM base image and applies the matching patch series,
+# which adds SupportsPP plus per-stage auxiliary hidden-state returns. A standard
+# vLLM installation from the general setup instructions supports the TP2 lane,
+# but is not sufficient for this PP2 recipe.
 model:
   target_model_path: Qwen/Qwen3.8-27B
   target_model_backend: vllm

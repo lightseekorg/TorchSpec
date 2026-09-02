@@ -27,6 +27,21 @@ python -m torchspec.train_entry --config configs/sglang_qwen3_8b.yaml training.l
 | `sglang_kimi_k25_3node.yaml` | SGLang | Kimi-K2.5 | 3-node H100, 24 GPUs |
 | `vllm_kimi_k3_dflash2_mla_swa_gb300.yaml` | vLLM | Kimi-K3 | DFlash2 MLA+SWA, six-node GB300 recipe; replace placeholders |
 | `vllm_kimi_k3_eagle3.yaml` | vLLM | Kimi-K3 | EAGLE3 MLA training recipe; replace placeholders |
+| `ci/vllm_qwen3_8_27b_eagle3_pp_convergence.yaml` | vLLM | Qwen3.8-27B | GB200 TP2/PP2 convergence gate; patched vLLM required |
+
+### vLLM pipeline-parallel recipes
+
+Configs with `inference.vllm.pp_size > 1` require TorchSpec's patched vLLM
+runtime. The standard vLLM environment installed by the general setup
+instructions does not provide the `SupportsPP` declaration and per-stage
+auxiliary hidden-state returns required by these recipes.
+
+For the Qwen3.8 convergence recipe, use the image built from
+`docker/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/Dockerfile`.
+It pins the upstream vLLM image by tag and digest and applies
+`patches/vllm/nightly-e9d1398d9edfd90fcc1cf783805240e3effec013/series`.
+GPU CI additionally checks the in-container vLLM revision, base-image tag, V2
+runner setting, and extraction patch markers before training starts.
 
 ## Key sections
 

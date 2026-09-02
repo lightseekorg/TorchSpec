@@ -1,5 +1,12 @@
 # Patch stack for vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013
 # Keep PP extraction correctness isolated from later async-publication and
 # barrier-overlap changes.
+#
+# Adds SupportsPP to ExtractHiddenStatesModel and makes model forwards return
+# the auxiliary hidden states owned by each pipeline stage. Both capabilities
+# are required for extract_hidden_states with pipeline_parallel_size > 1.
 vllm_pp_hidden_states.patch
+
+# Carries those stage-local fragments through the V2 runner and aggregates them
+# before publishing the completed request.
 vllm_v2_pp_hidden_states.patch
