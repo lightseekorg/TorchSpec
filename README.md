@@ -21,6 +21,9 @@ Draft models trained with TorchSpec, available on the [LightSeek Foundation](htt
 - [lightseekorg/kimi-k2.6-eagle3](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3)
 - [lightseekorg/kimi-k2.6-eagle3-mla](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3-mla)
 - [lightseekorg/kimi-k2.6-eagle3.1-mla](https://huggingface.co/lightseekorg/kimi-k2.6-eagle3.1-mla)
+- [lightseekorg/kimi-k3-eagle3-mla](https://huggingface.co/lightseekorg/kimi-k3-eagle3-mla)
+- [lightseekorg/kimi-k3-dflash2](https://huggingface.co/lightseekorg/kimi-k3-dflash2)
+- [lightseekorg/kimi-k3-dspark](https://huggingface.co/lightseekorg/kimi-k3-dspark)
 
 Draft models trained with TorchSpec, available from other organizations:
 
@@ -31,6 +34,7 @@ Draft models trained with TorchSpec, available from other organizations:
 
 ## Blogs and Announcements
 
+- [Releasing Kimi K3 Draft Collection: Efficient Draft Training in TorchSpec](https://lightseek.org/blog/kimi-k3-draft-collection.html) (Sep 2026)
 - [EAGLE 3.1: Advancing Speculative Decoding Through Collaboration Between the EAGLE Team, vLLM, and TorchSpec](https://lightseek.org/blog/eagle-3-1.html) (May 2026)
 - [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/) (PyTorch Blog, March 2026)
 - [TorchSpec: Speculative Decoding Training at Scale](https://lightseek.org/blog/torchspec-speculative-decoding-training-at-scale.html) (March 2026)
