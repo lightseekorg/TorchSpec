@@ -150,19 +150,6 @@ class TestAnchoredModel(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "MRoPE"):
             AnchoredEagle3Model(draft_model=draft, length=T, attention_backend="flex_attention")
 
-    def test_rejects_unsupported_loss_types(self):
-        torch.manual_seed(0)
-        config = AutoDraftModelConfig.from_dict(dict(_EAGLE3))
-        draft = AutoEagle3DraftModel.from_config(config, torch_dtype=torch.float32)
-
-        with self.assertRaisesRegex(ValueError, "forward_kl"):
-            AnchoredEagle3Model(
-                draft_model=draft,
-                length=T,
-                attention_backend="flex_attention",
-                loss_type="lk_alpha",
-            )
-
     @unittest.skipUnless(torch.cuda.is_available(), "FlexAttention path needs CUDA")
     def test_mla_draft_with_far_fewer_anchors_than_positions(self):
         """The rotary table must span the sequence, not the anchor count.
@@ -254,10 +241,11 @@ class TestMatchesDense(unittest.TestCase):
 
     def test_per_depth_losses_match_dense(self):
         for name in ("llama", "mla"):
-            with self.subTest(draft=name):
-                self._assert_matches_dense(name)
+            for loss_type in ("forward_kl", "lk_alpha", "lk_lambda"):
+                with self.subTest(draft=name, loss_type=loss_type):
+                    self._assert_matches_dense(name, loss_type)
 
-    def _assert_matches_dense(self, draft_kind):
+    def _assert_matches_dense(self, draft_kind, loss_type="forward_kl"):
         torch.manual_seed(0)
         seq, hidden, supervised = 64, 64, 40
 
@@ -271,7 +259,8 @@ class TestMatchesDense(unittest.TestCase):
             input_ids=torch.randint(0, 128, (1, seq), device="cuda"),
             attention_mask=torch.ones(1, seq, dtype=torch.long, device="cuda"),
             target=PrecomputedTarget(
-                target_p_padded=torch.softmax(torch.randn(1, seq + T, 128, device="cuda"), dim=-1)
+                target_p_padded=torch.softmax(torch.randn(1, seq + T, 128, device="cuda"), dim=-1),
+                coverage_padded=torch.rand(1, seq + T, device="cuda").clamp_min(0.1),
             ),
             loss_mask=loss_mask,
             hidden_states=torch.randn(1, seq, hidden * 3, device="cuda"),
@@ -279,7 +268,7 @@ class TestMatchesDense(unittest.TestCase):
 
         # "sdpa" so the dense path builds the additive decoder mask its eager attention
         # needs; the anchored path builds its own mask either way.
-        shared = dict(draft_model=draft, length=T, attention_backend="sdpa")
+        shared = dict(draft_model=draft, length=T, attention_backend="sdpa", loss_type=loss_type)
         dense = Eagle3Model(**shared)
         anchored = AnchoredEagle3Model(num_anchors=seq, **shared)
 

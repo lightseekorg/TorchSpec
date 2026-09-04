@@ -114,7 +114,14 @@ def _gather_target(
     loss reads the same either way with idx=0 and seq_length=num_anchors.
     """
     if isinstance(target, PrecomputedTarget):
-        return PrecomputedTarget(target_p_padded=_gather(target.target_p_padded, positions))
+        # coverage_padded travels with the gathered rows: the LK losses read the true
+        # target mass as target_p_padded * coverage_padded, and dropping it here would
+        # silently fall back to all-ones and overstate alpha under vocab pruning.
+        coverage = target.coverage_padded
+        return PrecomputedTarget(
+            target_p_padded=_gather(target.target_p_padded, positions),
+            coverage_padded=None if coverage is None else _gather(coverage, positions),
+        )
     return LazyTarget(
         hidden_states_padded=_gather(target.hidden_states_padded, positions),
         lm_head_weight=target.lm_head_weight,
@@ -140,10 +147,6 @@ class AnchoredEagle3Model(Eagle3Model):
                 "'mrope'). The dense path rotates through apply_multimodal_rotary_pos_emb "
                 "with the configured mrope_section, while the gathered-query path applies "
                 "standard rotary and would ignore the multidimensional position ids."
-            )
-        if self.loss_type != "forward_kl":
-            raise ValueError(
-                f"Anchored Eagle3 supports loss_type='forward_kl', got {self.loss_type!r}."
             )
         self.num_anchors = num_anchors
         self.anchor_max_gap = anchor_max_gap
