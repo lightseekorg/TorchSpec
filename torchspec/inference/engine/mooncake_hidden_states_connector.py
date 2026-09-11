@@ -394,12 +394,6 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         """
         assert self._kv_cache is not None
         self._cache_gpu_direct_registered = False
-        if self._pp_size <= 1:
-            logger.debug(
-                "Direct hidden-cache publication is disabled for TP-only layout; "
-                "the combined layer tensor still requires packing"
-            )
-            return
         if not self._kv_cache.is_cuda or self._kv_cache.dtype != torch.bfloat16:
             logger.info(
                 "Direct hidden-cache publication requires a CUDA BF16 cache; got %s/%s",
@@ -487,15 +481,6 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         input_ids = pending.token_ids.to(hidden_states_3d.device)
         mooncake_key = _sanitize_mooncake_key(pending.req_id)
 
-        if self._pp_size == 1:
-            all_hidden = hidden_states_3d.reshape(num_tokens, -1)
-            split_at = self._num_training_layers * self._hidden_size
-            return [
-                (f"{mooncake_key}_hs", all_hidden[:, :split_at]),
-                (f"{mooncake_key}_ids", input_ids),
-                (f"{mooncake_key}_lhs", all_hidden[:, -self._hidden_size :]),
-            ]
-
         tensors: list[tuple[str, torch.Tensor]] = []
         for position in local_positions:
             layer_key = f"{mooncake_key}_layer{self._layer_ids[position]}"
@@ -509,7 +494,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _publish_pending_saves(self, pending_saves: list[_PendingSave]) -> None:
         local_positions = self._local_layer_positions()
-        if self._pp_size > 1 and not local_positions:
+        if not local_positions:
             return
         if not self._ensure_mooncake_store():
             return
@@ -550,7 +535,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         pending_saves: list[_PendingSave],
         local_positions: list[int],
     ) -> None:
-        """Publish PP layer objects straight from registered LBNHC cache pages."""
+        """Publish layer objects straight from registered LBNHC cache pages."""
         assert self._kv_cache is not None
         hidden_keys: list[str] = []
         hidden_ptrs: list[list[int]] = []
@@ -700,19 +685,22 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 "num_layers": self.num_hidden_states,
                 "input_ids_list": token_ids,
             }
-            if self._pp_size > 1:
-                self._req_metadata[new_req.req_id]["pp_layer_manifest"] = [
-                    {
-                        "layer_id": layer_id,
-                        "mooncake_key": f"{mooncake_key}_layer{layer_id}",
-                        "role": (
-                            "last_hidden_states"
-                            if layer_id == self._num_target_layers
-                            else "hidden_states"
-                        ),
-                    }
-                    for layer_id in self._layer_ids
-                ]
+            # Keep one object per captured layer for every topology. This maps
+            # directly to paged cache fragments and avoids rebuilding the old
+            # token-major packed object for TP-only engines. The metadata key is
+            # retained for compatibility with existing readers.
+            self._req_metadata[new_req.req_id]["pp_layer_manifest"] = [
+                {
+                    "layer_id": layer_id,
+                    "mooncake_key": f"{mooncake_key}_layer{layer_id}",
+                    "role": (
+                        "last_hidden_states"
+                        if layer_id == self._num_target_layers
+                        else "hidden_states"
+                    ),
+                }
+                for layer_id in self._layer_ids
+            ]
 
         return meta
 

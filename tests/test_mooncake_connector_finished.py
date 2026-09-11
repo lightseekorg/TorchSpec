@@ -97,18 +97,26 @@ def test_publish_pending_saves_pack_pipeline_fragments(monkeypatch):
     assert tensors[2].dtype == torch.bfloat16
 
 
-def test_pending_save_tensors_normalizes_tp_hidden_states():
+def test_pending_save_tensors_uses_layer_objects_for_tp():
     connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
     connector._block_size = 3
     connector._kv_cache = torch.arange(2 * 4 * 3 * 2, dtype=torch.float16).view(2, 4, 3, 2)
     connector._pp_size = 1
-    connector._num_training_layers = 3
-    connector._hidden_size = 2
+    connector._layer_ids = [2, 46, 90, 93]
     pending = _PendingSave("req", torch.tensor([10, 20, 30]), [1])
 
-    tensors = connector._pending_save_tensors(pending, [])
+    tensors = connector._pending_save_tensors(pending, [0, 1, 2, 3])
 
-    assert [key for key, _ in tensors] == ["req_hs", "req_ids", "req_lhs"]
+    assert [key for key, _ in tensors] == [
+        "req_layer2_hs",
+        "req_layer2_ids",
+        "req_layer46_hs",
+        "req_layer46_ids",
+        "req_layer90_hs",
+        "req_layer90_ids",
+        "req_layer93_hs",
+        "req_layer93_ids",
+    ]
     assert tensors[0][1].dtype == torch.bfloat16
     assert tensors[1][1].dtype == torch.int64
     assert tensors[2][1].dtype == torch.bfloat16
@@ -189,6 +197,72 @@ def test_registered_cache_publish_uses_scatter_put_for_hidden_states():
     assert [tensor.tolist() for tensor in id_tensors] == [
         [10, 20, 30, 40, 50],
         [10, 20, 30, 40, 50],
+    ]
+
+
+def test_registered_cache_publish_uses_scatter_put_for_tp_hidden_states():
+    connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
+    connector._kv_cache = torch.empty((5, 4, 3, 2), dtype=torch.bfloat16)
+    connector._layer_ids = [2, 46, 90, 93]
+    connector._mooncake_store = MagicMock()
+    connector._mooncake_store.config.host_buffer_size = 1024
+    pending = _PendingSave("req", torch.tensor([10, 20, 30, 40, 50]), [3, 1])
+
+    connector._publish_pending_saves_from_registered_cache([pending], [0, 1, 2, 3])
+
+    direct = connector._mooncake_store.put_from_registered_multi_buffers
+    direct.assert_called_once()
+    keys, all_ptrs, all_sizes = direct.call_args.args
+    assert keys == [
+        "req_layer2_hs",
+        "req_layer46_hs",
+        "req_layer90_hs",
+        "req_layer93_hs",
+    ]
+    assert len(all_ptrs) == 4
+    assert all_sizes == [[12, 8], [12, 8], [12, 8], [12, 8]]
+
+
+def test_tp_registers_hidden_state_cache_for_gpu_direct(monkeypatch):
+    connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
+    connector._pp_size = 1
+    connector._kv_cache = MagicMock()
+    connector._kv_cache.is_cuda = True
+    connector._kv_cache.dtype = torch.bfloat16
+    connector._kv_cache.numel.return_value = 1024
+    connector._kv_cache.element_size.return_value = 2
+    connector._kv_cache.data_ptr.return_value = 4096
+    connector._mooncake_store = MagicMock()
+    connector._mooncake_store.config.enable_gpu_direct = True
+    connector._mooncake_store.config.protocol = "rdma"
+    connector._mooncake_store.supports_multi_buffer_put = True
+    connector._mooncake_store.register_external_buffer.return_value = True
+    monkeypatch.setattr(connector, "_ensure_mooncake_store", lambda: True)
+    monkeypatch.setattr(
+        "torchspec.inference.engine.mooncake_hidden_states_connector._cache_layer_fragments",
+        lambda *_args: ([4096], [2]),
+    )
+
+    connector._register_hidden_state_cache_for_gpu_direct()
+
+    connector._mooncake_store.register_external_buffer.assert_called_once_with(4096, 2048)
+    assert connector._cache_gpu_direct_registered is True
+
+
+def test_build_connector_meta_includes_layer_manifest_for_tp():
+    connector = _scheduler_connector()
+    connector._pp_size = 1
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="req", prompt_token_ids=[10, 20, 30])]
+    )
+
+    connector.build_connector_meta(scheduler_output)
+
+    assert connector._req_metadata["req"]["pp_layer_manifest"] == [
+        {"layer_id": 2, "mooncake_key": "req_layer2", "role": "hidden_states"},
+        {"layer_id": 46, "mooncake_key": "req_layer46", "role": "hidden_states"},
+        {"layer_id": 90, "mooncake_key": "req_layer90", "role": "hidden_states"},
+        {"layer_id": 93, "mooncake_key": "req_layer93", "role": "last_hidden_states"},
     ]
 
 
