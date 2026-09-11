@@ -202,3 +202,38 @@ def test_host_buffer_copy_is_non_blocking():
 
     assert buffer.copy_from_tensor(Tensor(), offset=4) == 8
     assert copied["non_blocking"] is True
+
+
+def test_registered_multi_buffer_put_delegates_with_replicate_config():
+    raw_store = MagicMock(spec=["batch_put_from_multi_buffers", "batch_remove"])
+    raw_store.batch_put_from_multi_buffers.return_value = [0, 0]
+    store = _make_store(raw_store)
+    store._replicate_config = MagicMock()
+
+    store.put_from_registered_multi_buffers(
+        ["layer2", "layer46"],
+        [[100, 200], [300]],
+        [[64, 32], [96]],
+    )
+
+    raw_store.batch_put_from_multi_buffers.assert_called_once_with(
+        ["layer2", "layer46"],
+        [[100, 200], [300]],
+        [[64, 32], [96]],
+        config=store._replicate_config,
+    )
+
+
+def test_registered_multi_buffer_put_cleans_partial_failure():
+    raw_store = MagicMock(spec=["batch_put_from_multi_buffers", "batch_remove"])
+    raw_store.batch_put_from_multi_buffers.return_value = [0, -600]
+    store = _make_store(raw_store)
+
+    with pytest.raises(RuntimeError, match=r"layer46 \(code=-600\)"):
+        store.put_from_registered_multi_buffers(
+            ["layer2", "layer46"],
+            [[100], [200]],
+            [[64], [64]],
+        )
+
+    raw_store.batch_remove.assert_called_once_with(["layer2", "layer46"], force=True)

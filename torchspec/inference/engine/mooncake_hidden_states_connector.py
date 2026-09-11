@@ -96,6 +96,60 @@ def _slot_mapping_from_block_ids(
     return (block_ids_gpu.unsqueeze(1) * page_size + offsets).flatten()[:num_tokens]
 
 
+def _cache_layer_fragments(
+    kv_cache: torch.Tensor,
+    block_ids: list[int],
+    layer_position: int,
+    num_tokens: int,
+) -> tuple[list[int], list[int]]:
+    """Return registered-cache source slices for one logical layer tensor.
+
+    The required vLLM layout is ``(blocks, layers, block_size, hidden)``.
+    Tokens for one layer are contiguous inside each block, so Mooncake's
+    multi-buffer put can concatenate those block slices into the exact
+    ``(num_tokens, hidden)`` object consumed by training.
+    """
+    if kv_cache.dim() != 4:
+        raise ValueError(f"Expected a 4D LBNHC cache, got shape={tuple(kv_cache.shape)}")
+    num_blocks, num_layers, block_size, hidden_size = kv_cache.shape
+    if not 0 <= layer_position < num_layers:
+        raise ValueError(
+            f"Layer position {layer_position} is outside hidden-state cache shape "
+            f"{tuple(kv_cache.shape)}"
+        )
+    if num_tokens <= 0:
+        raise ValueError(f"Expected a positive token count, got {num_tokens}")
+    if len(block_ids) * block_size < num_tokens:
+        raise ValueError(
+            f"Hidden-state cache has {len(block_ids) * block_size} slots for {num_tokens} tokens"
+        )
+    if kv_cache.stride(3) != 1 or kv_cache.stride(2) != hidden_size:
+        raise ValueError(
+            "Hidden-state cache tokens are not contiguous within each block: "
+            f"shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}"
+        )
+
+    element_size = kv_cache.element_size()
+    base_ptr = kv_cache.data_ptr()
+    ptrs: list[int] = []
+    sizes: list[int] = []
+    remaining = num_tokens
+    for block_id in block_ids:
+        if not 0 <= block_id < num_blocks:
+            raise ValueError(f"Hidden-state block id {block_id} is outside [0, {num_blocks})")
+        if remaining == 0:
+            break
+        tokens_in_block = min(block_size, remaining)
+        element_offset = block_id * kv_cache.stride(0) + layer_position * kv_cache.stride(1)
+        ptrs.append(base_ptr + element_offset * element_size)
+        sizes.append(tokens_in_block * hidden_size * element_size)
+        remaining -= tokens_in_block
+
+    if remaining:
+        raise ValueError(f"Hidden-state cache is missing {remaining} token slots")
+    return ptrs, sizes
+
+
 @dataclass
 class _PendingSave:
     req_id: str
@@ -164,6 +218,7 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self._num_target_layers = vllm_config.model_config.get_total_num_hidden_layers()
         self._kv_cache: torch.Tensor | None = None
+        self._cache_gpu_direct_registered = False
         self._check_layer_layout()
         self._check_mooncake_env()
 
@@ -328,6 +383,68 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 "Hidden-state block-size mismatch: "
                 f"derived {self._block_size}, cache view has {self._kv_cache.shape[2]}"
             )
+        self._register_hidden_state_cache_for_gpu_direct()
+
+    def _register_hidden_state_cache_for_gpu_direct(self) -> None:
+        """Try to make the vLLM hidden-state cache a Mooncake RDMA source.
+
+        Registration is an optional fast path. Unsupported layouts, older
+        Mooncake clients, CUDA-VMM registration failures, and non-RDMA configs
+        retain the existing registered staging-buffer path.
+        """
+        assert self._kv_cache is not None
+        self._cache_gpu_direct_registered = False
+        if self._pp_size <= 1:
+            logger.debug(
+                "Direct hidden-cache publication is disabled for TP-only layout; "
+                "the combined layer tensor still requires packing"
+            )
+            return
+        if not self._kv_cache.is_cuda or self._kv_cache.dtype != torch.bfloat16:
+            logger.info(
+                "Direct hidden-cache publication requires a CUDA BF16 cache; got %s/%s",
+                self._kv_cache.device,
+                self._kv_cache.dtype,
+            )
+            return
+        if not self._ensure_mooncake_store():
+            return
+        if not self._mooncake_store.config.enable_gpu_direct:
+            return
+        if self._mooncake_store.config.protocol.lower() != "rdma":
+            logger.warning("GPU Direct hidden-cache publication requires Mooncake RDMA")
+            return
+        if not self._mooncake_store.supports_multi_buffer_put:
+            logger.warning(
+                "Mooncake lacks batch_put_from_multi_buffers; using the registered staging buffer"
+            )
+            return
+
+        try:
+            # Validate the layout before paying the RDMA registration cost.
+            _cache_layer_fragments(self._kv_cache, [0], 0, 1)
+            cache_nbytes = self._kv_cache.numel() * self._kv_cache.element_size()
+            self._cache_gpu_direct_registered = self._mooncake_store.register_external_buffer(
+                self._kv_cache.data_ptr(), cache_nbytes
+            )
+        except Exception:
+            logger.warning(
+                "Failed to register the hidden-state cache for direct Mooncake puts; "
+                "using the registered staging buffer",
+                exc_info=True,
+            )
+            return
+
+        if getattr(self, "_cache_gpu_direct_registered", False):
+            logger.info(
+                "Registered %.1f GiB vLLM hidden-state cache for direct paged Mooncake puts",
+                cache_nbytes / (1024**3),
+            )
+        else:
+            logger.warning(
+                "Mooncake rejected hidden-state cache registration; "
+                "using the registered staging buffer"
+            )
 
     def save_kv_layer(
         self,
@@ -397,6 +514,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         if not self._ensure_mooncake_store():
             return
         assert self._kv_cache is not None
+        if getattr(self, "_cache_gpu_direct_registered", False):
+            self._publish_pending_saves_from_registered_cache(pending_saves, local_positions)
+            return
         capacity = int(self._mooncake_store.config.host_buffer_size)
         keys: list[str] = []
         tensors: list[torch.Tensor] = []
@@ -425,6 +545,77 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                 used_bytes += tensor_bytes
         submit()
 
+    def _publish_pending_saves_from_registered_cache(
+        self,
+        pending_saves: list[_PendingSave],
+        local_positions: list[int],
+    ) -> None:
+        """Publish PP layer objects straight from registered LBNHC cache pages."""
+        assert self._kv_cache is not None
+        hidden_keys: list[str] = []
+        hidden_ptrs: list[list[int]] = []
+        hidden_sizes: list[list[int]] = []
+        id_keys: list[str] = []
+        id_tensors: list[torch.Tensor] = []
+
+        for pending in pending_saves:
+            num_tokens = pending.token_ids.shape[0]
+            input_ids = pending.token_ids.to(self._kv_cache.device)
+            mooncake_key = _sanitize_mooncake_key(pending.req_id)
+            for position in local_positions:
+                layer_key = f"{mooncake_key}_layer{self._layer_ids[position]}"
+                ptrs, sizes = _cache_layer_fragments(
+                    self._kv_cache,
+                    pending.block_ids,
+                    position,
+                    num_tokens,
+                )
+                hidden_keys.append(f"{layer_key}_hs")
+                hidden_ptrs.append(ptrs)
+                hidden_sizes.append(sizes)
+                id_keys.append(f"{layer_key}_ids")
+                id_tensors.append(input_ids)
+
+        if hidden_keys:
+            # Mooncake's NIC read is outside CUDA stream ordering. Ensure every
+            # cache-write kernel submitted before get_finished is visible
+            # before RDMA reads the registered pages. The put itself is
+            # synchronous, so its return is also the cache-block reuse fence.
+            if self._kv_cache.is_cuda:
+                cache_ready = torch.cuda.Event()
+                cache_ready.record(torch.cuda.current_stream(self._kv_cache.device))
+                cache_ready.synchronize()
+            self._mooncake_store.put_from_registered_multi_buffers(
+                hidden_keys,
+                hidden_ptrs,
+                hidden_sizes,
+            )
+
+        # Token IDs originate on the scheduler CPU and are tiny relative to
+        # hidden states. Keep the existing registered staging path for them;
+        # when the GPU send buffer is available this is a small HtoD copy, not
+        # a hidden-state DtoH copy.
+        capacity = int(self._mooncake_store.config.host_buffer_size)
+        keys: list[str] = []
+        tensors: list[torch.Tensor] = []
+        used_bytes = 0
+        for key, tensor in zip(id_keys, id_tensors):
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if tensor_bytes > capacity:
+                raise RuntimeError(
+                    f"Mooncake tensor {key} needs {tensor_bytes} bytes, buffer has {capacity}"
+                )
+            if keys and used_bytes + tensor_bytes > capacity:
+                self._mooncake_store.put_raw_tensors(keys, tensors)
+                keys = []
+                tensors = []
+                used_bytes = 0
+            keys.append(key)
+            tensors.append(tensor)
+            used_bytes += tensor_bytes
+        if keys:
+            self._mooncake_store.put_raw_tensors(keys, tensors)
+
     def get_finished(
         self,
         finished_req_ids: set[str],
@@ -443,11 +634,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         try:
             self._publish_pending_saves(pending_saves)
             if self._mooncake_store is not None:
-                # The cache gather above creates independent GPU tensors. The
-                # store records them on its DtoH stream, so hidden-cache blocks
-                # can be released after scheduling while PUTs finish in the
-                # background. Surface any already-completed failure without
-                # draining the async manager; readers wait for every key.
+                # Direct cache puts complete synchronously before block reuse.
+                # The fallback path gathers independent tensors and records
+                # their DtoH copies before cache release. Surface any completed
+                # staging failure without draining active puts; readers wait
+                # for every key.
                 self._mooncake_store.check_async_errors()
         except BaseException as exc:
             local_error = exc

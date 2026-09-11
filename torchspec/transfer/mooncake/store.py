@@ -220,6 +220,101 @@ class MooncakeHiddenStateStore(ABC):
 
         return False
 
+    @property
+    def supports_multi_buffer_put(self) -> bool:
+        """Whether this Mooncake client can build one object from many buffers."""
+        self._ensure_initialized()
+        return callable(getattr(self._store, "batch_put_from_multi_buffers", None))
+
+    def register_external_buffer(self, buffer_ptr: int, size: int) -> bool:
+        """Register caller-owned memory for zero-copy Mooncake operations.
+
+        The caller retains ownership and must keep the allocation alive until
+        the store is closed (or :meth:`unregister_external_buffer` succeeds).
+        Sub-ranges of the registered allocation may subsequently be passed to
+        ``batch_put_from_multi_buffers``.
+        """
+        self._ensure_initialized()
+        return self._register_buffer(buffer_ptr, size)
+
+    def unregister_external_buffer(self, buffer_ptr: int) -> bool:
+        """Unregister caller-owned memory previously registered with Mooncake."""
+        self._ensure_initialized()
+        if buffer_ptr not in self._registered_buffers:
+            return True
+        try:
+            result = self._store.unregister_buffer(buffer_ptr)
+        except Exception as exc:
+            logger.warning("Failed to unregister buffer at %#x: %s", buffer_ptr, exc)
+            return False
+        if result not in (None, 0):
+            logger.warning("unregister_buffer returned error code %s for %#x", result, buffer_ptr)
+            return False
+        self._registered_buffers.pop(buffer_ptr, None)
+        return True
+
+    def put_from_registered_multi_buffers(
+        self,
+        keys: Sequence[str],
+        all_buffer_ptrs: Sequence[Sequence[int]],
+        all_sizes: Sequence[Sequence[int]],
+    ) -> None:
+        """Publish objects assembled from registered memory fragments.
+
+        This is the scatter-source counterpart of ``batch_put_from``.  It is
+        used by the vLLM PP connector to publish one layer directly from its
+        paged hidden-state cache without first packing the blocks into a host
+        or GPU staging buffer.
+        """
+        self._ensure_initialized()
+        key_list = list(keys)
+        ptr_lists = [list(ptrs) for ptrs in all_buffer_ptrs]
+        size_lists = [list(sizes) for sizes in all_sizes]
+        if not key_list or len(key_list) != len(ptr_lists) or len(key_list) != len(size_lists):
+            raise ValueError(
+                "Expected equal non-empty keys/pointer-lists/size-lists, got "
+                f"{len(key_list)}/{len(ptr_lists)}/{len(size_lists)}"
+            )
+        for key, ptrs, sizes in zip(key_list, ptr_lists, size_lists):
+            if not ptrs or len(ptrs) != len(sizes):
+                raise ValueError(
+                    f"Mooncake object {key!r} has {len(ptrs)} pointers and {len(sizes)} sizes"
+                )
+            if any(size <= 0 for size in sizes):
+                raise ValueError(f"Mooncake object {key!r} has a non-positive fragment size")
+
+        batch_put = getattr(self._store, "batch_put_from_multi_buffers", None)
+        if not callable(batch_put):
+            raise RuntimeError(
+                "Mooncake batch_put_from_multi_buffers is unavailable; "
+                "mooncake-transfer-engine >= 0.3.12.post1 is required for "
+                "direct paged hidden-state publication"
+            )
+        if self._replicate_config is not None:
+            results = list(
+                batch_put(key_list, ptr_lists, size_lists, config=self._replicate_config)
+            )
+        else:
+            results = list(batch_put(key_list, ptr_lists, size_lists))
+        if len(results) != len(key_list):
+            raise RuntimeError(
+                "batch_put_from_multi_buffers returned "
+                f"{len(results)} results for {len(key_list)} keys"
+            )
+        failures = [(key, result) for key, result in zip(key_list, results) if result != 0]
+        if not failures:
+            return
+        try:
+            self._store.batch_remove(key_list, force=True)
+        except Exception:
+            logger.warning(
+                "Failed to cleanup keys after batch_put_from_multi_buffers failure: %s",
+                key_list,
+                exc_info=True,
+            )
+        detail = ", ".join(f"{key} (code={result})" for key, result in failures)
+        raise RuntimeError(f"batch_put_from_multi_buffers failed: {detail}")
+
     def warmup_rdma(self) -> None:
         """Do a small test PUT to warm up the RDMA data path."""
         import uuid

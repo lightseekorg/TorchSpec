@@ -9,6 +9,7 @@ import torch
 from torchspec.inference.engine.mooncake_hidden_states_connector import (
     MooncakeConnectorMetadata,
     MooncakeHiddenStatesConnector,
+    _cache_layer_fragments,
     _PendingSave,
 )
 
@@ -145,6 +146,49 @@ def test_publish_pending_saves_splits_at_host_buffer_capacity(monkeypatch):
     assert calls[2].args[0] == [
         "req1_layer46_hs",
         "req1_layer46_ids",
+    ]
+
+
+def test_cache_layer_fragments_preserve_token_order_across_blocks():
+    cache = torch.empty((5, 4, 3, 2), dtype=torch.bfloat16)
+
+    ptrs, sizes = _cache_layer_fragments(
+        cache,
+        block_ids=[3, 1],
+        layer_position=2,
+        num_tokens=5,
+    )
+
+    element_size = cache.element_size()
+    assert ptrs == [
+        cache.data_ptr() + (3 * cache.stride(0) + 2 * cache.stride(1)) * element_size,
+        cache.data_ptr() + (1 * cache.stride(0) + 2 * cache.stride(1)) * element_size,
+    ]
+    assert sizes == [3 * 2 * element_size, 2 * 2 * element_size]
+
+
+def test_registered_cache_publish_uses_scatter_put_for_hidden_states():
+    connector = MooncakeHiddenStatesConnector.__new__(MooncakeHiddenStatesConnector)
+    connector._kv_cache = torch.empty((5, 4, 3, 2), dtype=torch.bfloat16)
+    connector._layer_ids = [2, 46, 90, 93]
+    connector._mooncake_store = MagicMock()
+    connector._mooncake_store.config.host_buffer_size = 1024
+    pending = _PendingSave("req", torch.tensor([10, 20, 30, 40, 50]), [3, 1])
+
+    connector._publish_pending_saves_from_registered_cache([pending], [0, 2])
+
+    direct = connector._mooncake_store.put_from_registered_multi_buffers
+    direct.assert_called_once()
+    keys, all_ptrs, all_sizes = direct.call_args.args
+    assert keys == ["req_layer2_hs", "req_layer90_hs"]
+    assert len(all_ptrs) == 2
+    assert all_sizes == [[12, 8], [12, 8]]
+    connector._mooncake_store.put_raw_tensors.assert_called_once()
+    id_keys, id_tensors = connector._mooncake_store.put_raw_tensors.call_args.args
+    assert id_keys == ["req_layer2_ids", "req_layer90_ids"]
+    assert [tensor.tolist() for tensor in id_tensors] == [
+        [10, 20, 30, 40, 50],
+        [10, 20, 30, 40, 50],
     ]
 
 
