@@ -87,6 +87,11 @@ class EagleMooncakeStore(MooncakeHiddenStateStore):
         if self._gpu_direct_available and self._gpu_send_buffer is not None:
             buf = self._gpu_send_buffer
             buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+            # copy_from_tensor() enqueues device-to-device copies on the
+            # current stream. Mooncake does not participate in CUDA stream
+            # ordering, so make those writes visible before the NIC reads the
+            # registered send buffer.
+            torch.cuda.current_stream(buf.device).synchronize()
             self._do_sync_batch_put(keys, buffer_ptrs, sizes)
         elif self._host_buffer_pool is None or self._async_put_manager is None:
             raise RuntimeError(

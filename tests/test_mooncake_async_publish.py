@@ -54,6 +54,26 @@ def test_eagle_raw_put_validates_then_delegates():
     store._put_raw_tensors.assert_called_once_with(keys, tensors)
 
 
+def test_gpu_direct_put_waits_for_staging_before_rdma_read():
+    store = object.__new__(EagleMooncakeStore)
+    store._gpu_direct_available = True
+    store._gpu_send_buffer = MagicMock(ptr=123, device="cuda:0")
+    store._stage_tensors_into_buffer = MagicMock(return_value=([123], [8]))
+    events = []
+    stream = MagicMock()
+    stream.synchronize.side_effect = lambda: events.append("staging complete")
+    store._do_sync_batch_put = MagicMock(side_effect=lambda *_: events.append("rdma put"))
+
+    with patch(
+        "torchspec.transfer.mooncake.eagle_store.torch.cuda.current_stream",
+        return_value=stream,
+    ) as current_stream:
+        store._put_raw_tensors(["key"], [MagicMock()])
+
+    current_stream.assert_called_once_with("cuda:0")
+    assert events == ["staging complete", "rdma put"]
+
+
 def test_async_error_check_does_not_wait_for_running_put():
     manager = AsyncPutManager(MagicMock(), max_workers=1)
     pending = Future()
