@@ -45,6 +45,22 @@ from torchspec.utils.distributed import (
 from torchspec.utils.logging import logger
 
 
+def _clone_fragment_before_receive_buffer_reuse(
+    tensors: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Clone Mooncake receive-buffer views before the next GPUDirect GET.
+
+    CUDA clones are asynchronous, while Mooncake writes the registered receive
+    buffer outside CUDA stream ordering. Synchronize the clone stream before a
+    subsequent GET can reuse and overwrite that buffer.
+    """
+    cloned = {name: tensor.clone() for name, tensor in tensors.items()}
+    cuda_tensor = next((tensor for tensor in cloned.values() if tensor.is_cuda), None)
+    if cuda_tensor is not None:
+        torch.cuda.current_stream(cuda_tensor.device).synchronize()
+    return cloned
+
+
 @dataclass
 class TrainSample:
     mooncake_key: str
@@ -205,8 +221,9 @@ class MooncakeDataset(IterableDataset):
                 device=self.device,
             ).to_tensor_dict()
 
-            layer_hidden = tensors["hidden_states"].clone()
-            layer_input_ids = tensors["input_ids"].clone()
+            cloned = _clone_fragment_before_receive_buffer_reuse(tensors)
+            layer_hidden = cloned["hidden_states"]
+            layer_input_ids = cloned["input_ids"]
             if input_ids is None:
                 input_ids = layer_input_ids
             elif not torch.equal(input_ids, layer_input_ids):

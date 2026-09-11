@@ -3,6 +3,7 @@
 import queue
 import time
 from typing import Dict, List, Tuple
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -12,6 +13,7 @@ from torchspec.training.data_fetcher import (
     MooncakeDataFetcher,
     MooncakeDataset,
     TrainSample,
+    _clone_fragment_before_receive_buffer_reuse,
     create_mooncake_dataloader,
 )
 
@@ -37,6 +39,29 @@ class MockTargetOutput:
 
     def to_tensor_dict(self) -> Dict[str, torch.Tensor]:
         return dict(self._tensors)
+
+
+def test_clone_fragment_synchronizes_cuda_before_receive_buffer_reuse(monkeypatch):
+    clone_stream = MagicMock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: clone_stream)
+
+    class FakeTensor:
+        is_cuda = True
+        device = torch.device("cuda:0")
+
+        def __init__(self, name):
+            self.name = name
+
+        def clone(self):
+            return FakeTensor(f"{self.name}-clone")
+
+    cloned = _clone_fragment_before_receive_buffer_reuse(
+        {"hidden_states": FakeTensor("hs"), "input_ids": FakeTensor("ids")}
+    )
+
+    assert cloned["hidden_states"].name == "hs-clone"
+    assert cloned["input_ids"].name == "ids-clone"
+    clone_stream.synchronize.assert_called_once_with()
 
 
 class MockMooncakeStore:
