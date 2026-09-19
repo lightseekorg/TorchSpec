@@ -30,10 +30,9 @@ Draft models trained with TorchSpec, available from other organizations:
 - [Inferact/MiniMax-M3-EAGLE3](https://huggingface.co/Inferact/MiniMax-M3-EAGLE3)
 - [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark)
 
-## 🚀 Blogs
+## 🚀 Blogs and Announcements
 
-## Blogs and Announcements
-
+- 🔥 [TorchSpec: Speculative Decoding Training at Scale](https://www.youtube.com/watch?v=M7fbxwBSIeI) (Youtube Video, Ray Summit 2026)
 - [Releasing Kimi K3 Draft Collection: Efficient Draft Training in TorchSpec](https://lightseek.org/blog/kimi-k3-draft-collection.html) (Sep 2026)
 - [EAGLE 3.1: Advancing Speculative Decoding Through Collaboration Between the EAGLE Team, vLLM, and TorchSpec](https://lightseek.org/blog/eagle-3-1.html) (May 2026)
 - [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/) (PyTorch Blog, March 2026)
