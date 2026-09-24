@@ -54,6 +54,10 @@ fa = [
     "nvidia-cutlass-dsl-libs-base>=4.4.2",
 ]
 
+megatron = [
+    "megatron-core==0.18.0; python_version >= '3.12'",
+]
+
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
