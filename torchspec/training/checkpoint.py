@@ -155,22 +155,99 @@ def resolve_initial_draft_checkpoint(path: str) -> Path:
     return checkpoint_path
 
 
-def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
-    """Load a published draft checkpoint into a freshly constructed draft model.
-
-    Unrelated to ``load()`` below, which resumes a training checkpoint with its optimizer and
-    scheduler state. Published drafts carry the serving key names ``tools/convert_to_hf.py``
-    writes, so keys are mapped back first, and the load is strict in both directions: a mismatch
-    would otherwise leave part of the model randomly initialised for a whole run.
-    """
+def _load_initial_weights(
+    draft_model: torch.nn.Module,
+    path: str,
+    *,
+    upgrade_keys: set[str],
+    allow_missing_embedding: bool,
+    error_type: type[Exception] = RuntimeError,
+) -> Path:
+    """Load shared weights strictly; new modules must be wholly absent or complete."""
     checkpoint_path = resolve_initial_draft_checkpoint(path)
+    expected = draft_model.state_dict()
     with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
-        tensors = {key: f.get_tensor(key) for key in f.keys()}
+        tensors = to_internal_keys({key: f.get_tensor(key) for key in f.keys()}, expected)
 
-    draft_model.load_state_dict(
-        to_internal_keys(tensors, draft_model.state_dict().keys()), strict=True
+    present_upgrade = upgrade_keys.intersection(tensors)
+    if present_upgrade and present_upgrade != upgrade_keys:
+        raise error_type(
+            f"Incomplete {type(draft_model).__name__} upgrade weights: "
+            f"missing={sorted(upgrade_keys - present_upgrade)}"
+        )
+    allowed_missing = {"embed_tokens.weight"} if allow_missing_embedding else set()
+    if not present_upgrade:
+        allowed_missing |= upgrade_keys
+    missing = set(expected) - set(tensors) - allowed_missing
+    unexpected = set(tensors) - set(expected)
+    mismatched = {
+        key for key in tensors.keys() & expected.keys() if tensors[key].shape != expected[key].shape
+    }
+    if missing or unexpected or mismatched:
+        raise error_type(
+            f"Incompatible initial {type(draft_model).__name__} checkpoint: "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}, "
+            f"shape_mismatch={sorted(mismatched)}"
+        )
+    # Validate before modifying the model. Retain only explicitly allowed initialization.
+    retained = set(expected) - set(tensors)
+    draft_model.load_state_dict({**expected, **tensors}, strict=True)
+    logger.info(
+        "Loaded %d initial draft tensors from %s; retained initialization for %s",
+        len(tensors),
+        checkpoint_path,
+        sorted(retained),
     )
     return checkpoint_path
+
+
+def load_initial_dflash_weights(draft_model: torch.nn.Module, path: str) -> Path:
+    """Warm-start DFlash, DFlash2 or DSpark from a compatible published backbone.
+
+    DFlash2 convolutions/selector or DSpark Markov/confidence heads may be wholly
+    absent, retaining their constructor initialization. Partial additions and missing
+    backbone weights are errors. The embedding is loaded separately from the target.
+    """
+    from torchspec.models.draft.dflash2 import DFlash2DraftModel
+    from torchspec.models.draft.dspark import DSparkDraftModel
+
+    extra = set()
+    if isinstance(draft_model, DFlash2DraftModel):
+        extra = {
+            key
+            for key in draft_model.state_dict()
+            if ".attention_conv." in key
+            or ".mlp_conv." in key
+            or key.startswith("candidate_selector.")
+        }
+    elif isinstance(draft_model, DSparkDraftModel):
+        extra = {
+            key
+            for key in draft_model.state_dict()
+            if key.startswith(("markov_head.", "confidence_head."))
+        }
+    return _load_initial_weights(
+        draft_model, path, upgrade_keys=extra, allow_missing_embedding=True, error_type=ValueError
+    )
+
+
+def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
+    """Load published draft weights, including a compatible EAGLE3 -> 3.1 warm start.
+
+    EAGLE's new per-input FC norms may be wholly absent; their unit-scale constructor
+    initialization is retained. Post-norm feedback is selected by config.norm_output
+    and adds no weights. This changes computation, so it is a training initialization,
+    not an output-preserving conversion. Head and vocabulary mappings remain strict.
+    The frozen EAGLE embedding may be absent because the trainer loads it from target.
+    This path does not restore optimizer or scheduler state.
+    """
+    from torchspec.models.draft.base import Eagle3DraftModel
+
+    is_eagle = isinstance(draft_model, Eagle3DraftModel)
+    extra = {key for key in draft_model.state_dict() if is_eagle and key.startswith("fc_norm.")}
+    return _load_initial_weights(
+        draft_model, path, upgrade_keys=extra, allow_missing_embedding=is_eagle
+    )
 
 
 def resolve_resume_model_dir(args: Any) -> Path | None:

@@ -134,6 +134,9 @@ class DFlashTrainer(Trainer):
             draft_model = self._build_draft_model(config)
 
         if dist.get_rank() == 0:
+            initial_path = getattr(self.args, "initial_draft_model_path", None)
+            if initial_path:
+                checkpoint.load_initial_dflash_weights(draft_model, initial_path)
             draft_model.load_embedding(
                 target_model_path,
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens.weight"),
