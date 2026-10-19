@@ -2431,11 +2431,11 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    
+
         if getattr(config, "attn_norm", False):
             self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
             self.pre_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    
+
         if getattr(config, "enable_post_mlp_norm", False):
             self.post_mlp_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
