@@ -26,6 +26,7 @@ import torch.distributed as dist
 
 from torchspec import AutoDraftModelConfig, AutoEagle3DraftModel, Eagle3Model
 from torchspec.models.anchored_eagle3 import AnchoredEagle3Model
+from torchspec.models.draft.eagle4_moe import Eagle4Router
 from torchspec.models.eagle3 import compute_lazy_target_padded, compute_target_p_padded
 from torchspec.training import checkpoint
 from torchspec.training.fsdp import apply_fsdp2, fsdp2_load_full_state_dict
@@ -92,13 +93,24 @@ class Eagle3Trainer(Trainer):
 
         initial_draft_model_path = getattr(self.args, "initial_draft_model_path", None)
         freeze_lm_head = getattr(self.args, "freeze_lm_head", False)
-        # A head loaded from a checkpoint is frozen as-is; only a fresh one is seeded. The
-        # resume path is resolved rather than merely present: load() skips a load_path that
-        # resolves to nothing, which would otherwise freeze a randomly initialized head.
-        seed_lm_head_from_target = freeze_lm_head and not (
-            initial_draft_model_path or checkpoint.resolve_resume_model_dir(self.args)
+        # A fresh frozen head is seeded from the target, and so is a full-vocab dense head before
+        # a warm start, so the rows a pruned EAGLE3 checkpoint lacks start from the target; the
+        # checkpoint then overwrites what it has. The resume path is resolved rather than merely
+        # present: load() skips a load_path that resolves to nothing.
+        seed_lm_head_from_target = not checkpoint.resolve_resume_model_dir(self.args) and (
+            (freeze_lm_head and not initial_draft_model_path)
+            or bool(initial_draft_model_path)
+            and not hasattr(draft_model, "t2d")
+            and not draft_model.is_lm_head_factorized
         )
         if dist.get_rank() == 0:
+            if seed_lm_head_from_target:
+                draft_model.load_lm_head(
+                    target_model_path,
+                    lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
+                )
+                logger.info(f"[Rank 0] Seeded draft lm_head from {target_model_path}")
+
             if initial_draft_model_path:
                 loaded_from = checkpoint.load_initial_draft_weights(
                     draft_model, initial_draft_model_path
@@ -110,13 +122,6 @@ class Eagle3Trainer(Trainer):
                 target_model_path,
                 embedding_key=getattr(self.args, "embedding_key", "model.embed_tokens"),
             )
-
-            if seed_lm_head_from_target:
-                draft_model.load_lm_head(
-                    target_model_path,
-                    lm_head_key=getattr(self.args, "lm_head_key", "lm_head.weight"),
-                )
-                logger.info(f"[Rank 0] Seeded draft lm_head from {target_model_path}")
 
         draft_model.freeze_embedding()
         frozen_parts = ["embedding"]
@@ -480,6 +485,12 @@ class Eagle3Trainer(Trainer):
     ) -> dict | DeferredTrainMetrics:
         if not all_step_metrics:
             return {}
+
+        # Runs once per optimizer step, on every rank.
+        for router in (m for m in self.draft_model.modules() if isinstance(m, Eagle4Router)):
+            imbalance = router.update_bias()
+            if step % 50 == 0:
+                logger.info(f"step {step}: MoE max/mean expert load {imbalance:.2f}")
 
         avg_vlosses = torch.stack([m["vlosses"] for m in all_step_metrics]).mean(dim=0)
         # Weight by acc_counts instead of averaging per-accumulation-step accuracies

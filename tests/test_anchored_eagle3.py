@@ -27,6 +27,7 @@ import torch
 
 from torchspec.models.anchored_eagle3 import AnchoredEagle3Model, anchored_bool_mask
 from torchspec.models.draft.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from torchspec.models.draft.base import _make_causal_mask
 from torchspec.models.draft.deepseek_eagle import Eagle3DeepseekV2ForCausalLM
 from torchspec.models.eagle3 import Eagle3Model, LazyTarget, PrecomputedTarget
 from torchspec.models.ops.anchors import sample_anchor_positions
@@ -50,6 +51,14 @@ _EAGLE3 = {
     "rope_theta": 10000.0,
     "pad_token_id": 0,
     "tie_word_embeddings": False,
+}
+
+# One EAGLE-4 structural switch each, on top of _EAGLE3.
+_EAGLE4_SWITCHES = {
+    "sliding_window": {"architectures": ["LlamaForCausalLMEagle4"], "sliding_window": 8},
+    "attn_norm": {"attn_norm": True},
+    "post_mlp_norm": {"enable_post_mlp_norm": True},
+    "nope": {"use_rope": False},
 }
 
 
@@ -110,6 +119,18 @@ class TestAnchoredMask(unittest.TestCase):
             torch.testing.assert_close(
                 chain[:, block * N : (block + 1) * N], torch.eye(N, dtype=torch.bool)
             )
+
+    def test_window_keeps_the_last_w_context_keys(self):
+        """Query q sees context keys q - W + 1 .. q, and an anchor sees what its position sees."""
+        W = 3
+        dense = _make_causal_mask((1, S), torch.float32, "cpu", window=W)[0, 0] == 0
+        for q in range(S):
+            self.assertEqual(
+                dense[q].nonzero().flatten().tolist(), list(range(max(0, q - W + 1), q + 1))
+            )
+        anchored = anchored_bool_mask(ANCHORS, KEEP, S, N, S + N, W)[0, 0]
+        for slot, position in enumerate(ANCHORS[0].tolist()):
+            torch.testing.assert_close(anchored[slot, :S], dense[position])
 
     def test_keep_mask_blanks_a_padded_anchor(self):
         keep = torch.tensor([[True, False, True, True]])
@@ -235,21 +256,51 @@ class TestMatchesDense(unittest.TestCase):
     anchor (an anchor needs ``loss_mask[a] & loss_mask[a + 1]``).
     """
 
-    def _llama_draft(self):
-        config = AutoDraftModelConfig.from_dict(dict(_EAGLE3))
+    def _llama_draft(self, **overrides):
+        config = AutoDraftModelConfig.from_dict(dict(_EAGLE3, **overrides))
         return AutoEagle3DraftModel.from_config(config, torch_dtype=torch.float32).cuda()
 
     def test_per_depth_losses_match_dense(self):
-        for name in ("llama", "mla"):
+        for name, make_draft in (("llama", self._llama_draft), ("mla", _mla_draft)):
             for loss_type in ("forward_kl", "lk_alpha", "lk_lambda"):
                 with self.subTest(draft=name, loss_type=loss_type):
-                    self._assert_matches_dense(name, loss_type)
+                    self._assert_matches_dense(make_draft, loss_type)
 
-    def _assert_matches_dense(self, draft_kind, loss_type="forward_kl"):
+    def test_eagle4_switches_match_dense(self):
+        for name, overrides in _EAGLE4_SWITCHES.items():
+            with self.subTest(switch=name):
+                self._assert_matches_dense(lambda: self._llama_draft(**overrides))
+
+    def test_sliding_window_is_eagle4_only_and_changes_attention(self):
+        plain = self._assert_matches_dense(self._llama_draft)
+        # An EAGLE3 config's sliding_window is ignored, as in Qwen-derived drafts.
+        ignored = self._assert_matches_dense(lambda: self._llama_draft(sliding_window=8))
+        windowed = self._assert_matches_dense(
+            lambda: self._llama_draft(**_EAGLE4_SWITCHES["sliding_window"])
+        )
+        for depth in range(T):
+            torch.testing.assert_close(ignored[depth], plain[depth], rtol=0, atol=0)
+            self.assertFalse(torch.allclose(windowed[depth], plain[depth]), f"depth {depth}")
+
+    def test_sliding_window_refuses_unmasked_backends(self):
+        config = AutoDraftModelConfig.from_dict(dict(_EAGLE3, **_EAGLE4_SWITCHES["sliding_window"]))
+        for backend in ("flex_attention", "fa4", "fa", "usp"):
+            with (
+                self.subTest(backend=backend),
+                self.assertRaisesRegex(ValueError, "Sliding-window"),
+            ):
+                AutoEagle3DraftModel.from_config(config, attention_backend=backend)
+
+    def test_nope_rotates_by_identity(self):
+        rope = self._llama_draft(use_rope=False).midlayer.self_attn.rotary_emb
+        cos, sin = rope(torch.zeros(1, 1, 8, 16, device="cuda"), seq_len=8)
+        self.assertTrue(bool((cos == 1).all()) and bool((sin == 0).all()))
+
+    def _assert_matches_dense(self, make_draft, loss_type="forward_kl"):
         torch.manual_seed(0)
         seq, hidden, supervised = 64, 64, 40
 
-        draft = self._llama_draft() if draft_kind == "llama" else _mla_draft()
+        draft = make_draft()
 
         # Supervise a prefix so that the anchor set is exactly {0 .. supervised - 2}:
         # num_anchors exceeds the candidate count, so sampling is deterministic.
@@ -285,6 +336,7 @@ class TestMatchesDense(unittest.TestCase):
                 torch.allclose(dense_acc[depth], anch_acc[depth], atol=1e-4),
                 f"depth {depth} accuracy",
             )
+        return dense_losses
 
 
 def _depth_coverage(anchors, keep, loss_mask, seq, ttt):

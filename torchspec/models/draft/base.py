@@ -33,16 +33,44 @@ from safetensors import safe_open
 from transformers.modeling_utils import PreTrainedModel
 
 
+def draft_sliding_window(config) -> Optional[int]:
+    """Context window W of an EAGLE-4 sliding-window draft, or None.
+
+    At every TTT depth a query sees the W context keys ending at its own position, plus its
+    own chain. Enablement follows SGLang's EAGLE-4 loader: ``layer_types`` wins, then
+    ``use_sliding_window``, then a bare ``sliding_window``. Other architectures keep full
+    attention: Qwen-derived EAGLE3 configs carry a ``sliding_window`` they never used.
+    """
+    if "LlamaForCausalLMEagle4" not in (getattr(config, "architectures", None) or ()):
+        return None
+    window = getattr(config, "sliding_window", None)
+    layer_types = getattr(config, "layer_types", None)
+    enabled = getattr(config, "use_sliding_window", None)
+    if layer_types is not None:
+        enabled = "sliding_attention" in layer_types
+    elif enabled is None:
+        enabled = window is not None
+    if enabled and not window:
+        raise ValueError(f"Sliding window is enabled but sliding_window={window!r}")
+    return window if enabled else None
+
+
 def _make_causal_mask(
     input_ids_shape: torch.Size,
     dtype: torch.dtype,
     device: torch.device,
     past_key_values_length: int = 0,
+    window: Optional[int] = None,
 ):
     bsz, tgt_len = input_ids_shape
     mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
     mask_cond = torch.arange(mask.size(-1), device=device)
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    if window is not None:
+        # Keys window or more positions behind the query fall out of the window.
+        mask.masked_fill_(
+            mask_cond <= (mask_cond - window).view(mask.size(-1), 1), torch.finfo(dtype).min
+        )
     mask = mask.to(dtype)
 
     if past_key_values_length > 0:
@@ -146,6 +174,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             eagle_config = getattr(config, "eagle_config", None) or {}
             layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
             self.num_aux_hidden_states = len(layer_ids) if layer_ids else 3
+        self.sliding_window = draft_sliding_window(config)
 
     @abstractmethod
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -185,6 +214,7 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
                 hidden_states.dtype,
                 device=hidden_states.device,
                 past_key_values_length=past_key_values_length,
+                window=self.sliding_window,
             )
 
         if attention_mask is not None:
@@ -198,6 +228,17 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
                 else expanded_attn_mask + combined_attention_mask
             )
         return combined_attention_mask
+
+    def next_depth_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Hidden state the next TTT depth reads; logits always come from norm(hidden_states).
+
+        ``norm_output`` feeds back the normed state, a ``post_mlp_layernorm`` feeds back its
+        own norm of it, otherwise the raw layer output is fed back.
+        """
+        if self.norm_output:
+            return self.norm(hidden_states)
+        post_norm = getattr(self.midlayer, "post_mlp_layernorm", None)
+        return hidden_states if post_norm is None else post_norm(hidden_states)
 
     @abstractmethod
     def backbone(

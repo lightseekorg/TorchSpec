@@ -32,7 +32,8 @@ from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from torchspec.config.utils import resolve_rope_theta
-from torchspec.models.draft.base import Eagle3DraftModel, build_lm_head
+from torchspec.models.draft.base import Eagle3DraftModel, build_lm_head, draft_sliding_window
+from torchspec.models.draft.eagle4_moe import Eagle4MoE
 from torchspec.models.ops.flex_attention import (
     compile_friendly_flex_attention,
     eagle3_block_mask,
@@ -417,6 +418,15 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         )
 
 
+class NoRotaryEmbedding(LlamaRotaryEmbedding):
+    """NoPE as an identity rotation (cos=1, sin=0), so every attention backend runs unchanged."""
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        super()._set_cos_sin_cache(seq_len, device, dtype)
+        self.cos_cached.fill_(1)
+        self.sin_cached.zero_()
+
+
 class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
     """LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
@@ -625,6 +635,13 @@ def build_rotary_embedding(config, dim: int, max_position_embeddings: int):
     YaRN branch, so drafts trained at 10000 while their config declared otherwise.
     Adding a scaling type or an argument in one place now reaches every draft.
     """
+    if (
+        getattr(config, "use_rope", True) is False
+        or getattr(config, "position_embedding_type", None) == "none"
+        or getattr(config, "partial_rotary_factor", None) == 0
+    ):
+        return NoRotaryEmbedding(dim, max_position_embeddings=max_position_embeddings)
+
     rope_scaling = config.rope_scaling
     rope_theta = resolve_rope_theta(config)
     rget = partial(rope_config_get, rope_scaling)
@@ -1222,13 +1239,11 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
-        self.q_proj = nn.Linear(self.hidden_size * 2, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
-        )
+        # attn_norm layers project norm(emb) | norm(hidden) back to hidden_size before attention.
+        in_size = self.hidden_size * (1 if getattr(config, "attn_norm", False) else 2)
+        self.q_proj = nn.Linear(in_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(in_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(in_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self._init_rope()
 
@@ -2374,10 +2389,28 @@ class LlamaRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
+def fuse_layer_input(layer, input_emb: torch.Tensor, hidden_states: torch.Tensor):
+    """(attention input, residual) of a draft layer.
+
+    The input is norm(embedding) | norm(hidden). An ``attn_norm`` layer projects it back to
+    hidden_size through ``eh_proj``, whose output is then also the residual.
+    """
+    fused = torch.cat((layer.input_layernorm(input_emb), layer.hidden_norm(hidden_states)), dim=-1)
+    if not hasattr(layer, "eh_proj"):
+        return fused, hidden_states
+    residual = layer.eh_proj(fused)
+    return layer.pre_attention_layernorm(residual), residual
+
+
 class LlamaDecoderLayer(nn.Module):
     def __init__(self, config, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
+        if draft_sliding_window(config) is not None and attention_backend != "sdpa":
+            raise ValueError(
+                "Sliding-window drafts are only masked on attention_backend='sdpa' "
+                f"(dense or anchored), got {attention_backend!r}"
+            )
 
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
@@ -2394,10 +2427,17 @@ class LlamaDecoderLayer(nn.Module):
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
         self.attention_backend = attention_backend
-        self.mlp = LlamaMLP(config)
+        self.mlp = Eagle4MoE(config) if getattr(config, "enable_moe", False) else LlamaMLP(config)
         self.hidden_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    
+        if getattr(config, "attn_norm", False):
+            self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
+            self.pre_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    
+        if getattr(config, "enable_post_mlp_norm", False):
+            self.post_mlp_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -2409,12 +2449,7 @@ class LlamaDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        residual = hidden_states
-
-        hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
-
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        hidden_states, residual = fuse_layer_input(self, input_emb, hidden_states)
         # Self Attention
         hidden_states, cache_keys, cache_values = self.self_attn(
             hidden_states=hidden_states,
@@ -2471,6 +2506,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             config, config.hidden_size, self.vocab_size, self.target_vocab_size
         )
 
+        if getattr(config, "efficient_lm_head_config", None) and self.vocab_size != (
+            self.target_vocab_size
+        ):
+            raise ValueError(
+                "efficient_lm_head_config rescores candidates with the full-vocab lm_head; "
+                "train without draft vocab pruning"
+            )
         if self.vocab_size != self.target_vocab_size:
             self.register_buffer("t2d", torch.ones(self.target_vocab_size, dtype=torch.bool))
             self.register_buffer("d2t", torch.zeros(self.vocab_size, dtype=torch.int64))

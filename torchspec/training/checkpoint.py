@@ -33,6 +33,7 @@ from safetensors import safe_open
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 
+from torchspec.models.draft.eagle4_moe import stack_latent_experts
 from torchspec.models.draft.keymap import to_internal_keys
 from torchspec.utils.logging import logger
 
@@ -155,6 +156,52 @@ def resolve_initial_draft_checkpoint(path: str) -> Path:
     return checkpoint_path
 
 
+@torch.no_grad()
+def _upgrade_to_eagle4(tensors: dict, expected: dict) -> dict:
+    """Initialize the EAGLE-4 parts a published EAGLE3 or EAGLE-4 draft does not carry."""
+    # Latent MoE experts are served one key per expert; keys the model does not own keep their
+    # serving names through the first to_internal_keys.
+    tensors = to_internal_keys(stack_latent_experts(tensors), expected)
+
+    # Pruned head: draft row i predicts target token i + d2t[i]; other rows keep the head the
+    # trainer seeded from the target.
+    if "d2t" in tensors and "d2t" not in expected:
+        d2t = tensors.pop("d2t")
+        tensors.pop("t2d", None)
+        head = expected["lm_head.weight"].clone()
+        head[torch.arange(len(d2t)) + d2t] = tensors["lm_head.weight"].to(head.dtype)
+        tensors["lm_head.weight"] = head
+
+    # Post-MLP norm starts as the final norm, as SGLang's EAGLE-4 loader does.
+    if "midlayer.post_mlp_layernorm.weight" in expected:
+        tensors.setdefault("midlayer.post_mlp_layernorm.weight", tensors["norm.weight"])
+
+    # attn_norm: SVD-factor the stacked EAGLE3 q/k/v into eh_proj (2H -> H) and H-wide q/k/v.
+    eh_proj = "midlayer.eh_proj.weight"
+    if eh_proj in expected and eh_proj not in tensors:
+        qkv = [f"midlayer.self_attn.{p}_proj.weight" for p in "qkv"]
+        sizes = [tensors[k].shape[0] for k in qkv]
+        u, s, vh = torch.linalg.svd(torch.cat([tensors[k] for k in qkv]).float(), False)
+        rank = expected[eh_proj].shape[0]
+        tensors[eh_proj] = vh[:rank]
+        tensors.update(zip(qkv, (u[:, :rank] * s[:rank]).split(sizes)))
+        tensors["midlayer.pre_attention_layernorm.weight"] = torch.ones(rank)
+
+    # MoE: routed experts keep their no-op init (zero down projections) and a shared expert as
+    # wide as the dense MLP takes it over. A latent MoE cannot reuse it and starts fresh.
+    dense = [f"layers.0.mlp.{p}_proj.weight" for p in ("gate", "up", "down")]
+    if "midlayer.mlp.gate.weight" in expected and dense[0] in tensors:
+        mlp = {
+            k.replace("layers.0.mlp.", "midlayer.mlp.shared_experts."): tensors.pop(k)
+            for k in dense
+        }
+        tensors.update({k: v for k, v in expected.items() if k.startswith("midlayer.mlp.")})
+        if all(k in expected and expected[k].shape == v.shape for k, v in mlp.items()):
+            tensors.update(mlp)
+
+    return tensors
+
+
 def _load_initial_weights(
     draft_model: torch.nn.Module,
     path: str,
@@ -162,12 +209,15 @@ def _load_initial_weights(
     upgrade_keys: set[str],
     allow_missing_embedding: bool,
     error_type: type[Exception] = RuntimeError,
+    upgrade=None,
 ) -> Path:
     """Load shared weights strictly; new modules must be wholly absent or complete."""
     checkpoint_path = resolve_initial_draft_checkpoint(path)
     expected = draft_model.state_dict()
     with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
         tensors = to_internal_keys({key: f.get_tensor(key) for key in f.keys()}, expected)
+    if upgrade is not None:
+        tensors = upgrade(tensors, expected)
 
     present_upgrade = upgrade_keys.intersection(tensors)
     if present_upgrade and present_upgrade != upgrade_keys:
@@ -245,8 +295,13 @@ def load_initial_draft_weights(draft_model: torch.nn.Module, path: str) -> Path:
 
     is_eagle = isinstance(draft_model, Eagle3DraftModel)
     extra = {key for key in draft_model.state_dict() if is_eagle and key.startswith("fc_norm.")}
+    is_eagle4 = "LlamaForCausalLMEagle4" in (draft_model.config.architectures or ())
     return _load_initial_weights(
-        draft_model, path, upgrade_keys=extra, allow_missing_embedding=is_eagle
+        draft_model,
+        path,
+        upgrade_keys=extra,
+        allow_missing_embedding=is_eagle,
+        upgrade=_upgrade_to_eagle4 if is_eagle4 else None,
     )
 
 

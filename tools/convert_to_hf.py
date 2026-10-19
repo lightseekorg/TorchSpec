@@ -51,6 +51,7 @@ import time
 from collections import Counter
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.distributed.checkpoint as dist_cp
 from safetensors.torch import save_file
@@ -59,6 +60,7 @@ from typing_extensions import override
 
 from torchspec.models.draft import AutoDraftModelConfig, AutoEagle3DraftModel
 from torchspec.models.draft.dflash2 import dflash2_config_for_serving
+from torchspec.models.draft.eagle4_moe import split_latent_experts
 from torchspec.models.draft.keymap import DRAFT_WEIGHT_KEY_REMAP
 
 logging.basicConfig(
@@ -140,7 +142,7 @@ def _remap_weight_keys(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tens
                 new_key = new_prefix + k[len(old_prefix) :]
                 break
         remapped[new_key] = v
-    return remapped
+    return split_latent_experts(remapped)
 
 
 _MODEL_TYPE_REMAP = {
@@ -559,6 +561,23 @@ def _convert_fsdp_to_hf(
     vocab_size = raw_config["vocab_size"]
     config_draft_vocab_size = raw_config.get("draft_vocab_size") or vocab_size
 
+    if (raw_config.get("efficient_lm_head_config") or {}).get("type") == "weighted_low_rank":
+        # SGLang's EAGLE-4 loader weights the efficient lm_head SVD by per-token counts it
+        # reads from token_frequency.npy beside the weights.
+
+        if not (dataset_path and tokenizer and chat_template):
+            raise ValueError(
+                "weighted_low_rank needs --dataset-path, --tokenizer and --chat-template"
+            )
+        prompts = _load_tokenized_prompts(
+            dataset_path, tokenizer, chat_template, prompt_key, max_seq_length, cache_dir
+        )
+        counts = np.zeros(vocab_size, dtype=np.int64)
+        for token, count in _count_token_frequencies(prompts).items():
+            if token < vocab_size:
+                counts[token] = count
+        np.save(os.path.join(output_dir, "token_frequency.npy"), counts)
+
     if not prune_vocab:
         if config_draft_vocab_size != vocab_size:
             raise ValueError(
@@ -570,6 +589,11 @@ def _convert_fsdp_to_hf(
             hf_model, output_dir, raw_config, vocab_size, export_for_vllm=export_for_vllm
         )
         return
+
+    if raw_config.get("efficient_lm_head_config"):
+        raise ValueError(
+            "efficient_lm_head_config needs the full-vocab lm_head; drop --prune-vocab"
+        )
 
     # ── Vocab pruning ────────────────────────────────────────────────────
     assert dataset_path is not None and draft_vocab_size is not None

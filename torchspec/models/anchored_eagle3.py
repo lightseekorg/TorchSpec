@@ -34,6 +34,7 @@ from torchspec.models.draft.deepseek_eagle import _apply_rotary_pos_emb_interlea
 from torchspec.models.draft.llama3_eagle import (
     LlamaMutiRotaryEmbedding,
     apply_rotary_pos_emb,
+    fuse_layer_input,
 )
 from torchspec.models.eagle3 import Eagle3Model, LazyTarget, PrecomputedTarget
 from torchspec.models.ops.anchors import sample_anchor_positions
@@ -67,6 +68,7 @@ def anchored_bool_mask(
     ctx_len: int,
     num_anchors: int,
     kv_len: int,
+    window: Optional[int] = None,
 ) -> torch.Tensor:
     """The predicate as a [B, 1, N, KV] boolean mask for scaled_dot_product_attention.
 
@@ -77,6 +79,8 @@ def anchored_bool_mask(
     kv = torch.arange(kv_len, device=anchor_positions.device)
     slot = torch.arange(num_anchors, device=anchor_positions.device).unsqueeze(-1)
     context = (kv < ctx_len) & (kv <= anchor_positions.unsqueeze(-1))
+    if window is not None:
+        context &= kv > anchor_positions.unsqueeze(-1) - window
     chain = (kv >= ctx_len) & (((kv - ctx_len) % num_anchors) == slot)
     return ((context | chain) & keep_mask.unsqueeze(-1)).unsqueeze(1)
 
@@ -184,10 +188,6 @@ class AnchoredEagle3Model(Eagle3Model):
         q, key = apply_rotary_pos_emb(q, key, rope[0], rope[1], positions)
         return q, key, value
 
-    def _fuse(self, layer, input_emb: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
-        """The decoder layer's attention input: norm(embedding) concat norm(hidden)."""
-        return torch.cat((layer.input_layernorm(input_emb), layer.hidden_norm(hidden)), dim=-1)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -229,7 +229,7 @@ class AnchoredEagle3Model(Eagle3Model):
         # Context K/V. One layer means these are pointwise in the layer input, so the whole
         # sequence is a couple of linears -- no attention, no MLP, no cross-position term.
         context_positions = torch.arange(seq_len, device=device).expand(bsz, -1)
-        context = self._fuse(layer, embeddings, projected)
+        context, _ = fuse_layer_input(layer, embeddings, projected)
         _, key_cache, value_cache = self._qkv(attn, context, context_positions, rope, query=False)
 
         current = _gather(projected, anchors)
@@ -237,7 +237,7 @@ class AnchoredEagle3Model(Eagle3Model):
         plosses, vlosses, acces, acc_counts, alphas = [], [], [], [], []
         for depth in range(self.length):
             positions = (anchors + depth).clamp(max=seq_len - 1)
-            fused = self._fuse(layer, _gather(embeddings, positions), current)
+            fused, residual = fuse_layer_input(layer, _gather(embeddings, positions), current)
 
             query, key, value = self._qkv(attn, fused, positions, rope)
 
@@ -252,14 +252,19 @@ class AnchoredEagle3Model(Eagle3Model):
                 key_cache,
                 value_cache,
                 attn_mask=anchored_bool_mask(
-                    anchors, keep_mask, seq_len, num_anchors, key_cache.shape[2]
+                    anchors,
+                    keep_mask,
+                    seq_len,
+                    num_anchors,
+                    key_cache.shape[2],
+                    draft.sliding_window,
                 ),
                 enable_gqa=not self.is_mla,
                 scale=attn.softmax_scale if self.is_mla else None,
             )
             attn_out = attn_out.transpose(1, 2).reshape(bsz, num_anchors, -1)
 
-            hidden = current + attn.o_proj(attn_out)
+            hidden = residual + attn.o_proj(attn_out)
             hidden = hidden + layer.mlp(layer.post_attention_layernorm(hidden))
 
             step_mask = _gather(effective_mask, positions) * keep_mask
@@ -282,6 +287,6 @@ class AnchoredEagle3Model(Eagle3Model):
             acc_counts.append(count.detach().float())
             alphas.append((alpha_sum / denominator).detach())
 
-            current = draft.norm(hidden) if draft.norm_output else hidden
+            current = draft.next_depth_hidden(hidden)
 
         return plosses, vlosses, acces, acc_counts, alphas

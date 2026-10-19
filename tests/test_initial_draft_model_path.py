@@ -168,6 +168,61 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
 
         self._assert_matches(fresh, published)
 
+    def test_eagle3_rejects_a_pruned_checkpoint_for_a_full_vocab_draft(self):
+        published = _build(_EAGLE3, seed=0)
+        published.set_vocab_buffers(*TestVocabMappingGuard._mapping(list(range(0, 128, 2))))
+        directory = _publish(published, self.tmpdir / "eagle3")
+        fresh = _build({**_EAGLE3, "draft_vocab_size": 128}, seed=1)
+        with self.assertRaisesRegex(RuntimeError, "unexpected=\\['d2t', 't2d'\\]"):
+            load_initial_draft_weights(fresh, str(directory))
+
+    def test_upgrades_a_pruned_eagle3_draft_to_eagle4(self):
+        # q/k/v together are no wider than hidden_size, so the eh_proj factoring is exact.
+        small = {**_EAGLE3, "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 16}
+        published = _build(small, seed=0)
+        published.set_vocab_buffers(*TestVocabMappingGuard._mapping(list(range(0, 128, 2))))
+        directory = _publish(published, self.tmpdir / "eagle3")
+
+        eagle4 = {
+            **small,
+            "architectures": ["LlamaForCausalLMEagle4"],
+            "draft_vocab_size": 128,
+            "attn_norm": True,
+            "enable_post_mlp_norm": True,
+        }
+        fresh = _build(eagle4, seed=1)
+        head = fresh.lm_head.weight.detach().clone()
+        load_initial_draft_weights(fresh, str(directory))
+
+        old, new = published.state_dict(), fresh.state_dict()
+        head[0::2] = old["lm_head.weight"]
+        self.assertTrue(torch.equal(new["lm_head.weight"], head))
+        self.assertTrue(torch.equal(new["midlayer.post_mlp_layernorm.weight"], old["norm.weight"]))
+        qkv = [f"midlayer.self_attn.{p}_proj.weight" for p in "qkv"]
+        torch.testing.assert_close(
+            torch.cat([new[k] for k in qkv]) @ new["midlayer.eh_proj.weight"],
+            torch.cat([old[k] for k in qkv]),
+        )
+
+    def test_upcycles_a_dense_eagle3_draft_to_an_eagle4_moe(self):
+        dense = {**_EAGLE3, "draft_vocab_size": 128}
+        published = _build(dense, seed=0)
+        directory = _publish(published, self.tmpdir / "eagle3")
+        moe = {
+            **dense,
+            "architectures": ["LlamaForCausalLMEagle4"],
+            "enable_moe": True,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "n_shared_experts": 2,
+        }
+        fresh = _build(moe, seed=1)
+        load_initial_draft_weights(fresh, str(directory))
+
+        x = torch.randn(2, 3, 64)
+        torch.testing.assert_close(fresh.midlayer.mlp(x), published.midlayer.mlp(x))
+
     def test_rejects_a_checkpoint_for_a_different_draft(self):
         published = _build(_DFLASH, seed=0)
         directory = _publish(published, self.tmpdir / "wrong")

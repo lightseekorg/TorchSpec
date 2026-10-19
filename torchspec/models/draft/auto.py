@@ -39,9 +39,19 @@ from torchspec.models.draft.llama3_eagle import LlamaForCausalLMEagle3
 from torchspec.utils.logging import logger
 
 
+class EagleLlamaConfig(LlamaConfig):
+    """LlamaConfig whose drafts may size attention by an explicit head_dim."""
+
+    def validate_architecture(self):
+        # Skip only LlamaConfig's hidden_size % num_attention_heads check, which explicit
+        # head_dim drafts break (Qwen3.8: 24 heads x 256 over hidden_size 5120).
+        PretrainedConfig.validate_architecture(self)
+
+
 class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     _model_mapping = {
         LlamaConfig: LlamaForCausalLMEagle3,
+        EagleLlamaConfig: LlamaForCausalLMEagle3,
         DeepseekV3Config: Eagle3DeepseekV2ForCausalLM,
         DFlashConfig: DFlashDraftModel,
         DFlash2Config: DFlash2DraftModel,
@@ -84,7 +94,8 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
 
 class AutoDraftModelConfig:
     _config_mapping = {
-        "LlamaForCausalLMEagle3": LlamaConfig,
+        "LlamaForCausalLMEagle3": EagleLlamaConfig,
+        "LlamaForCausalLMEagle4": EagleLlamaConfig,
         "Eagle3DeepseekV2ForCausalLM": DeepseekV3Config,
         "DFlashDraftModel": DFlashConfig,
         "DFlash2DraftModel": DFlash2Config,
