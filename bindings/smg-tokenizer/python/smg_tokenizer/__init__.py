@@ -5,7 +5,7 @@ import json
 from smg_tokenizer._native import TOKENIZERS_V1
 from smg_tokenizer._native import Tokenizer as _Tokenizer
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 build_features = "tokenizers-v1" if TOKENIZERS_V1 else "default"
 
 
@@ -17,6 +17,9 @@ class Tokenizer:
 
     def encode(self, text, *, add_special_tokens=False):
         return self._inner.encode(text, add_special_tokens)
+
+    def token_to_id(self, token):
+        return self._inner.token_to_id(token)
 
     @property
     def encode_path(self):

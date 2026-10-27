@@ -36,6 +36,7 @@ from torchspec.data.parse import (
 from torchspec.data.preprocessing import _normalize_conversation, preprocess_conversations
 from torchspec.data.renderers import RENDERER_REGISTRY
 from torchspec.data.renderers.smg import SmgRenderer, effective_renderer, prepare_checkpoint
+from torchspec.data.renderers.smg_k3 import SmgK3Renderer
 from torchspec.data.template import TEMPLATE_REGISTRY
 from torchspec.data.utils import (
     deserialize_packed_loss_mask,
@@ -189,12 +190,14 @@ def _init_tokenize_worker(
     _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
     tokenizer = (
         None
-        if renderer_name == "smg"
+        if renderer_name in ("smg", "smg-kimi-k3")
         else load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
     )
     _worker_state["tokenizer"] = tokenizer
     _worker_state["renderer"] = (
-        SmgRenderer(tokenizer_path, chat_template_name, **(smg_options or {}))
+        SmgK3Renderer(tokenizer_path)
+        if renderer_name == "smg-kimi-k3"
+        else SmgRenderer(tokenizer_path, chat_template_name, **(smg_options or {}))
         if renderer_name == "smg"
         else RENDERER_REGISTRY.create(renderer_name, tokenizer)
         if renderer_name
@@ -374,7 +377,7 @@ def load_conversation_dataset(args):
         raise ValueError("Registered dataset renderers require defer_tokenization=False")
     if (
         renderer_name
-        and renderer_name != "smg"
+        and renderer_name not in ("smg", "smg-kimi-k3")
         and renderer_name not in RENDERER_REGISTRY.get_all_renderer_names()
     ):
         available = ", ".join(RENDERER_REGISTRY.get_all_renderer_names()) or "<none>"
@@ -404,8 +407,8 @@ def load_conversation_dataset(args):
     smg_options = None
     smg_fingerprint = ""
     tokenizer_path = args.target_model_path
-    if renderer_name == "smg":
-        if not chat_template_name:
+    if renderer_name in ("smg", "smg-kimi-k3"):
+        if renderer_name == "smg" and not chat_template_name:
             raise ValueError("SMG needs dataset.chat_template for assistant supervision boundaries")
         tokenizer_path, smg_fingerprint = prepare_checkpoint(
             tokenizer_path, getattr(args, "smg_revision", None)
@@ -415,6 +418,12 @@ def load_conversation_dataset(args):
         template_kwargs = getattr(args, "smg_template_kwargs", {}) or {}
         if OmegaConf.is_config(template_kwargs):
             template_kwargs = OmegaConf.to_container(template_kwargs, resolve=True)
+        if renderer_name == "smg-kimi-k3" and (
+            template_kwargs or getattr(args, "smg_render_instant", None) is not None
+        ):
+            raise ValueError(
+                "SMG K3 preserves legacy per-row generation_config; template overrides are unsupported"
+            )
         smg_options = {
             "template_kwargs": dict(template_kwargs),
             "include_end_token": getattr(args, "smg_include_end_token", True),
@@ -432,7 +441,9 @@ def load_conversation_dataset(args):
     train_with_decode = getattr(args, "train_with_decode", False)
     min_loss_tokens_val = getattr(args, "min_loss_tokens", 0)
     renderer_version = (
-        SmgRenderer.CACHE_VERSION
+        SmgK3Renderer.CACHE_VERSION
+        if renderer_name == "smg-kimi-k3"
+        else SmgRenderer.CACHE_VERSION
         if renderer_name == "smg"
         else RENDERER_REGISTRY.cache_version(renderer_name)
         if renderer_name
@@ -445,13 +456,14 @@ def load_conversation_dataset(args):
         f"-defer={defer_tokenization}-decode={train_with_decode}"
         f"-mlt={min_loss_tokens_val}"
     )
-    if renderer_name == "smg":
+    if renderer_name in ("smg", "smg-kimi-k3"):
         import json
 
         cache_params += f"-smg={smg_fingerprint}-{json.dumps(smg_options, sort_keys=True)}"
-        cache_params += (
-            f"-supervision={TEMPLATE_REGISTRY.get(chat_template_name).model_dump_json()}"
-        )
+        if renderer_name == "smg":
+            cache_params += (
+                f"-supervision={TEMPLATE_REGISTRY.get(chat_template_name).model_dump_json()}"
+            )
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
     cache_path = os.path.join(cache_dir, f"{cache_key}.pt")
@@ -511,7 +523,9 @@ def load_conversation_dataset(args):
         # Forking inherits native tokenizer thread-pool/lock state without its
         # threads and can deadlock Linux workers. Start clean interpreters for
         # SMG; keep the existing multiprocessing policy for other renderers.
-        pool_factory = mp.get_context("spawn").Pool if renderer_name == "smg" else mp.Pool
+        pool_factory = (
+            mp.get_context("spawn").Pool if renderer_name in ("smg", "smg-kimi-k3") else mp.Pool
+        )
         pool_ctx = pool_factory(num_proc, initializer=worker_init, initargs=worker_initargs)
 
     with pool_ctx as pool:
@@ -529,7 +543,7 @@ def load_conversation_dataset(args):
 
             messages = _normalize_conversation(raw_prompt)
             multimodal_inputs = extract_media_urls(messages)
-            if renderer_name == "smg" and multimodal_inputs is not None:
+            if renderer_name in ("smg", "smg-kimi-k3") and multimodal_inputs is not None:
                 raise ValueError("SMG training currently supports text-only samples")
             if custom_template is not None:
                 flatten_multimodal_content(messages, custom_template.image_placeholder)

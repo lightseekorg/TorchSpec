@@ -22,7 +22,9 @@ def effective_renderer(args):
     if backend != "smg":
         return renderer
     model_path = str(getattr(args, "target_model_path", ""))
-    is_k3 = renderer == "kimi-k3" or "kimi-k3" in model_path.lower().replace("_", "-")
+    is_k3 = renderer in ("kimi-k3", "smg-kimi-k3") or "kimi-k3" in model_path.lower().replace(
+        "_", "-"
+    )
     config = Path(model_path) / "config.json"
     if config.is_file():
         model_type = json.loads(config.read_text()).get("model_type", "")
@@ -30,7 +32,9 @@ def effective_renderer(args):
     if is_k3:
         if getattr(args, "smg_exclude_k3", True):
             return "kimi-k3"
-        raise ValueError("K3 SMG training is not qualified; set dataset.smg_exclude_k3=true")
+        if getattr(args, "defer_tokenization", False) or getattr(args, "train_with_decode", False):
+            raise ValueError("SMG K3 requires defer_tokenization=false and train_with_decode=false")
+        return "smg-kimi-k3"
     if renderer not in (None, "smg"):
         raise ValueError(f"SMG cannot override explicit dataset.renderer={renderer!r}")
     if getattr(args, "defer_tokenization", False) or getattr(args, "train_with_decode", False):

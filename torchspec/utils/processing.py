@@ -44,7 +44,7 @@ def get_assistant_token_ids(
     from torchspec.data.template import TEMPLATE_REGISTRY
 
     renderer_name = effective_renderer(args)
-    if renderer_name == "smg":
+    if renderer_name in ("smg", "smg-kimi-k3"):
         # No dynamic re-masking: SMG's supported text path supplies the mask
         # against the exact IDs sent to the target model.
         return None, None, 0

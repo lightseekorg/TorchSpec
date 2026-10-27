@@ -35,6 +35,10 @@ impl Tokenizer {
             .map_err(value_error)
     }
 
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
     #[getter]
     fn encode_path(&self) -> String {
         self.inner

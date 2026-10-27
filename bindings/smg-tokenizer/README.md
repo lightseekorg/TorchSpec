@@ -21,6 +21,6 @@ Run binding tests after installing the wheel:
 python -m pytest -q bindings/smg-tokenizer/tests
 ```
 
-The binding was moved from the prototype companion SMG change without changing
-its Rust implementation. Version 0.1.1 distinguishes this owned, pinned build
-from that prototype for dataset cache invalidation.
+The binding is versioned independently for dataset cache invalidation. Version
+0.1.2 exposes special-token lookup for TorchSpec's K3 token-ID mask policy.
+Rendering and encoding continue to use the pinned upstream Rust implementation.

@@ -329,7 +329,18 @@ def evaluate(trainer, backend, data, cache, collator, batch_size, step):
     }
 
 
-def run_backend(args, backend, config, data, cache, schedule, expected_initial_digest=None):
+def run_backend(
+    args,
+    backend,
+    config,
+    data,
+    cache,
+    schedule,
+    expected_initial_digest=None,
+    *,
+    trainer_options=None,
+    target_reference=None,
+):
     from torchspec.training.eagle3_trainer import Eagle3Trainer
 
     folder = args.output / backend
@@ -337,7 +348,7 @@ def run_backend(args, backend, config, data, cache, schedule, expected_initial_d
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
-    trainer = Eagle3Trainer(trainer_args(args, backend))
+    trainer = Eagle3Trainer(trainer_options or trainer_args(args, backend))
     try:
         trainer.init_model(config, str(args.assets / "model"))
         initial_digest = trainable_digest(trainer.draft_model)
@@ -387,7 +398,8 @@ def run_backend(args, backend, config, data, cache, schedule, expected_initial_d
             {
                 "step": args.steps,
                 "draft_config": config.to_dict(),
-                "target_revision": load_manifest()["profiles"]["qwen3"]["revision"],
+                "target_revision": target_reference
+                or load_manifest()["profiles"]["qwen3"]["revision"],
                 "frozen_keys_from_target": ["embed_tokens.weight", "lm_head.weight"],
                 "trainable_state_dict": {
                     name: p.detach().cpu()

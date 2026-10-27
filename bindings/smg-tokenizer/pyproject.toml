@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "smg-tokenizer"
-version = "0.1.1"
+version = "0.1.2"
 requires-python = ">=3.11"
 description = "Standalone Python bindings for SMG rendering and tokenization"
 license = "Apache-2.0"

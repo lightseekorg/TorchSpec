@@ -66,11 +66,78 @@ Clock-dependent templates require `smg_render_instant` so dataset workers and
 cache rebuilds render the same timestamp; that value is also in the cache key.
 
 When the selected renderer is `kimi-k3`, the model path names Kimi-K3, or a local
-config declares `model_type: kimi_k3`, `smg_exclude_k3: true` uses the existing
-K3 renderer without importing SMG. Keep `renderer: kimi-k3` explicit for an
-aliased or Hub checkpoint whose name hides its model family. Setting the flag
-false currently raises an error: K3 is not yet qualified for this training API.
-Other explicit custom renderers are not silently replaced.
+config declares `model_type: kimi_k3`, `smg_exclude_k3: true` keeps the existing
+checkpoint-Python renderer without importing SMG. Set `smg_exclude_k3: false`
+to opt into the SMG K3 text path. Keep `renderer: kimi-k3` explicit for an aliased
+or Hub checkpoint whose name hides its family. Other custom renderers are not
+silently replaced.
+
+### K3 training policy
+
+```yaml
+dataset:
+  rendering_backend: smg
+  renderer: kimi-k3
+  smg_exclude_k3: false
+  defer_tokenization: false
+training:
+  train_with_decode: false
+```
+
+`SmgK3Renderer` uses SMG's native segmented encoding and inherits the existing
+`K3Renderer` training policy: assistant bodies and their internal XTML structure
+are supervised, outer headers and `<|end_of_msg|>` are excluded, last-turn
+selection precedes truncation. It does not use the generic text-offset adapter
+or `smg_include_end_token`; K3's established EOM policy is preserved.
+
+Generation settings retain the existing per-row `generation_config` contract:
+no config means thinking enabled with **explicit null effort**; explicit enabled
+configs require `low`, `high` or `max`, and disabled thinking rejects nonempty
+reasoning. Dataset template kwargs and render-instant overrides are rejected.
+
+The pinned SMG serving entry point conflates null effort with omitted effort,
+adding a `max` directive. The TorchSpec adapter removes only that auto-generated
+prefix after tool declarations. Both prefix pieces are rendered and encoded by
+SMG; exact text and token-prefix checks must pass before removal. It never
+flattens and re-encodes K3 text or searches arbitrary payloads for a directive.
+Literal control spellings remain ordinary text, as in the checkpoint tokenizer.
+
+K3 remains opt-in and text-only. Its qualification uses locally supplied real
+checkpoint assets with pinned hashes, not the existing unit-test tokenizer stub:
+
+```bash
+PYTHONPATH=. python tools/qualification/k3_tokenizer_contract.py \
+  --checkpoint /path/to/Kimi-K3 --report k3-contract.json
+PYTHONPATH=. python tools/qualification/prepare_k3_convergence_data.py \
+  --model /path/to/Kimi-K3 --source /path/to/training.jsonl --output /path/to/run/data
+```
+
+The corpus selector takes 256 training and 64 held-out conversations with disjoint
+user prompts from an ordered source, preserves per-row configuration, requires
+at least 32 supervised tokens after truncation to 512, and checks exact legacy/SMG
+IDs and masks before selection. It records source line and row hashes.
+
+For convergence, extract real K3 hidden states for those exact IDs at layer
+boundaries 2, 46, 90 and 93 (the last is pre-norm). `extraction/manifest.json`
+contains one entry per selected row, in order: `id`, `split`, and `layers`, each
+with `layer_id`, `path` and the safetensors file's `sha256`. Each file contains
+`input_ids` and finite `[sequence_length, 7168]` `hidden_states`. Extraction must
+not split an individual 512-token prompt across prefill chunks.
+
+```bash
+PYTHONPATH=. python tools/qualification/train_k3_tokenizer_convergence.py \
+  --assets /path/to/run/assets --extraction /path/to/run/extraction \
+  --output /path/to/run/comparison
+```
+
+`assets/model` points to the pinned full K3 checkpoint. The comparison reruns
+both actual dataset loaders, verifies every cached layer's IDs and hash, and
+runs 1,000 optimizer steps per arm using the same initial one-layer Eagle3 draft
+and schedule. Target embedding/head/norm weights come from K3. This isolates
+preprocessing using one-rank training and cached real targets; it does not
+reproduce a prior multi-node training job or qualify media/queue/RDMA paths.
+The loss, accuracy and trajectory acceptance thresholds match the Qwen gate;
+`--smoke` never qualifies convergence.
 
 ## Supervision and compatibility
 
@@ -98,8 +165,8 @@ Existing pretokenized datasets bypass rendering and do not require the binding.
 
 Flat tiktoken encodings without offsets are accepted only when the encoded
 prefixes at supervision boundaries exactly match the full sequence. Native
-segment-wise encodings are rejected by the training adapter until they expose
-training annotations. Their IDs are preserved by the binding and never silently
+segment-wise encodings are rejected by the generic adapter until they expose
+training annotations; the dedicated K3 path uses its structural token IDs. Their IDs are preserved by the binding and never silently
 replaced with flat-text encoding.
 
 Unsupported in this first version: multimodal content/engine-side media expansion,

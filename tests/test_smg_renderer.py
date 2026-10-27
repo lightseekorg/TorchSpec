@@ -178,8 +178,7 @@ def test_k3_flag_keeps_existing_renderer_without_smg_import(tmp_path):
     args = SimpleNamespace(rendering_backend="smg", renderer="kimi-k3", smg_exclude_k3=True)
     assert effective_renderer(args) == "kimi-k3"
     args.smg_exclude_k3 = False
-    with pytest.raises(ValueError, match="not qualified"):
-        effective_renderer(args)
+    assert effective_renderer(args) == "smg-kimi-k3"
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "kimi_k3"}))
     args.renderer = None
     args.smg_exclude_k3 = True
@@ -208,6 +207,10 @@ def test_resolved_config_selects_smg_and_keeps_k3():
     config.dataset.renderer = "kimi-k3"
     args = config_to_flat_args(config)
     assert args.renderer == "kimi-k3" and args.dynamic_loss_mask is True
+    config.dataset.smg_exclude_k3 = False
+    args = config_to_flat_args(config)
+    assert args.renderer == "smg-kimi-k3" and args.dynamic_loss_mask is False
+    assert effective_renderer(args) == "smg-kimi-k3"
 
 
 def test_clock_dependent_template_requires_pinned_instant(checkpoint):
