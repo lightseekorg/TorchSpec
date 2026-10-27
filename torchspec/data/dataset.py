@@ -20,12 +20,14 @@
 
 import contextlib
 import hashlib
+import json
 import logging as _logging
 import multiprocessing as mp
 import os
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from torchspec.data.parse import (
@@ -194,15 +196,15 @@ def _init_tokenize_worker(
         else load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
     )
     _worker_state["tokenizer"] = tokenizer
-    _worker_state["renderer"] = (
-        SmgK3Renderer(tokenizer_path)
-        if renderer_name == "smg-kimi-k3"
-        else SmgRenderer(tokenizer_path, chat_template_name, **(smg_options or {}))
-        if renderer_name == "smg"
-        else RENDERER_REGISTRY.create(renderer_name, tokenizer)
-        if renderer_name
-        else None
-    )
+    if renderer_name == "smg-kimi-k3":
+        renderer = SmgK3Renderer(tokenizer_path)
+    elif renderer_name == "smg":
+        renderer = SmgRenderer(tokenizer_path, chat_template_name, **(smg_options or {}))
+    elif renderer_name:
+        renderer = RENDERER_REGISTRY.create(renderer_name, tokenizer)
+    else:
+        renderer = None
+    _worker_state["renderer"] = renderer
     _worker_state["template"] = (
         TEMPLATE_REGISTRY.get(chat_template_name) if not renderer_name else None
     )
@@ -417,8 +419,6 @@ def load_conversation_dataset(args):
         tokenizer_path, smg_fingerprint = prepare_checkpoint(
             tokenizer_path, getattr(args, "smg_revision", None)
         )
-        from omegaconf import OmegaConf
-
         template_kwargs = getattr(args, "smg_template_kwargs", {}) or {}
         if OmegaConf.is_config(template_kwargs):
             template_kwargs = OmegaConf.to_container(template_kwargs, resolve=True)
@@ -444,15 +444,14 @@ def load_conversation_dataset(args):
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
     train_with_decode = getattr(args, "train_with_decode", False)
     min_loss_tokens_val = getattr(args, "min_loss_tokens", 0)
-    renderer_version = (
-        SmgK3Renderer.CACHE_VERSION
-        if renderer_name == "smg-kimi-k3"
-        else SmgRenderer.CACHE_VERSION
-        if renderer_name == "smg"
-        else RENDERER_REGISTRY.cache_version(renderer_name)
-        if renderer_name
-        else None
-    )
+    if renderer_name == "smg-kimi-k3":
+        renderer_version = SmgK3Renderer.CACHE_VERSION
+    elif renderer_name == "smg":
+        renderer_version = SmgRenderer.CACHE_VERSION
+    elif renderer_name:
+        renderer_version = RENDERER_REGISTRY.cache_version(renderer_name)
+    else:
+        renderer_version = None
     cache_params = (
         f"{dataset_name}-{args.train_data_path}{file_stat}-{args.target_model_path}"
         f"-{max_length}-template={chat_template_name}-renderer={renderer_name}"
@@ -461,8 +460,6 @@ def load_conversation_dataset(args):
         f"-mlt={min_loss_tokens_val}"
     )
     if renderer_name in ("smg", "smg-kimi-k3"):
-        import json
-
         cache_params += f"-smg={smg_fingerprint}-{json.dumps(smg_options, sort_keys=True)}"
         if renderer_name == "smg":
             cache_params += (
