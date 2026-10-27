@@ -182,6 +182,15 @@ def check(path, report):
             assert legacy.render(messages, max_seq_length=limit) == smg.render(
                 messages, max_seq_length=limit
             )
+    golden_path = (
+        Path(__file__).resolve().parents[2] / "tests/tokenizer_contract/fixtures/k3_policy.json"
+    )
+    golden = json.loads(golden_path.read_text())
+    assert golden["assets"] == ASSETS and golden["reference_versions"] == versions
+    assert passed == golden["cases"], (
+        "K3 training policy changed relative to the frozen checkpoint oracle"
+    )
+    assert rejected == golden["required_rejections"]
     result = {
         "qualified": True,
         "reference_versions": versions,
