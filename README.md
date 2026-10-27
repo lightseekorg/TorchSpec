@@ -123,6 +123,24 @@ Optional: install Flash Attention support:
 pip install -e ".[fa]"
 ```
 
+### Training tokenizer
+
+Supported text profiles (`llama3`, `qwen`, `qwen3-thinking`, `minimax-m2`) and
+Kimi-K3 now use SMG by default. After activating the environment, build the
+TorchSpec-owned binding on each worker OS/architecture:
+
+```bash
+python -m pip install maturin
+rustup toolchain install 1.98.0 --profile minimal
+RUSTUP_TOOLCHAIN=1.98.0 maturin develop --release --locked --manifest-path bindings/smg-tokenizer/Cargo.toml
+```
+
+To explicitly use the old tokenizer, set `dataset.rendering_backend: huggingface`
+or pass `dataset.rendering_backend=huggingface` on the CLI. Deferred/decode training,
+other templates and custom renderers retain their existing auto routing. Missing
+SMG bindings and rendering errors never silently change the selected backend.
+See [SMG setup, supported paths and correctness gates](docs/smg-tokenization.md).
+
 ### Backend-Specific Usage
 
 **vLLM**

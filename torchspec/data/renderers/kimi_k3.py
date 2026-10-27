@@ -45,7 +45,7 @@ class K3Renderer:
 
     # Included in the dataset tokenization cache key. Bump whenever rendering
     # semantics change in a way that can alter input_ids or loss masks.
-    CACHE_VERSION = "generation-config-v3"
+    CACHE_VERSION = "checkpoint-default-effort-v4"
 
     def __init__(self, tokenizer: Any):
         self.tokenizer = tokenizer
@@ -89,14 +89,18 @@ class K3Renderer:
         thinking: bool = True,
         thinking_effort: str | None = None,
     ) -> list[int]:
-        """Encode ``messages``, leaving unset options to the tokenizer.
+        """Encode using checkpoint defaults when no effort was requested.
 
-        The tokenizer treats a non-``None`` ``thinking_effort`` as an explicit
-        rendering option and injects an internal thinking-effort system
-        message. Passing one where the caller did not ask for it would make
-        training prompts diverge from what the checkpoint renders at serving
-        time for a request that named no effort, so the default stays ``None``.
+        Internally, ``None`` with thinking enabled denotes an absent config;
+        explicit enabled configs must name a supported effort. Omit the keyword
+        in that case: the checkpoint defaults an absent effort to ``max``, while
+        an explicit null suppresses its directive and changes the prompt.
         """
+        effort_kwargs = (
+            {"thinking_effort": thinking_effort}
+            if thinking_effort is not None or not thinking
+            else {}
+        )
         token_ids = self.tokenizer.apply_chat_template(
             messages,
             tools=tools,
@@ -104,11 +108,11 @@ class K3Renderer:
             add_generation_prompt=False,
             thinking=thinking,
             preserve_thinking=True,
-            thinking_effort=thinking_effort,
             padding=False,
             truncation=False,
             return_tensors=None,
             return_dict=False,
+            **effort_kwargs,
         )
         return self._normalize_token_ids(token_ids)
 

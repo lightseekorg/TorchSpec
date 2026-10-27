@@ -1,7 +1,4 @@
-"""SMG's segmented K3 encoding with the existing TorchSpec training policy."""
-
-import json
-from functools import lru_cache
+"""SMG's segmented K3 encoding with checkpoint-default generation settings."""
 
 from torchspec.data.renderers.kimi_k3 import K3Renderer
 
@@ -16,18 +13,17 @@ class _K3Tokenizer:
             for token in ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
         }
 
-    @lru_cache(maxsize=32)
-    def _implicit_effort_prefix(self, tools_json):
-        tools = json.loads(tools_json)
-        declarations = self.native.render([], tools=tools, template_kwargs={"thinking": False})
-        effort = self.native.render([], template_kwargs={"thinking": True})
-        if not declarations["segmentwise"] or not effort["segmentwise"]:
-            raise ValueError("Expected the native segmented K3 renderer")
-        return declarations, effort
-
-    def apply_chat_template(
-        self, messages, *, tools=None, thinking=True, thinking_effort=None, **kwargs
-    ):
+    def apply_chat_template(self, messages, *, tools=None, thinking=True, **kwargs):
+        template_kwargs = {"thinking": thinking}
+        if "thinking_effort" in kwargs:
+            effort = kwargs.pop("thinking_effort")
+            # SMG currently maps explicit null to max, unlike the checkpoint.
+            # Reject this unsupported mode instead of rewriting rendered IDs.
+            if thinking and effort is None:
+                raise ValueError(
+                    "SMG K3 does not support explicit null effort with thinking enabled"
+                )
+            template_kwargs["thinking_effort"] = effort
         expected = {
             "tokenize": True,
             "add_generation_prompt": False,
@@ -41,39 +37,24 @@ class _K3Tokenizer:
             raise ValueError("SMG K3 requires the complete-conversation training contract")
         for message in messages:
             if message.get("content") is not None and not isinstance(message["content"], str):
-                raise ValueError("SMG K3 training currently accepts text-only string content")
+                raise ValueError(
+                    "SMG K3 training currently accepts text-only string content; "
+                    "set dataset.rendering_backend=huggingface for the legacy path"
+                )
         result = self.native.render(
             messages,
             tools=tools,
-            template_kwargs={"thinking": thinking, "thinking_effort": thinking_effort},
+            template_kwargs=template_kwargs,
         )
         if not result["segmentwise"]:
             raise ValueError("Expected the native segmented K3 renderer")
-        ids = result["input_ids"]
-        if thinking and thinking_effort is None:
-            # The checkpoint distinguishes an absent effort (defaults to max)
-            # from explicit None (no directive). SMG's serving API conflates
-            # them. Remove only its generated directive, after tool declarations.
-            # Both pieces are rendered/encoded by SMG; never flatten/re-encode.
-            declarations, effort = self._implicit_effort_prefix(json.dumps(tools))
-            prefix = declarations["input_ids"] + effort["input_ids"]
-            text_prefix = declarations["text"] + effort["text"]
-            if (
-                not effort["input_ids"]
-                or ids[: len(prefix)] != prefix
-                or not result["text"].startswith(text_prefix)
-            ):
-                raise ValueError(
-                    "SMG K3 implicit-effort prefix changed; refusing to alter training IDs"
-                )
-            ids = declarations["input_ids"] + ids[len(prefix) :]
-        return ids
+        return result["input_ids"]
 
 
 class SmgK3Renderer(K3Renderer):
     # Reuse the established thinking validation, token-ID matcher, EOM policy,
     # last-turn selection and truncation without duplicating training semantics.
-    CACHE_VERSION = "smg-k3-explicit-null-v1-" + K3Renderer.CACHE_VERSION
+    CACHE_VERSION = "smg-k3-native-v2-" + K3Renderer.CACHE_VERSION
 
     def __init__(self, source):
         super().__init__(_K3Tokenizer(source))

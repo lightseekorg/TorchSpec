@@ -1,9 +1,35 @@
 # SMG rendering and tokenization
 
-The optional SMG backend uses the standalone `smg-tokenizer` Python binding to
-SMG's Rust `llm-tokenizer` crate. It requires no gateway, HTTP service, or GPU.
-The default Hugging Face path is unchanged. This is a first integration for
-complete, teacher-forced **text** conversations, not universal model support.
+SMG is the default for supported complete text-training conversations. Its
+Rust renderer/tokenizer runs in-process through TorchSpec's `smg-tokenizer`
+binding. `dataset.rendering_backend: auto` selects the route from configuration:
+
+| Configuration | Default route |
+| --- | --- |
+| `llama3`, `qwen`, `qwen3-thinking`, `minimax-m2` text profiles | SMG |
+| Kimi-K3, identified by renderer, model name or local config | SMG K3 |
+| Deferred tokenization or `train_with_decode` | Existing path |
+| Other templates or an explicit custom renderer | Existing path |
+| Pretokenized datasets with masks | No rendering/tokenization |
+
+These are routing defaults, not a claim that every checkpoint sharing a template
+has been qualified. The pinned contract gates below define the measured coverage.
+Media encountered on an SMG route is rejected with instructions to select the
+legacy path; the loader never silently changes backends after a rendering error.
+
+To explicitly use the old tokenizer and renderer, including K3:
+
+```yaml
+dataset:
+  rendering_backend: huggingface
+```
+
+Or pass `dataset.rendering_backend=huggingface` on the training command line.
+This does not import the SMG binding. Setting `rendering_backend: smg` forces
+SMG selection and rejects unsupported modes instead of applying auto routing.
+`smg_exclude_k3: true` remains a K3-only legacy override; its default is false.
+The selected route is logged, and the resolved renderer determines masking and
+cache keys. Switching backend creates a distinct cache entry.
 
 ## Installation
 
@@ -12,9 +38,10 @@ it against unmodified upstream SMG at commit
 `df17c6c24b7be9e6eae50d23373f5d459e7f722b`; `Cargo.lock` pins transitive
 dependencies. No SMG fork, companion PR, separate checkout or gateway is needed.
 Rust executes in each Python process and releases the GIL during rendering and
-encoding. The default HF installation does not require Rust.
+encoding. Explicit legacy/HF use and unsupported auto routes do not require Rust.
 
-From the TorchSpec checkout, in the Python environment used by dataset workers:
+For the default SMG text paths, install the binding from the TorchSpec checkout
+in every Python environment used by dataset workers:
 
 ```bash
 python -m pip install maturin
@@ -28,8 +55,9 @@ For deployment, use `maturin build --release --locked` with the same manifest
 and install the resulting `smg_tokenizer` wheel in each worker environment.
 The first build fetches the pinned upstream Rust source and crates; an installed
 wheel needs neither Rust nor an SMG checkout. Build separately for each
-OS/architecture; macOS wheels cannot run on Linux Grace hosts. The bridge is
-optional and its wheel is not currently published to PyPI.
+OS/architecture; macOS wheels cannot run on Linux Grace hosts. The wheel is
+not currently published to PyPI. A missing binding is an actionable error; it
+does not silently trigger legacy fallback.
 
 The library exposes `Tokenizer.encode_path` (`native`, `v1`, `tokenizers`, or
 `tiktoken`) so qualification verifies the actual selected path. When changing the
@@ -40,8 +68,8 @@ Rust revision or bridge behavior, update the lockfile and bridge package version
 
 ```yaml
 dataset:
-  rendering_backend: smg
-  smg_exclude_k3: true
+  rendering_backend: auto  # default: SMG for supported text profiles
+  smg_exclude_k3: false    # default: includes K3
   chat_template: qwen3-thinking
   defer_tokenization: false
   smg_revision: null  # Prefer an immutable HF checkpoint revision or local snapshot.
@@ -67,8 +95,8 @@ cache rebuilds render the same timestamp; that value is also in the cache key.
 
 When the selected renderer is `kimi-k3`, the model path names Kimi-K3, or a local
 config declares `model_type: kimi_k3`, `smg_exclude_k3: true` keeps the existing
-checkpoint-Python renderer without importing SMG. Set `smg_exclude_k3: false`
-to opt into the SMG K3 text path. Keep `renderer: kimi-k3` explicit for an aliased
+checkpoint-Python renderer without importing SMG. The default
+`smg_exclude_k3: false` selects the SMG K3 text path. Keep `renderer: kimi-k3` explicit for an aliased
 or Hub checkpoint whose name hides its family. Other custom renderers are not
 silently replaced.
 
@@ -76,7 +104,7 @@ silently replaced.
 
 ```yaml
 dataset:
-  rendering_backend: smg
+  rendering_backend: auto
   renderer: kimi-k3
   smg_exclude_k3: false
   defer_tokenization: false
@@ -90,19 +118,29 @@ are supervised, outer headers and `<|end_of_msg|>` are excluded, last-turn
 selection precedes truncation. It does not use the generic text-offset adapter
 or `smg_include_end_token`; K3's established EOM policy is preserved.
 
-Generation settings retain the existing per-row `generation_config` contract:
-no config means thinking enabled with **explicit null effort**; explicit enabled
-configs require `low`, `high` or `max`, and disabled thinking rejects nonempty
-reasoning. Dataset template kwargs and render-instant overrides are rejected.
+Generation settings use the per-row `generation_config` contract. With no config,
+thinking is enabled and effort is **omitted**, allowing the checkpoint/SMG default
+of `max`. Explicit enabled configs require `low`, `high` or `max`; disabled
+thinking rejects nonempty reasoning. Dataset template kwargs and render-instant
+overrides are rejected. Thinking-enabled explicit null remains unsupported:
+the checkpoint suppresses its directive, but SMG currently treats null as max.
+TorchSpec rejects this mode rather than rewriting native token IDs.
 
-The pinned SMG serving entry point conflates null effort with omitted effort,
-adding a `max` directive. The TorchSpec adapter removes only that auto-generated
-prefix after tool declarations. Both prefix pieces are rendered and encoded by
-SMG; exact text and token-prefix checks must pass before removal. It never
-flattens and re-encodes K3 text or searches arbitrary payloads for a directive.
+This corrects an old TorchSpec bug: absent config previously passed explicit null,
+overriding the checkpoint default. The initial SMG compatibility adapter stripped
+the default directive to reproduce that bug; this workaround has been removed.
+Both SMG and the explicit HF fallback now use the corrected default and bumped
+cache versions. Existing pretokenized data and target-state caches must be rebuilt
+to adopt it; a backend switch does not reinterpret previously tokenized rows.
 Literal control spellings remain ordinary text, as in the checkpoint tokenizer.
 
-K3 remains opt-in and text-only. Its qualification uses locally supplied real
+In the previously selected 320-row corpus sample, all 273 single-turn examples
+had recorded generation prompt-token counts equal to checkpoint-default/max
+rendering. None matched explicit null, which was 67 tokens shorter in every case.
+This supports the correction but is not byte-level verification of original
+generation requests; the 47 multi-turn rows were excluded from that comparison.
+
+K3 defaults to SMG for complete text conversations. Its qualification uses locally supplied real
 checkpoint assets with pinned hashes, not the existing unit-test tokenizer stub:
 
 ```bash
@@ -139,7 +177,8 @@ reproduce a prior multi-node training job or qualify media/queue/RDMA paths.
 The loss, accuracy and trajectory acceptance thresholds match the Qwen gate;
 `--smoke` never qualifies convergence.
 
-Measured on 2026-10-26 with the pinned checkpoint and a 320-row subset of the
+Historical legacy-equivalence measurement (explicit-null policy, superseded):
+on 2026-10-26 with the pinned checkpoint and a 320-row subset of the
 existing K3 training corpus: both arms completed 1,000 steps, with identical
 per-step metrics, all 11 evaluations, and byte-identical trainable checkpoints.
 Held-out loss fell from 14.5035 to 5.0557; depth-0 accuracy rose from 0% to 44.03%;
@@ -149,13 +188,15 @@ targets were extracted with TP8/PP2 on 16 GB200 GPUs, then both training arms ra
 on one GB200 using PyTorch 2.14.1+cu130. Final checkpoint SHA256:
 `bd523ce828b54f34f1c415416369812f4b8675753d433c4906d67bb699674c37`.
 
-The real-checkpoint tokenizer gate passed 126 cases, two required rejections,
+That old-policy real-checkpoint tokenizer gate passed 126 cases, two required rejections,
 14,802 truncation comparisons and 15 long-segment checks on macOS and
 Linux/aarch64, including one/two-worker dataset loading and cache reloads.
 `tests/tokenizer_contract/fixtures/k3_policy.json` freezes the expected token/mask
 digests so a shared change to legacy and SMG masking cannot silently redefine
-this policy. These measurements qualify the tested text-training setup, not
-multimodal or live speculative-decoding performance.
+the policy. The corrected absent-effort entries reuse the independently frozen
+explicit-max expectations. The gate additionally compares IDs directly against
+the checkpoint API without either TorchSpec adapter. The historical convergence
+result establishes old-path equivalence, not correct generation-prompt alignment.
 
 ## Supervision and compatibility
 

@@ -50,7 +50,7 @@ def prepare(args):
                 train_data_path=str(raw),
                 prompt_key="messages",
                 renderer="kimi-k3",
-                rendering_backend="huggingface" if backend == "hf" else "smg",
+                rendering_backend="huggingface" if backend == "hf" else "auto",
                 smg_exclude_k3=False,
                 max_seq_length=args.max_length,
                 defer_tokenization=False,
@@ -62,6 +62,7 @@ def prepare(args):
                 cache_dir=str(args.output / "dataset-cache"),
             )
             actual = load_conversation_dataset(cfg)
+            assert cfg.renderer == ("kimi-k3" if backend == "hf" else "smg-kimi-k3")
             assert len(actual) == len(selected)
             rows = []
             for got, expected in zip(actual, selected):

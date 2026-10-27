@@ -1,6 +1,6 @@
 {
-  "description": "Frozen existing K3 training policy against the real checkpoint tokenizer; assistant internal XTML supervised, outer header and EOM excluded. Changes require explicit specification review.",
-  "reference_renderer_sha256": "5038290e6f4d7325fc60b4dded193a1e52799a69ec6d3669487320f721ec5239",
+  "description": "Checkpoint-default K3 policy: absent effort equals the independently frozen explicit-max cases; assistant internal XTML supervised, outer header and EOM excluded. Explicit enabled-null remains unsupported. Changes require specification review.",
+  "reference_renderer_sha256": "570b54cb1e7aeda0a3b2f88bb24d185002606512a407489279c90fb08957d024",
   "assets": {
     "config.json": "9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213",
     "tokenization_kimi.py": "f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944",
@@ -17,17 +17,17 @@
       "case": "ascii",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 38,
+      "tokens": 105,
       "supervised": 17,
-      "ids_mask_sha256": "056c8714e94b69161dfe46b5e6828edc5efa4e4991d2fa2a20f201b340697ab9"
+      "ids_mask_sha256": "e63ceb20fc762dc9240a14cbd5aa690fc7518b5eddd1f462ad37ca440e39b812"
     },
     {
       "case": "ascii",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 38,
+      "tokens": 105,
       "supervised": 17,
-      "ids_mask_sha256": "056c8714e94b69161dfe46b5e6828edc5efa4e4991d2fa2a20f201b340697ab9"
+      "ids_mask_sha256": "e63ceb20fc762dc9240a14cbd5aa690fc7518b5eddd1f462ad37ca440e39b812"
     },
     {
       "case": "ascii",
@@ -121,17 +121,17 @@
       "case": "unicode",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 58,
+      "tokens": 125,
       "supervised": 30,
-      "ids_mask_sha256": "d13af6368f7ea22e8e3676d78a4260e59b8eea0cc3d41713bac14a82c09458ce"
+      "ids_mask_sha256": "bda74d382584784a5423eeadb271febdd3937b8f1540866bdb0950754b016054"
     },
     {
       "case": "unicode",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 58,
+      "tokens": 125,
       "supervised": 30,
-      "ids_mask_sha256": "d13af6368f7ea22e8e3676d78a4260e59b8eea0cc3d41713bac14a82c09458ce"
+      "ids_mask_sha256": "bda74d382584784a5423eeadb271febdd3937b8f1540866bdb0950754b016054"
     },
     {
       "case": "unicode",
@@ -225,17 +225,17 @@
       "case": "whitespace",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 41,
+      "tokens": 108,
       "supervised": 19,
-      "ids_mask_sha256": "31ae987ad43d2f216067cfdfddbf195192f26310efb3a522e59fc15fb0b89c71"
+      "ids_mask_sha256": "d05167384d397f2dd425cc64915ab577518a01ac6297371e1df244a2ca752f65"
     },
     {
       "case": "whitespace",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 41,
+      "tokens": 108,
       "supervised": 19,
-      "ids_mask_sha256": "31ae987ad43d2f216067cfdfddbf195192f26310efb3a522e59fc15fb0b89c71"
+      "ids_mask_sha256": "d05167384d397f2dd425cc64915ab577518a01ac6297371e1df244a2ca752f65"
     },
     {
       "case": "whitespace",
@@ -329,17 +329,17 @@
       "case": "empty",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 35,
+      "tokens": 102,
       "supervised": 15,
-      "ids_mask_sha256": "8e3b41d2b0e9bd4351206d2ed3ea283a72bff58653e61d2122291c53b3b58760"
+      "ids_mask_sha256": "29dd257392b41c88303b914cae73752fb64dbcf03d6f5402c4ce48a305070663"
     },
     {
       "case": "empty",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 35,
+      "tokens": 102,
       "supervised": 15,
-      "ids_mask_sha256": "8e3b41d2b0e9bd4351206d2ed3ea283a72bff58653e61d2122291c53b3b58760"
+      "ids_mask_sha256": "29dd257392b41c88303b914cae73752fb64dbcf03d6f5402c4ce48a305070663"
     },
     {
       "case": "empty",
@@ -433,17 +433,17 @@
       "case": "literal_controls",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 60,
+      "tokens": 127,
       "supervised": 22,
-      "ids_mask_sha256": "86adf279004b64f63b994318453a60683ac88b6c3ef0c350c4555c7730070905"
+      "ids_mask_sha256": "c96269a5d54ae5f0af857419b3c9917a5db8f824a70ae261ce791c47f86d7072"
     },
     {
       "case": "literal_controls",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 60,
+      "tokens": 127,
       "supervised": 22,
-      "ids_mask_sha256": "86adf279004b64f63b994318453a60683ac88b6c3ef0c350c4555c7730070905"
+      "ids_mask_sha256": "c96269a5d54ae5f0af857419b3c9917a5db8f824a70ae261ce791c47f86d7072"
     },
     {
       "case": "literal_controls",
@@ -537,17 +537,17 @@
       "case": "reasoning",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 39,
+      "tokens": 106,
       "supervised": 19,
-      "ids_mask_sha256": "77a3eba68e1f4164d5c3873938fe65f2d7c1b374677156d2f5dfd73293783cb1"
+      "ids_mask_sha256": "5de0ba1c8b2e4e65a2f99f9770aa7dc921ac951a622b00bcb38fabc3bebc3c28"
     },
     {
       "case": "reasoning",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 39,
+      "tokens": 106,
       "supervised": 19,
-      "ids_mask_sha256": "77a3eba68e1f4164d5c3873938fe65f2d7c1b374677156d2f5dfd73293783cb1"
+      "ids_mask_sha256": "5de0ba1c8b2e4e65a2f99f9770aa7dc921ac951a622b00bcb38fabc3bebc3c28"
     },
     {
       "case": "reasoning",
@@ -619,17 +619,17 @@
       "case": "reasoning_alias",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 38,
+      "tokens": 105,
       "supervised": 18,
-      "ids_mask_sha256": "c9cd0da441ff07425308310f5029f009e7c223c6e9bc828e29ca95dabf23196b"
+      "ids_mask_sha256": "f6c700a5d565fef66f90bafb1e99e4ba194c443a5af84cf26355edb659a09ef6"
     },
     {
       "case": "reasoning_alias",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 38,
+      "tokens": 105,
       "supervised": 18,
-      "ids_mask_sha256": "c9cd0da441ff07425308310f5029f009e7c223c6e9bc828e29ca95dabf23196b"
+      "ids_mask_sha256": "f6c700a5d565fef66f90bafb1e99e4ba194c443a5af84cf26355edb659a09ef6"
     },
     {
       "case": "reasoning_alias",
@@ -701,17 +701,17 @@
       "case": "multi_turn",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 74,
+      "tokens": 141,
       "supervised": 34,
-      "ids_mask_sha256": "e69cfae76d54202e0359db7fe719b11c729500909b48b85080685e5a127e599a"
+      "ids_mask_sha256": "854bfcd187a3e3276c2edb48feac425c5c12a6d0127f0c32077ba518f8b01a3a"
     },
     {
       "case": "multi_turn",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 74,
+      "tokens": 141,
       "supervised": 17,
-      "ids_mask_sha256": "931b8da0cd5a7a5af2892cb6efa544b23037c4f3bbbc7a6ad4295c7bf270dc63"
+      "ids_mask_sha256": "cba73266685683629e96d5e952af717641d371ada0f6d37fcffe6698156dfb1a"
     },
     {
       "case": "multi_turn",
@@ -805,17 +805,17 @@
       "case": "named_assistant",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 41,
+      "tokens": 108,
       "supervised": 16,
-      "ids_mask_sha256": "08de27475138461d936017c69dc1fa48751625fe390ca0fddd0ac9f4955c2d8a"
+      "ids_mask_sha256": "9b20bddc4ded877f3318a041b08516c8f7693ca6030608a1c79f90a624411dec"
     },
     {
       "case": "named_assistant",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 41,
+      "tokens": 108,
       "supervised": 16,
-      "ids_mask_sha256": "08de27475138461d936017c69dc1fa48751625fe390ca0fddd0ac9f4955c2d8a"
+      "ids_mask_sha256": "9b20bddc4ded877f3318a041b08516c8f7693ca6030608a1c79f90a624411dec"
     },
     {
       "case": "named_assistant",
@@ -909,17 +909,17 @@
       "case": "system",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 51,
+      "tokens": 118,
       "supervised": 16,
-      "ids_mask_sha256": "a858d705b2e3760abc8f502db8f84fbd0829567bd9bd16155bb7b416fe2d975e"
+      "ids_mask_sha256": "923bc5b9aa76b8805293b329cc103722946166e37731b7453345f78040f7cd24"
     },
     {
       "case": "system",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 51,
+      "tokens": 118,
       "supervised": 16,
-      "ids_mask_sha256": "a858d705b2e3760abc8f502db8f84fbd0829567bd9bd16155bb7b416fe2d975e"
+      "ids_mask_sha256": "923bc5b9aa76b8805293b329cc103722946166e37731b7453345f78040f7cd24"
     },
     {
       "case": "system",
@@ -1013,17 +1013,17 @@
       "case": "tools_dict",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 194,
+      "tokens": 261,
       "supervised": 72,
-      "ids_mask_sha256": "e2fe81d798a796fd493c29fd65cf6712d28d2f1acd5c194fc13f45cfcb07c6f1"
+      "ids_mask_sha256": "95b4ac6ff10f215689ab2668122299cb7101a3ad67a51ad95b4e2c224f4a6d86"
     },
     {
       "case": "tools_dict",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 194,
+      "tokens": 261,
       "supervised": 18,
-      "ids_mask_sha256": "2f2639fe06c3bff8be9fe7c716c30408b605a7f9e00d119c88a85ea8b0774304"
+      "ids_mask_sha256": "4d80a1f4d0409cb3d1bb5a7e2b5bde14d80b90c18e8390875ef8077407b74d67"
     },
     {
       "case": "tools_dict",
@@ -1117,17 +1117,17 @@
       "case": "tools_str",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 194,
+      "tokens": 261,
       "supervised": 72,
-      "ids_mask_sha256": "e2fe81d798a796fd493c29fd65cf6712d28d2f1acd5c194fc13f45cfcb07c6f1"
+      "ids_mask_sha256": "95b4ac6ff10f215689ab2668122299cb7101a3ad67a51ad95b4e2c224f4a6d86"
     },
     {
       "case": "tools_str",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 194,
+      "tokens": 261,
       "supervised": 18,
-      "ids_mask_sha256": "2f2639fe06c3bff8be9fe7c716c30408b605a7f9e00d119c88a85ea8b0774304"
+      "ids_mask_sha256": "4d80a1f4d0409cb3d1bb5a7e2b5bde14d80b90c18e8390875ef8077407b74d67"
     },
     {
       "case": "tools_str",
@@ -1221,17 +1221,17 @@
       "case": "unused_tools",
       "mode": null,
       "last_turn_only": false,
-      "tokens": 109,
+      "tokens": 176,
       "supervised": 16,
-      "ids_mask_sha256": "5f78c4db0a7e4fcd3ab031271a4a07494613b3e3755a9d1dec331a190f2c1e09"
+      "ids_mask_sha256": "e6c4c0638e2026c309569d876a08c0a3ae744f0327c9cb3a0a9f6a0e6b06da90"
     },
     {
       "case": "unused_tools",
       "mode": null,
       "last_turn_only": true,
-      "tokens": 109,
+      "tokens": 176,
       "supervised": 16,
-      "ids_mask_sha256": "5f78c4db0a7e4fcd3ab031271a4a07494613b3e3755a9d1dec331a190f2c1e09"
+      "ids_mask_sha256": "e6c4c0638e2026c309569d876a08c0a3ae744f0327c9cb3a0a9f6a0e6b06da90"
     },
     {
       "case": "unused_tools",

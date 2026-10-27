@@ -1,4 +1,4 @@
-"""Parity against the pinned real K3 tokenizer and existing training policy."""
+"""Parity against the pinned K3 tokenizer, including its absent-effort default."""
 
 import argparse
 import hashlib
@@ -95,9 +95,7 @@ def check_dataset(path, legacy):
         raw.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n")
         for workers in (1, 2):
             args = SimpleNamespace(
-                rendering_backend="smg",
-                renderer="smg-kimi-k3",
-                smg_exclude_k3=False,
+                renderer="kimi-k3",
                 target_model_path=str(Path(path).resolve()),
                 train_data_path=str(raw),
                 prompt_key="messages",
@@ -128,6 +126,20 @@ def check(path, report):
     assert versions == {"transformers": "5.20.2", "tiktoken": "0.14.0"}, versions
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     legacy, smg = K3Renderer(tokenizer), SmgK3Renderer(path)
+    # Independent of both TorchSpec adapters: the checkpoint distinguishes
+    # omitted effort (max) from explicit null (no directive). This catches the
+    # previous shared bug where both adapters agreed on the wrong prompt.
+    probe = [{"role": "user", "content": "Question"}, {"role": "assistant", "content": "Answer"}]
+    reference_kwargs = dict(
+        tokenize=True, add_generation_prompt=False, thinking=True, preserve_thinking=True
+    )
+    default_ids = tokenizer.apply_chat_template(probe, **reference_kwargs)
+    assert default_ids == tokenizer.apply_chat_template(
+        probe, thinking_effort="max", **reference_kwargs
+    )
+    assert default_ids != tokenizer.apply_chat_template(
+        probe, thinking_effort=None, **reference_kwargs
+    )
     modes = [
         None,
         {"thinking": False, "thinking_effort": None},
@@ -156,6 +168,12 @@ def check(path, report):
                 args = dict(max_seq_length=10000, last_turn_only=last_turn, generation_config=mode)
                 expected = legacy.render(messages, tools, **args)
                 actual = smg.render(messages, tools, **args)
+                checkpoint_kwargs = dict(reference_kwargs)
+                if mode is not None:
+                    checkpoint_kwargs.update(mode)
+                assert expected[0] == tokenizer.apply_chat_template(
+                    messages, tools=tools, **checkpoint_kwargs
+                ), ("checkpoint API disagreement", name, mode)
                 assert actual == expected, (name, mode, last_turn, expected, actual)
                 assert all(mask == 0 for token, mask in zip(*actual) if token == legacy.eom_id)
                 for cut in range(1, len(expected[0]) + 2):
@@ -197,6 +215,8 @@ def check(path, report):
         "dataset_integration": check_dataset(path, legacy),
         "assets": ASSETS,
         "reference_class": type(tokenizer).__name__,
+        "absent_effort_policy": "checkpoint_default_max",
+        "direct_checkpoint_ids": True,
         "cases": passed,
         "required_rejections": rejected,
         "truncation_comparisons": truncations,

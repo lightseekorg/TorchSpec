@@ -372,6 +372,10 @@ def load_conversation_dataset(args):
     defer_tokenization = getattr(args, "defer_tokenization", False)
 
     logger.info(f"Max sequence length allowed for training: {max_length}")
+    logger.info(
+        f"Dataset rendering backend={getattr(args, 'rendering_backend', 'auto')}; "
+        f"resolved renderer={renderer_name or 'legacy-template'}"
+    )
 
     if renderer_name and defer_tokenization:
         raise ValueError("Registered dataset renderers require defer_tokenization=False")
@@ -544,7 +548,10 @@ def load_conversation_dataset(args):
             messages = _normalize_conversation(raw_prompt)
             multimodal_inputs = extract_media_urls(messages)
             if renderer_name in ("smg", "smg-kimi-k3") and multimodal_inputs is not None:
-                raise ValueError("SMG training currently supports text-only samples")
+                raise ValueError(
+                    "SMG training currently supports text-only samples; "
+                    "set dataset.rendering_backend=huggingface for multimodal training"
+                )
             if custom_template is not None:
                 flatten_multimodal_content(messages, custom_template.image_placeholder)
             data_id = sample.get("id") or sample.get("data_id") or f"sample_{idx}"

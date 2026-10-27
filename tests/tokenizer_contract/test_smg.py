@@ -179,7 +179,6 @@ def test_dataset_workers_and_cache_match_goldens(
         + "\n"
     )
     args = SimpleNamespace(
-        rendering_backend="smg",
         target_model_path=str(checkpoints[profile]),
         chat_template=MANIFEST["profiles"][profile]["template"],
         train_data_path=str(source),

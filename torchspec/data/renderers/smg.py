@@ -1,4 +1,4 @@
-"""Optional SMG rendering/encoding with TorchSpec-owned supervision.
+"""SMG rendering/encoding with TorchSpec-owned supervision.
 
 The first integration accepts complete text conversations with explicit
 assistant/end delimiters. Unsupported encodings and ambiguous boundaries are
@@ -13,13 +13,20 @@ from pathlib import Path
 
 from torchspec.data.template import TEMPLATE_REGISTRY
 
+# Default routing is deliberately bounded to the supported text profiles.
+# Additional templates can still be requested explicitly with backend="smg".
+SMG_DEFAULT_TEMPLATES = frozenset({"llama3", "qwen", "qwen3-thinking", "minimax-m2"})
+
 
 def effective_renderer(args):
-    backend = getattr(args, "rendering_backend", "huggingface")
+    backend = getattr(args, "rendering_backend", "auto")
     renderer = getattr(args, "renderer", None)
-    if backend not in ("huggingface", "smg"):
-        raise ValueError("dataset.rendering_backend must be 'huggingface' or 'smg'")
-    if backend != "smg":
+    if backend not in ("auto", "huggingface", "smg"):
+        raise ValueError("dataset.rendering_backend must be 'auto', 'huggingface' or 'smg'")
+    # Preserve explicit custom renderers, including on K3 model paths.
+    if renderer not in (None, "smg", "kimi-k3", "smg-kimi-k3"):
+        if backend == "smg":
+            raise ValueError(f"SMG cannot override explicit dataset.renderer={renderer!r}")
         return renderer
     model_path = str(getattr(args, "target_model_path", ""))
     is_k3 = renderer in ("kimi-k3", "smg-kimi-k3") or "kimi-k3" in model_path.lower().replace(
@@ -29,31 +36,47 @@ def effective_renderer(args):
     if config.is_file():
         model_type = json.loads(config.read_text()).get("model_type", "")
         is_k3 |= "kimi-k3" in model_type.lower().replace("_", "-")
-    if is_k3:
-        if getattr(args, "smg_exclude_k3", True):
-            return "kimi-k3"
-        if getattr(args, "defer_tokenization", False) or getattr(args, "train_with_decode", False):
-            raise ValueError("SMG K3 requires defer_tokenization=false and train_with_decode=false")
-        return "smg-kimi-k3"
-    if renderer not in (None, "smg"):
-        raise ValueError(f"SMG cannot override explicit dataset.renderer={renderer!r}")
-    if getattr(args, "defer_tokenization", False) or getattr(args, "train_with_decode", False):
+    legacy_renderer = "kimi-k3" if is_k3 else None
+    # This also allows switching an already-resolved namespace back to legacy.
+    if backend == "huggingface":
+        return legacy_renderer
+    incompatible = getattr(args, "defer_tokenization", False) or getattr(
+        args, "train_with_decode", False
+    )
+    if is_k3 and getattr(args, "smg_exclude_k3", False):
+        return legacy_renderer
+    if backend == "auto":
+        if incompatible:
+            return legacy_renderer
+        if (
+            not is_k3
+            and renderer != "smg"
+            and getattr(args, "chat_template", None) not in SMG_DEFAULT_TEMPLATES
+        ):
+            return legacy_renderer
+    if incompatible:
         raise ValueError(
-            "SMG rendering requires defer_tokenization=false and train_with_decode=false"
+            "SMG rendering requires defer_tokenization=false and train_with_decode=false; "
+            "set dataset.rendering_backend=huggingface for the legacy path"
         )
-    return "smg"
+    return "smg-kimi-k3" if is_k3 else "smg"
 
 
 def prepare_checkpoint(source, revision=None):
     """Resolve once before multiprocessing, and fingerprint actual tokenizer assets."""
+    from packaging.version import Version
+
     try:
         version = importlib.metadata.version("smg-tokenizer")
-    except importlib.metadata.PackageNotFoundError as exc:
+        if Version(version) < Version("0.1.2"):
+            raise ImportError(f"smg-tokenizer {version} is older than the required 0.1.2")
+        from smg_tokenizer import build_features
+    except ImportError as exc:
         raise ImportError(
-            "SMG rendering needs the standalone smg-tokenizer binding; "
-            "see docs/smg-tokenization.md for the source build command"
+            "SMG rendering needs the TorchSpec-owned smg-tokenizer binding >=0.1.2; "
+            "see docs/smg-tokenization.md for the source build command, or set "
+            "dataset.rendering_backend=huggingface to use the legacy tokenizer"
         ) from exc
-    from smg_tokenizer import build_features
 
     root = Path(source)
     if not root.is_dir():
@@ -159,7 +182,8 @@ class SmgRenderer:
             content = message.get("content")
             if content is not None and not isinstance(content, str):
                 raise ValueError(
-                    "SMG training currently accepts text-only string content; multimodal expansion is not supported"
+                    "SMG training currently accepts text-only string content; for multimodal training "
+                    "set dataset.rendering_backend=huggingface"
                 )
             if not self.tokenizer.raw_tool_call_arguments:
                 for call in message.get("tool_calls") or []:

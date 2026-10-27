@@ -148,7 +148,7 @@ def test_render_delegates_all_xtml_work_to_remote_tokenizer():
     assert call["add_generation_prompt"] is False
     assert call["thinking"] is True
     assert call["preserve_thinking"] is True
-    assert call["thinking_effort"] is None
+    assert "thinking_effort" not in call
     assert call["padding"] is False
     assert call["truncation"] is False
     assert call["return_tensors"] is None
@@ -179,10 +179,9 @@ def test_rows_without_a_generation_config_leave_the_effort_to_the_tokenizer():
         max_seq_length=1024,
     )
 
-    # Naming an effort makes the tokenizer inject a thinking-effort system
-    # message, so a row that asked for none must not get one -- otherwise
-    # training prompts diverge from what serving renders for the same request.
-    assert all(call["thinking_effort"] is None for call in tokenizer.calls)
+    # Missing and explicit null differ in the checkpoint API. Forward neither
+    # a synthetic null nor a locally chosen default; let the tokenizer decide.
+    assert all("thinking_effort" not in call for call in tokenizer.calls)
 
 
 @pytest.mark.parametrize("thinking_effort", ["low", "high", "max"])

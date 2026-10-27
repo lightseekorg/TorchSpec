@@ -25,7 +25,11 @@ Or install into your current environment:
 pip install -e ".[dev]"
 ```
 
-3. (Optional) Install Flash Attention for full feature support:
+3. For default supported text-training paths, install the SMG binding using
+   [the setup instructions](docs/smg-tokenization.md#installation). Explicit
+   `dataset.rendering_backend=huggingface` keeps the old tokenizer without Rust.
+
+4. (Optional) Install Flash Attention for full feature support:
 
 ```bash
 pip install -e ".[fa]"

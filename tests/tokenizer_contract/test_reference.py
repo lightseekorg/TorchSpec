@@ -65,7 +65,7 @@ def test_required_coverage_is_present():
             assert len(case["assistant_tokens"]) == len(case["assistant_annotations"])
             assert len(expected_mask(case, True, False)) == len(case["input_ids"])
             assert sum(expected_mask(case, True, False)) > 0
-    assert {p.stem for p in FIXTURES.glob("*.json")} == {*PROFILES, "manifest"}
+    assert {p.stem for p in FIXTURES.glob("*.json")} == {*PROFILES, "manifest", "k3_policy"}
 
 
 def test_changed_checkpoint_is_rejected(tmp_path, monkeypatch):

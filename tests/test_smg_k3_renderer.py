@@ -18,9 +18,10 @@ def test_k3_opt_in_rejects_unsupported_training_modes(flag):
         )
 
 
-def test_k3_prefix_correction_fails_when_native_layout_changes():
+def test_k3_returns_native_ids_without_prefix_rewriting():
     class Native:
         def render(self, messages, *, tools=None, template_kwargs=None):
+            assert template_kwargs == {"thinking": True}
             return {
                 "segmentwise": True,
                 "input_ids": [99] if messages else [1],
@@ -29,17 +30,22 @@ def test_k3_prefix_correction_fails_when_native_layout_changes():
 
     tokenizer = object.__new__(_K3Tokenizer)
     tokenizer.native = Native()
-    with pytest.raises(ValueError, match="prefix changed"):
-        tokenizer.apply_chat_template(
-            [{"role": "assistant", "content": "answer"}],
-            tokenize=True,
-            add_generation_prompt=False,
-            preserve_thinking=True,
-            padding=False,
-            truncation=False,
-            return_tensors=None,
-            return_dict=False,
-        )
+    assert tokenizer.apply_chat_template(
+        [{"role": "assistant", "content": "answer"}],
+        tokenize=True,
+        add_generation_prompt=False,
+        preserve_thinking=True,
+        padding=False,
+        truncation=False,
+        return_tensors=None,
+        return_dict=False,
+    ) == [99]
+
+
+def test_k3_rejects_explicit_null_instead_of_silently_using_max():
+    tokenizer = object.__new__(_K3Tokenizer)
+    with pytest.raises(ValueError, match="explicit null"):
+        tokenizer.apply_chat_template([], thinking=True, thinking_effort=None)
 
 
 def test_k3_refuses_flat_encoding_and_nontext_inputs():

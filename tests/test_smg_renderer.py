@@ -186,31 +186,32 @@ def test_k3_flag_keeps_existing_renderer_without_smg_import(tmp_path):
     assert effective_renderer(args) == "kimi-k3"
 
 
-def test_backend_is_opt_in_and_rejects_incompatible_modes():
+def test_explicit_smg_rejects_incompatible_modes():
     assert effective_renderer(SimpleNamespace()) is None
     for field in ("defer_tokenization", "train_with_decode"):
         with pytest.raises(ValueError, match="requires"):
             effective_renderer(SimpleNamespace(rendering_backend="smg", **{field: True}))
 
 
-def test_resolved_config_selects_smg_and_keeps_k3():
+def test_default_config_selects_smg_including_k3_and_allows_legacy():
     from omegaconf import OmegaConf
 
     from torchspec.config.train_config import Config, config_to_flat_args
 
     config = OmegaConf.structured(Config)
     config.model.target_model_path = "Qwen/Qwen3-0.6B"
-    config.dataset.rendering_backend = "smg"
     config.dataset.chat_template = "qwen3-thinking"
+    assert config.dataset.rendering_backend == "auto"
+    assert config.dataset.smg_exclude_k3 is False
     args = config_to_flat_args(config)
     assert args.renderer == "smg" and args.dynamic_loss_mask is False
     config.dataset.renderer = "kimi-k3"
     args = config_to_flat_args(config)
-    assert args.renderer == "kimi-k3" and args.dynamic_loss_mask is True
-    config.dataset.smg_exclude_k3 = False
-    args = config_to_flat_args(config)
     assert args.renderer == "smg-kimi-k3" and args.dynamic_loss_mask is False
     assert effective_renderer(args) == "smg-kimi-k3"
+    config.dataset.rendering_backend = "huggingface"
+    args = config_to_flat_args(config)
+    assert args.renderer == "kimi-k3" and args.dynamic_loss_mask is True
 
 
 def test_clock_dependent_template_requires_pinned_instant(checkpoint):
@@ -249,7 +250,6 @@ def test_dataset_worker_and_cache_roundtrip(checkpoint, tmp_path, num_proc):
     data = tmp_path / "train.jsonl"
     data.write_text(json.dumps({"conversations": messages()}) + "\n")
     args = SimpleNamespace(
-        rendering_backend="smg",
         target_model_path=str(path),
         chat_template="qwen",
         train_data_path=str(data),
@@ -265,3 +265,51 @@ def test_dataset_worker_and_cache_roundtrip(checkpoint, tmp_path, num_proc):
     assert rows[0]["input_ids"].tolist() == cached[0]["input_ids"].tolist()
     assert rows[0]["packed_loss_mask"] == cached[0]["packed_loss_mask"]
     assert len(unpack_loss_mask(rows[0]["packed_loss_mask"])) == len(rows[0]["input_ids"])
+
+
+def test_explicit_legacy_dataset_does_not_import_smg(checkpoint, tmp_path, monkeypatch):
+    import sys
+
+    import torchspec.data.dataset as dataset_module
+    from torchspec.data.preprocessing import preprocess_conversations
+    from torchspec.data.template import TEMPLATE_REGISTRY
+    from torchspec.data.utils import unpack_loss_mask
+
+    path, hf = checkpoint
+    source = tmp_path / "legacy.jsonl"
+    source.write_text(json.dumps({"conversations": messages()}) + "\n")
+    expected = preprocess_conversations(
+        hf,
+        [messages()],
+        TEMPLATE_REGISTRY.get("qwen"),
+        max_length=4096,
+        is_preformatted=False,
+        include_attention_mask=False,
+        use_packed_loss_mask=True,
+        add_generation_prompt=False,
+        return_formatted_text=True,
+        last_turn_loss_only=True,
+    )
+    args = SimpleNamespace(
+        target_model_path=str(path),
+        chat_template="qwen",
+        train_data_path=str(source),
+        prompt_key="conversations",
+        max_seq_length=4096,
+        num_proc=1,
+        cache_dir=str(tmp_path / "legacy-cache"),
+        last_turn_loss_only=True,
+    )
+    smg_rows = dataset_module.load_conversation_dataset(args)
+    assert smg_rows[0]["formatted_prompt"] is None
+    monkeypatch.setitem(sys.modules, "smg_tokenizer", None)
+    args.rendering_backend = "huggingface"
+    args.renderer = "smg"  # simulate switching a resolved config back to legacy
+    rows = dataset_module.load_conversation_dataset(args)
+    assert rows[0]["formatted_prompt"] is not None
+    assert len(list((tmp_path / "legacy-cache/tokenized_dataset").glob("*.pt"))) == 2
+    assert rows[0]["input_ids"].tolist() == expected["input_ids"][0].tolist()
+    assert (
+        unpack_loss_mask(rows[0]["packed_loss_mask"]).tolist()
+        == unpack_loss_mask(expected["packed_loss_mask"][0]).tolist()
+    )
