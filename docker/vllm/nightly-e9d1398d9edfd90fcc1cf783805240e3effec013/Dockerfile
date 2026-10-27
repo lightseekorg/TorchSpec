@@ -1,9 +1,9 @@
 FROM vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013@sha256:95bed119f39e2414973cf7224df31c9a3ed213566138722346d7bd360edf842b AS base
 
 # Compile against the runtime base for matching architecture and libc.
-FROM base AS smg-builder
-COPY bindings/smg-tokenizer /tmp/smg-tokenizer
-RUN bash /tmp/smg-tokenizer/build-wheel.sh
+FROM base AS torchspec-builder
+COPY . /tmp/torchspec
+RUN bash /tmp/torchspec/bindings/smg-tokenizer/build-wheel.sh
 
 FROM base AS runtime
 
@@ -52,14 +52,14 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
 # apache-tvm-ffi>=0.1.12, while the pinned vLLM, TileLang, and TokenSpeed stack
 # requires apache-tvm-ffi==0.1.11. Routing-validation configs use
 # flex_attention instead.
-# Only the compiled extension is needed at runtime; no Rust toolchain.
-COPY --from=smg-builder /opt/smg-wheels/ /tmp/smg-wheels/
-RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/smg-wheels/*.whl && \
-    python3 -c "from smg_tokenizer import Tokenizer, build_features; assert build_features == 'default'" && \
-    rm -rf /tmp/smg-wheels
+# Install this checkout as one wheel, then resolve its Python dependencies.
+COPY --from=torchspec-builder /opt/torchspec-wheels/ /tmp/torchspec-wheels/
+RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/torchspec-wheels/*.whl && \
+    python3 -c "from torchspec_smg import Tokenizer, build_features; assert build_features == 'default'" && \
+    rm -rf /tmp/torchspec-wheels
 
 COPY . /root/torchspec
-RUN cd /root/torchspec && pip install --no-cache-dir -e .
+RUN python3 -m pip install --no-cache-dir "torchspec==$(python3 -c 'from importlib.metadata import version; print(version("torchspec"))')"
 
 # TorchSpec's generic dependency can install the CUDA 12 Mooncake wheel over
 # the base package. Replace it last and verify the binary left in the image.

@@ -1,7 +1,7 @@
 """Default selection, explicit legacy rollback and unsupported-mode boundaries."""
 
-import importlib.metadata
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -71,10 +71,7 @@ def test_custom_renderer_is_preserved_even_on_a_k3_model():
 
 
 def test_missing_binding_requires_install_or_explicit_legacy(monkeypatch):
-    def missing(name):
-        raise importlib.metadata.PackageNotFoundError(name)
-
-    monkeypatch.setattr(importlib.metadata, "version", missing)
+    monkeypatch.setitem(sys.modules, "torchspec_smg", None)
     args = SimpleNamespace(chat_template="qwen")
     assert effective_renderer(args) == "smg"
     with pytest.raises(ImportError, match="rendering_backend=huggingface"):
@@ -99,6 +96,8 @@ def test_saved_config_preserves_backend_and_mask_routing(tmp_path, backend):
 
 
 def test_outdated_binding_is_not_silently_used(monkeypatch):
-    monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.1.0")
+    monkeypatch.setitem(
+        sys.modules, "torchspec_smg", SimpleNamespace(__version__="0.1.0", build_features="default")
+    )
     with pytest.raises(ImportError, match="binding >=0.1.2"):
         prepare_checkpoint("unused")

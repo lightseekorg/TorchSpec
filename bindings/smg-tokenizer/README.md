@@ -1,12 +1,14 @@
 # TorchSpec SMG tokenizer bridge
 
-This native extension runs SMG's Rust tokenizer inside Python dataset workers
-using PyO3. The wheel is an installation artifact, not a separate service or
-independently maintained project. TorchSpec owns the bridge; its Dockerfiles
-build the wheel in a separate stage and install it in each training image.
-The Rust crate comes from the immutable upstream
-revision in `Cargo.toml`, with transitive dependencies pinned in `Cargo.lock`.
-It needs no SMG fork, gateway or separate source checkout.
+This Rust crate is compiled by the root setuptools-rust build into
+`torchspec_smg._native`. Its Python wrapper is `python/torchspec_smg/__init__.py`. Both ship in the main
+TorchSpec wheel; `pip install -e .` builds them automatically. This directory is
+not an independently installable Python package.
+
+The Dockerfiles build the same wheel in a compiler stage and install it into each
+training image. SMG comes from the immutable revision in `Cargo.toml`, with
+transitive dependencies pinned in `Cargo.lock`. Rust executes directly inside
+Python dataset workers through PyO3, releasing the GIL during heavy work.
 
 See [installation and qualification](../../docs/smg-tokenization.md) for build
 commands, supported inputs, supervision policy and the convergence gate.
@@ -24,6 +26,6 @@ Run binding tests after installing the wheel:
 python -m pytest -q bindings/smg-tokenizer/tests
 ```
 
-The binding is versioned independently for dataset cache invalidation. Version
+The internal Rust binding version is exposed for dataset cache invalidation. Version
 0.1.2 exposes special-token lookup for TorchSpec's K3 token-ID mask policy.
 Rendering and encoding continue to use the pinned upstream Rust implementation.

@@ -12,7 +12,7 @@ from torchspec.data.renderers.smg import SmgRenderer, effective_renderer, prepar
 
 @pytest.fixture
 def checkpoint(tmp_path):
-    pytest.importorskip("smg_tokenizer")
+    pytest.importorskip("torchspec_smg")
     native = Tokenizer(models.BPE(unk_token="[UNK]"))
     native.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     native.decoder = decoders.ByteLevel()
@@ -302,7 +302,7 @@ def test_explicit_legacy_dataset_does_not_import_smg(checkpoint, tmp_path, monke
     )
     smg_rows = dataset_module.load_conversation_dataset(args)
     assert smg_rows[0]["formatted_prompt"] is None
-    monkeypatch.setitem(sys.modules, "smg_tokenizer", None)
+    monkeypatch.setitem(sys.modules, "torchspec_smg", None)
     args.rendering_backend = "huggingface"
     args.renderer = "smg"  # simulate switching a resolved config back to legacy
     rows = dataset_module.load_conversation_dataset(args)

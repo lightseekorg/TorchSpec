@@ -94,6 +94,14 @@ Override config values directly from the CLI:
 
 ### Quick Setup
 
+Source installs build the bundled Rust tokenizer. Install [Rust/rustup](https://rustup.rs/)
+and select the pinned toolchain first (prebuilt wheels and Docker runtime images
+do not need a compiler):
+
+```bash
+rustup toolchain install 1.98.0 --profile minimal
+```
+
 ```bash
 # Install with vLLM
 ./tools/build_conda.sh 1 vllm
@@ -126,10 +134,10 @@ pip install -e ".[fa]"
 ### Training tokenizer
 
 Supported text profiles (`llama3`, `qwen`, `qwen3-thinking`, `minimax-m2`) and
-Kimi-K3 use SMG's Rust tokenizer in-process by default. The repository's Docker
-images build and install the TorchSpec-owned Python bridge automatically;
-training does not need a Rust toolchain. For other environments, see the
-[wheel build instructions](docs/smg-tokenization.md#installation).
+Kimi-K3 use SMG's Rust tokenizer in-process by default. Its native extension ships
+in the TorchSpec wheel, and `pip install -e .` builds it automatically. Source
+builds need Rust 1.98.0; prebuilt wheels and our Docker runtime images do not.
+See [installation details](docs/smg-tokenization.md#installation).
 
 To explicitly use the old tokenizer, set `dataset.rendering_backend: huggingface`
 or pass `dataset.rendering_backend=huggingface` on the CLI. Deferred/decode training,

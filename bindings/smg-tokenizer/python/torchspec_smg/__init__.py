@@ -2,10 +2,10 @@
 
 import json
 
-from smg_tokenizer._native import TOKENIZERS_V1
-from smg_tokenizer._native import Tokenizer as _Tokenizer
+from torchspec_smg._native import BINDING_VERSION, TOKENIZERS_V1
+from torchspec_smg._native import Tokenizer as _Tokenizer
 
-__version__ = "0.1.2"
+__version__ = BINDING_VERSION
 build_features = "tokenizers-v1" if TOKENIZERS_V1 else "default"
 
 

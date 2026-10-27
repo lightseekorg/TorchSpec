@@ -4,6 +4,13 @@ Thank you for your interest in contributing to TorchSpec! This guide will help y
 
 ## Development Setup
 
+Source installs compile the bundled tokenizer. Install [Rust/rustup](https://rustup.rs/)
+and the pinned toolchain before running the environment installer:
+
+```bash
+rustup toolchain install 1.98.0 --profile minimal
+```
+
 1. Clone the repository and create the conda environment:
 
 ```bash
@@ -25,9 +32,9 @@ Or install into your current environment:
 pip install -e ".[dev]"
 ```
 
-3. Outside the repository's Docker images, install the SMG binding using
-   [the setup instructions](docs/smg-tokenization.md#installation). Explicit
-   `dataset.rendering_backend=huggingface` keeps the old tokenizer without Rust.
+3. The native SMG extension is bundled automatically. See
+   [installation details](docs/smg-tokenization.md#installation) for wheel builds
+   and the explicit `dataset.rendering_backend=huggingface` runtime fallback.
 
 4. (Optional) Install Flash Attention for full feature support:
 

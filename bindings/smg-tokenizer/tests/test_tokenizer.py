@@ -1,9 +1,9 @@
 import json
 
 import pytest
-from smg_tokenizer import Tokenizer
 from tokenizers import Tokenizer as HFTokenizer
 from tokenizers import decoders, models, pre_tokenizers, trainers
+from torchspec_smg import Tokenizer
 
 
 @pytest.fixture

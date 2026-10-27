@@ -151,6 +151,7 @@ impl Tokenizer {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Tokenizer>()?;
+    m.add("BINDING_VERSION", env!("CARGO_PKG_VERSION"))?;
     m.add("TOKENIZERS_V1", cfg!(feature = "tokenizers-v1"))?;
     Ok(())
 }

@@ -6,7 +6,6 @@ errors, not a reason to silently fall back to a different tokenizer.
 """
 
 import hashlib
-import importlib.metadata
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -67,14 +66,15 @@ def prepare_checkpoint(source, revision=None):
     from packaging.version import Version
 
     try:
-        version = importlib.metadata.version("smg-tokenizer")
+        from torchspec_smg import __version__ as version
+        from torchspec_smg import build_features
+
         if Version(version) < Version("0.1.2"):
             raise ImportError(f"smg-tokenizer {version} is older than the required 0.1.2")
-        from smg_tokenizer import build_features
     except ImportError as exc:
         raise ImportError(
-            "SMG rendering needs the TorchSpec-owned smg-tokenizer binding >=0.1.2; "
-            "see docs/smg-tokenization.md for the source build command, or set "
+            "SMG rendering needs TorchSpec's bundled native binding >=0.1.2; "
+            "reinstall TorchSpec with its native extension (see docs/smg-tokenization.md), or set "
             "dataset.rendering_backend=huggingface to use the legacy tokenizer"
         ) from exc
 
@@ -144,7 +144,7 @@ class SmgRenderer:
         include_end_token=True,
         render_instant=None,
     ):
-        from smg_tokenizer import Tokenizer
+        from torchspec_smg import Tokenizer
 
         self.template = TEMPLATE_REGISTRY.get(chat_template_name)
         self.header = self.template.assistant_header

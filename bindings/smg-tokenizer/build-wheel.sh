@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Used only in Docker's smg-builder stage; the runtime copies the wheel alone.
+# Used only in Docker's torchspec-builder stage; the runtime installs one TorchSpec wheel.
 set -euo pipefail
 
 apt-get update
@@ -13,7 +13,6 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 export PATH="$CARGO_HOME/bin:$PATH"
 curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/smg-rustup-init.sh
 bash /tmp/smg-rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain "$RUSTUP_TOOLCHAIN"
-python3 -m pip install --no-cache-dir maturin==1.15.0
 
-cd /tmp/smg-tokenizer
-maturin build --release --locked --out /opt/smg-wheels
+cd /tmp/torchspec
+python3 -m pip wheel --no-cache-dir --no-deps . --wheel-dir /opt/torchspec-wheels

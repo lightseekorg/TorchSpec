@@ -2,9 +2,9 @@
 
 TorchSpec calls SMG's Rust `llm-tokenizer` library **inside each Python dataset
 worker** through a small PyO3 extension. Loading, rendering and encoding release
-the GIL. There is no tokenizer server or subprocess. `smg-tokenizer` is the wheel
-containing this bridge, owned and built in this repository; it does not require
-a separately published package or an SMG fork.
+the GIL. The native `torchspec_smg._native` module and its Python wrapper
+ship inside the **TorchSpec wheel**. There is no separate tokenizer distribution,
+server or subprocess, and no SMG fork is needed.
 
 SMG owns chat formatting and encoding. TorchSpec owns assistant supervision,
 last-turn selection and truncation. Rendering always consumes a complete
@@ -43,27 +43,39 @@ boundaries and discarded supervised reasoning/tool calls are rejected.
 
 ## Installation
 
-The repository's vLLM, SGLang and TensorRT-LLM Dockerfiles build the wheel in a
-separate stage using the **same base image and target architecture**, then install
-it into the final image. Rust, Cargo and maturin are build dependencies only.
-Each worker image includes the extension; training needs no Rust installation.
-The image build verifies that Python can load the compiled extension.
-
-Outside these images, build once for the Python environment/OS/architecture:
+Install from this checkout with the normal command:
 
 ```bash
-python -m pip install 'maturin==1.15.0'
-rustup toolchain install 1.98.0 --profile minimal
-RUSTUP_TOOLCHAIN=1.98.0 maturin build --release --locked \
-  --manifest-path bindings/smg-tokenizer/Cargo.toml --out wheelhouse
-python -m pip install --no-deps wheelhouse/smg_tokenizer-*.whl
+rustup toolchain install 1.98.0 --profile minimal  # source builds only
+python -m pip install -e .
 ```
 
-The bridge pins upstream SMG at `df17c6c24b7be9e6eae50d23373f5d459e7f722b`;
-`Cargo.lock` pins transitive dependencies. The wheel is not published to PyPI.
-HF fallback does not import it. The optional `--features tokenizers-v1` build
-selects accelerated encoders; `Tokenizer.encode_path` and `build_features` expose
-the actual selection. K3 uses tiktoken regardless of this feature. Generic offset
+The declared setuptools-rust build dependency compiles the extension automatically
+in release mode. Both editable installs and normal wheels include it; no second
+`smg-tokenizer` installation is needed. Source builds require Rust 1.98.0 and a
+C/C++ toolchain. Installing a prebuilt TorchSpec wheel needs neither. The existing
+HF runtime fallback remains available; it does not disable native compilation
+when building TorchSpec from source.
+
+The vLLM, SGLang and TensorRT-LLM Dockerfiles build this same **TorchSpec wheel**
+in a separate stage using the same base image/architecture, then install it and
+resolve Python dependencies in the runtime image. The compiler stays in the build
+stage. The checkout remains in `/root/torchspec` for configs/tools and Python development.
+The native package uses a separate source directory so the checkout does not
+shadow the installed extension.
+
+To produce a wheel and source archive:
+
+```bash
+python -m pip install build
+python -m build --outdir wheelhouse
+```
+
+`Cargo.toml` pins SMG at `df17c6c24b7be9e6eae50d23373f5d459e7f722b`, and builds
+use `Cargo.lock` with `--locked`. The source archive includes the Rust sources,
+manifest, lockfile and toolchain declaration. Set `TORCHSPEC_SMG_FEATURES=tokenizers-v1`
+at build time for accelerated encoders. `Tokenizer.encode_path` and `build_features`
+expose the actual selection; K3 uses tiktoken in either build. Generic offset
 validation performs an extra reference encode, so encoder speedups do not imply
 the same end-to-end training speedup.
 

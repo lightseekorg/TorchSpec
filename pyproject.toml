@@ -1,10 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77", "wheel", "setuptools-rust==1.13.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchspec"
-dynamic = ["version", "description"]
+dynamic = ["version"]
+description = "Torch-native speculative decoding training"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -30,8 +31,16 @@ dependencies = [
     "numba",
 ]
 
-[tool.setuptools]
-packages = ["torchspec"]
+[tool.setuptools.package-dir]
+torchspec_smg = "bindings/smg-tokenizer/python/torchspec_smg"
+
+[tool.setuptools.packages.find]
+where = [".", "bindings/smg-tokenizer/python"]
+include = ["torchspec*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+torchspec = ["config/*.json"]
 
 [project.optional-dependencies]
 dev = [
@@ -61,7 +70,6 @@ megatron = [
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
-description = {file = "README.md"}
 
 [tool.ruff]
 line-length = 100

@@ -5,7 +5,7 @@ from torchspec.data.renderers.kimi_k3 import K3Renderer
 
 class _K3Tokenizer:
     def __init__(self, source):
-        from smg_tokenizer import Tokenizer
+        from torchspec_smg import Tokenizer
 
         self.native = Tokenizer(source)
         self.special_tokens = {

@@ -26,20 +26,19 @@ jobs:
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       - name: Install reference and CPU dependencies
         run: |
-          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --system -e '.[dev]' maturin -r tools/qualification/tokenizer-requirements.txt
           rustup toolchain install 1.98.0 --profile minimal
-      - name: Build TorchSpec-owned SMG binding
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system build
+      - name: Build and install TorchSpec with its native extension
         env:
           RUSTUP_TOOLCHAIN: '1.98.0'
           ENCODE_PATH: ${{ matrix.encode_path }}
         run: |
-          features=()
-          if [[ "$ENCODE_PATH" == v1 ]]; then features=(--features tokenizers-v1); fi
-          maturin build --release --locked "${features[@]}" \
-            --manifest-path bindings/smg-tokenizer/Cargo.toml --out wheelhouse
-          uv pip install --system wheelhouse/smg_tokenizer-*.whl
-      - name: Test standalone binding
+          if [[ "$ENCODE_PATH" == v1 ]]; then export TORCHSPEC_SMG_FEATURES=tokenizers-v1; fi
+          python -m build --outdir wheelhouse
+          uv pip install --system wheelhouse/torchspec-*.whl pytest -r tools/qualification/tokenizer-requirements.txt
+          python -I -c "import torchspec, torchspec_smg, torchspec_smg._native"
+      - name: Test bundled binding
         run: python -m pytest -q bindings/smg-tokenizer/tests
       - name: Require exact rendering, IDs, masks and encoder selection
         env:

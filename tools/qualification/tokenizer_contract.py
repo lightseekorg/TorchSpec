@@ -61,10 +61,12 @@ def main():
     }
     files = ["tests/tokenizer_contract/test_reference.py"]
     if args.backend == "smg":
-        from smg_tokenizer import Tokenizer, build_features
+        from torchspec_smg import Tokenizer, build_features
 
         info.update(build_features=build_features, required_encode_path=args.encode_path)
-        info["versions"]["smg-tokenizer"] = importlib.metadata.version("smg-tokenizer")
+        from torchspec_smg import __version__
+
+        info["versions"]["torchspec-smg-binding"] = __version__
         info["actual_encode_paths"] = {
             name: Tokenizer(resolve_checkpoint(name)).encode_path for name in manifest["profiles"]
         }

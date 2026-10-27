@@ -129,6 +129,7 @@ jobs:
 
       - name: Install CPU torch + dev deps + report tooling
         run: |
+          rustup toolchain install 1.98.0 --profile minimal
           uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system -e ".[dev]" pytest-html
 

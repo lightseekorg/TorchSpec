@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from smg_tokenizer import Tokenizer
+from torchspec_smg import Tokenizer
 
 from tests.tokenizer_contract.support import expected_mask, load_cases, load_manifest
 from torchspec.data.renderers.smg import SmgRenderer
