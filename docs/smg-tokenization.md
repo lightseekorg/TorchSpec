@@ -177,26 +177,34 @@ reproduce a prior multi-node training job or qualify media/queue/RDMA paths.
 The loss, accuracy and trajectory acceptance thresholds match the Qwen gate;
 `--smoke` never qualifies convergence.
 
-Historical legacy-equivalence measurement (explicit-null policy, superseded):
-on 2026-10-26 with the pinned checkpoint and a 320-row subset of the
-existing K3 training corpus: both arms completed 1,000 steps, with identical
-per-step metrics, all 11 evaluations, and byte-identical trainable checkpoints.
-Held-out loss fell from 14.5035 to 5.0557; depth-0 accuracy rose from 0% to 44.03%;
-early/late-100 mean training loss fell from 8.6286 to 1.3983. The one-layer draft
-had 425,772,032 trainable parameters; target embedding/head were frozen. Real
-targets were extracted with TP8/PP2 on 16 GB200 GPUs, then both training arms ran
-on one GB200 using PyTorch 2.14.1+cu130. Final checkpoint SHA256:
-`bd523ce828b54f34f1c415416369812f4b8675753d433c4906d67bb699674c37`.
+Measured with the corrected checkpoint-default policy on 2026-10-26: both arms
+completed 1,000 steps, with identical per-step metrics, all 11 evaluations, and
+byte-identical trainable checkpoints. Held-out loss fell from 14.5081 to 4.8653;
+depth-0 accuracy rose from 0% to 44.69%; early/late-100 mean training loss fell
+from 8.6183 to 1.2917. The SMG arm exercised `rendering_backend: auto`; the HF
+arm explicitly selected `huggingface`. Training source was
+`dd8d12e2af6dba3626c3cd0c0923ce614d740e3e` with smg-tokenizer 0.1.2.
 
-That old-policy real-checkpoint tokenizer gate passed 126 cases, two required rejections,
-14,802 truncation comparisons and 15 long-segment checks on macOS and
-Linux/aarch64, including one/two-worker dataset loading and cache reloads.
-`tests/tokenizer_contract/fixtures/k3_policy.json` freezes the expected token/mask
-digests so a shared change to legacy and SMG masking cannot silently redefine
-the policy. The corrected absent-effort entries reuse the independently frozen
-explicit-max expectations. The gate additionally compares IDs directly against
-the checkpoint API without either TorchSpec adapter. The historical convergence
-result establishes old-path equivalence, not correct generation-prompt alignment.
+Fresh targets were extracted with TP8/PP2 on 16 GB200 GPUs (job 31224), then both
+training arms ran on one GB200 with PyTorch 2.14.1+cu130 (job 31225). Both jobs
+completed with exit 0. All 320 source-row hashes matched the original corpus.
+The one-layer draft had 425,772,032 trainable parameters with frozen K3 embedding
+and head weights. Final checkpoint SHA256:
+`5a810a64d7eda1e03d26e16e99265b8ccbab38c633139e6ac1c437d82d65ee26`.
+
+The corrected real-checkpoint gate passed 126 cases, two required rejections,
+16,544 truncation comparisons and 15 long-segment checks on macOS (default and
+v1 binding builds) and Linux/aarch64 (v1), including one/two-worker dataset
+loading and cache reloads. `tests/tokenizer_contract/fixtures/k3_policy.json`
+freezes expected token/mask digests; corrected absent-effort entries reuse the
+previously frozen explicit-max expectations. The gate also compares IDs directly
+against the checkpoint API without either TorchSpec adapter.
+
+The earlier explicit-null experiment also converged with exact backend parity
+(checkpoint SHA256 `bd523ce828b54f34f1c415416369812f4b8675753d433c4906d67bb699674c37`).
+It establishes legacy equivalence only and is superseded by the corrected-policy
+run above. Convergence and backend agreement alone cannot establish faithful
+reconstruction of the original generation prompt.
 
 ## Supervision and compatibility
 
