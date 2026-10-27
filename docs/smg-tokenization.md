@@ -184,6 +184,51 @@ more. It does not redefine this convention as ordinary next-token SFT labels.
 It bypasses FSDP setup and queue/RDMA transport. It does not qualify pretrained
 model numerics, vLLM/SGLang, multimodal expansion or distributed execution.
 
+### Required 1,000-step convergence qualification
+
+Tokenizer/unit gates are prerequisites. The training acceptance gate is
+`tools/qualification/train_tokenizer_convergence.py`: **1,000 optimizer steps
+per backend**, using pretrained Qwen3-0.6B and a pinned UltraChat train/test
+split. It initializes a real one-layer Eagle3 draft through `Eagle3Trainer` and
+uses TorchSpec's `BF16Optimizer` in single-rank REPLICATE mode. The target's
+embedding/head are loaded and frozen; the remaining draft parameters train.
+
+```bash
+PYTHONPATH=. python tools/qualification/download_convergence_assets.py --output /path/to/assets
+PYTHONPATH=. python tools/qualification/train_tokenizer_convergence.py \
+  --assets /path/to/assets --output /path/to/new-run
+```
+
+Defaults: 256 unique training prompts, 64 disjoint held-out prompts, length 512,
+batch size 2, two Eagle3 depths, seed 42, learning rate 1e-4, cosine decay and
+15 warmup steps. Each sample uses the first user/assistant pair from UltraChat;
+short supervision, oversized sources and unsupported literal markers are
+counted and excluded before comparing backends. Selected raw conversations and
+all artifact/token/mask hashes are retained.
+
+The HF control uses the checkpoint renderer and an independently specified
+single-turn assistant-body mask with the same explicit end-marker policy. It
+does not claim equivalence to the legacy parser. The SMG arm uses the actual
+dataset loader with spawned workers. Any token/mask mismatch aborts before
+training. Exact-ID parity permits both arms to reuse the same real HFRunner
+hidden-state cache; hooks check IDs consumed by the pretrained target.
+
+Both arms use identical initialization and sample order. Passing requires:
+
+- Exactly 1,000 steps each, with finite loss and gradient norm at every step.
+- At least 10% reduction in held-out loss and in late-100 versus early-100
+  training loss, plus at least one percentage point of held-out depth-0 token
+  accuracy improvement, for each arm.
+- At most 1% relative difference between the two per-step loss trajectories.
+
+Criteria are recorded before training. Every step is logged; held-out evaluation
+runs at step 0 and every 100 steps. A short `--smoke --steps 2` debug run is never
+marked convergence-qualified. Checkpoints contain trainable draft parameters,
+configuration and the pinned target reference for the frozen weights.
+Teacher-forced accuracy and simulated acceptance length are diagnostic proxies,
+not measurements from a live speculative-decoding server. Queue/RDMA and
+multi-rank qualification remain separate.
+
 ### Performance measurements
 
 ```bash
