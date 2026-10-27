@@ -54,7 +54,7 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
 # flex_attention instead.
 # Only the compiled extension is needed at runtime; no Rust toolchain.
 COPY --from=smg-builder /opt/smg-wheels/ /tmp/smg-wheels/
-RUN python3 -m pip install --no-cache-dir --no-deps /tmp/smg-wheels/*.whl && \
+RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/smg-wheels/*.whl && \
     python3 -c "from smg_tokenizer import Tokenizer, build_features; assert build_features == 'default'" && \
     rm -rf /tmp/smg-wheels
 
