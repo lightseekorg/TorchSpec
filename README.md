@@ -32,6 +32,7 @@ Draft models trained with TorchSpec, available from other organizations:
 
 ## 🚀 Blogs and Announcements
 
+- TorchSpec now integrates [SMG](https://github.com/smg-project/smg) for chat templating and tokenization in supported text training paths. (Oct 2026)
 - 🔥 [TorchSpec: Speculative Decoding Training at Scale](https://www.youtube.com/watch?v=M7fbxwBSIeI) (Youtube Video, Ray Summit 2026)
 - [Releasing Kimi K3 Draft Collection: Efficient Draft Training in TorchSpec](https://lightseek.org/blog/kimi-k3-draft-collection.html) (Sep 2026)
 - [EAGLE 3.1: Advancing Speculative Decoding Through Collaboration Between the EAGLE Team, vLLM, and TorchSpec](https://lightseek.org/blog/eagle-3-1.html) (May 2026)
