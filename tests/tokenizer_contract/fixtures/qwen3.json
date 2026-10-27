@@ -1,0 +1,897 @@
+[
+  {
+    "name": "ascii",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer one."
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|im_start|>system\nSystem.<|im_end|>\n<|im_start|>user\nQuestion?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer one.<|im_end|>\n",
+    "input_ids": [
+      151644,
+      8948,
+      198,
+      2320,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      14582,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      16141,
+      825,
+      13,
+      151645,
+      198
+    ],
+    "assistant_annotations": [
+      {
+        "body": "<think>\n\n</think>\n\nAnswer one.",
+        "end": "<|im_end|>",
+        "byte_span": [
+          96,
+          126,
+          136
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "with_end": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24
+        ]
+      }
+    ]
+  },
+  {
+    "name": "unicode",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "你好 café 🧠 é ‍\tend"
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|im_start|>system\nSystem.<|im_end|>\n<|im_start|>user\nQuestion?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n你好 café 🧠 é ‍\tend<|im_end|>\n",
+    "input_ids": [
+      151644,
+      8948,
+      198,
+      2320,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      14582,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      108386,
+      51950,
+      11162,
+      100,
+      254,
+      3958,
+      636,
+      235,
+      6246,
+      151645,
+      198
+    ],
+    "assistant_annotations": [
+      {
+        "body": "<think>\n\n</think>\n\n你好 café 🧠 é ‍\tend",
+        "end": "<|im_end|>",
+        "byte_span": [
+          96,
+          144,
+          154
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29
+        ],
+        "with_end": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30
+        ]
+      }
+    ]
+  },
+  {
+    "name": "whitespace",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "\n\nAnswer one.\n"
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|im_start|>system\nSystem.<|im_end|>\n<|im_start|>user\nQuestion?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer one.\n<|im_end|>\n",
+    "input_ids": [
+      151644,
+      8948,
+      198,
+      2320,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      14582,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      16141,
+      825,
+      624,
+      151645,
+      198
+    ],
+    "assistant_annotations": [
+      {
+        "body": "<think>\n\n</think>\n\nAnswer one.\n",
+        "end": "<|im_end|>",
+        "byte_span": [
+          96,
+          127,
+          137
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "with_end": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24
+        ]
+      }
+    ]
+  },
+  {
+    "name": "empty",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": ""
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|im_start|>system\nSystem.<|im_end|>\n<|im_start|>user\nQuestion?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<|im_end|>\n",
+    "input_ids": [
+      151644,
+      8948,
+      198,
+      2320,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      14582,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      151645,
+      198
+    ],
+    "assistant_annotations": [
+      {
+        "body": "<think>\n\n</think>\n\n",
+        "end": "<|im_end|>",
+        "byte_span": [
+          96,
+          115,
+          125
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          17,
+          18,
+          19,
+          20
+        ],
+        "with_end": [
+          17,
+          18,
+          19,
+          20,
+          21
+        ]
+      }
+    ]
+  },
+  {
+    "name": "multi_turn",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer one."
+      },
+      {
+        "role": "user",
+        "content": "Second question?"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer two."
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|im_start|>system\nSystem.<|im_end|>\n<|im_start|>user\nQuestion?<|im_end|>\n<|im_start|>assistant\nAnswer one.<|im_end|>\n<|im_start|>user\nSecond question?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nAnswer two.<|im_end|>\n",
+    "input_ids": [
+      151644,
+      8948,
+      198,
+      2320,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      14582,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      16141,
+      825,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      15666,
+      3405,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      16141,
+      1378,
+      13,
+      151645,
+      198
+    ],
+    "assistant_annotations": [
+      {
+        "body": "Answer one.",
+        "end": "<|im_end|>",
+        "byte_span": [
+          96,
+          107,
+          117
+        ]
+      },
+      {
+        "body": "<think>\n\n</think>\n\nAnswer two.",
+        "end": "<|im_end|>",
+        "byte_span": [
+          184,
+          214,
+          224
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          17,
+          18,
+          19
+        ],
+        "with_end": [
+          17,
+          18,
+          19,
+          20
+        ]
+      },
+      {
+        "body": [
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39
+        ],
+        "with_end": [
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40
+        ]
+      }
+    ]
+  },
+  {
+    "name": "reasoning",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "reasoning_content": "Reason one.",
+        "content": "Answer one."
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|im_start|>system\nSystem.<|im_end|>\n<|im_start|>user\nQuestion?<|im_end|>\n<|im_start|>assistant\n<think>\nReason one.\n</think>\n\nAnswer one.<|im_end|>\n",
+    "input_ids": [
+      151644,
+      8948,
+      198,
+      2320,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      14582,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      198,
+      25139,
+      825,
+      624,
+      151668,
+      271,
+      16141,
+      825,
+      13,
+      151645,
+      198
+    ],
+    "assistant_annotations": [
+      {
+        "body": "<think>\nReason one.\n</think>\n\nAnswer one.",
+        "end": "<|im_end|>",
+        "byte_span": [
+          96,
+          137,
+          147
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ],
+        "with_end": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27
+        ]
+      }
+    ]
+  },
+  {
+    "name": "tools",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call1",
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call1",
+        "name": "weather",
+        "content": "sunny"
+      },
+      {
+        "role": "assistant",
+        "content": "It is sunny."
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|im_start|>system\nSystem.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nQuestion?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"北京\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nIt is sunny.<|im_end|>\n",
+    "input_ids": [
+      151644,
+      8948,
+      198,
+      2320,
+      382,
+      2,
+      13852,
+      271,
+      2610,
+      1231,
+      1618,
+      825,
+      476,
+      803,
+      5746,
+      311,
+      7789,
+      448,
+      279,
+      1196,
+      3239,
+      382,
+      2610,
+      525,
+      3897,
+      448,
+      729,
+      32628,
+      2878,
+      366,
+      15918,
+      1472,
+      15918,
+      29,
+      11874,
+      9492,
+      510,
+      27,
+      15918,
+      397,
+      4913,
+      1313,
+      788,
+      330,
+      1688,
+      497,
+      330,
+      1688,
+      788,
+      5212,
+      606,
+      788,
+      330,
+      15206,
+      497,
+      330,
+      13786,
+      788,
+      5212,
+      1313,
+      788,
+      330,
+      1700,
+      497,
+      330,
+      13193,
+      788,
+      5212,
+      8926,
+      788,
+      5212,
+      1313,
+      788,
+      330,
+      917,
+      30975,
+      3417,
+      532,
+      522,
+      15918,
+      1339,
+      2461,
+      1817,
+      729,
+      1618,
+      11,
+      470,
+      264,
+      2951,
+      1633,
+      448,
+      729,
+      829,
+      323,
+      5977,
+      2878,
+      220,
+      151657,
+      151658,
+      11874,
+      9492,
+      510,
+      151657,
+      198,
+      4913,
+      606,
+      788,
+      366,
+      1688,
+      11494,
+      8066,
+      330,
+      16370,
+      788,
+      366,
+      2116,
+      56080,
+      40432,
+      31296,
+      151658,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      14582,
+      30,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151657,
+      198,
+      4913,
+      606,
+      788,
+      330,
+      15206,
+      497,
+      330,
+      16370,
+      788,
+      5212,
+      8926,
+      788,
+      330,
+      68990,
+      95642,
+      151658,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      151665,
+      198,
+      82,
+      27297,
+      198,
+      151666,
+      151645,
+      198,
+      151644,
+      77091,
+      198,
+      151667,
+      271,
+      151668,
+      271,
+      2132,
+      374,
+      39698,
+      13,
+      151645,
+      198
+    ],
+    "assistant_annotations": [
+      {
+        "body": "<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"北京\"}}\n</tool_call>",
+        "end": "<|im_end|>",
+        "byte_span": [
+          601,
+          678,
+          688
+        ]
+      },
+      {
+        "body": "<think>\n\n</think>\n\nIt is sunny.",
+        "end": "<|im_end|>",
+        "byte_span": [
+          777,
+          808,
+          818
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          132,
+          133,
+          134,
+          135,
+          136,
+          137,
+          138,
+          139,
+          140,
+          141,
+          142,
+          143,
+          144,
+          145,
+          146,
+          147,
+          148,
+          149
+        ],
+        "with_end": [
+          132,
+          133,
+          134,
+          135,
+          136,
+          137,
+          138,
+          139,
+          140,
+          141,
+          142,
+          143,
+          144,
+          145,
+          146,
+          147,
+          148,
+          149,
+          150
+        ]
+      },
+      {
+        "body": [
+          166,
+          167,
+          168,
+          169,
+          170,
+          171,
+          172,
+          173
+        ],
+        "with_end": [
+          166,
+          167,
+          168,
+          169,
+          170,
+          171,
+          172,
+          173,
+          174
+        ]
+      }
+    ]
+  }
+]

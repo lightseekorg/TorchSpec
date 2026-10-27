@@ -138,7 +138,7 @@ def _cross_validate(template_name, messages, last_turn_only=False):
     gt_mask_list = gt_mask.squeeze().tolist()
 
     if sum(gt_mask_list) == 0:
-        pytest.skip(
+        pytest.fail(
             f"Parser produced all-zero mask for '{template_name}' — "
             f"template header may not match tokenizer's chat template"
         )

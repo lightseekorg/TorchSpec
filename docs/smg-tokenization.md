@@ -72,7 +72,10 @@ silently lose separately supplied reasoning or tool calls.
 HF byte offsets map spans onto the **complete** token stream, including Unicode.
 Tokens crossing a supervision boundary are conservatively masked out. End-of-turn
 tokens are included by default; set `smg_include_end_token: false` to exclude
-them. Last-turn selection happens before synchronized right truncation. SMG
+them. This supervises the end marker itself, never the following formatting
+newline. The `text-spans-v2-eot-marker-only` cache version invalidates masks
+from the initial prototype, which included that newline for Qwen but not
+MiniMax. Last-turn selection happens before synchronized right truncation. SMG
 rows always carry `packed_loss_mask`; they are not re-masked by the trainer.
 
 The exact-mask policy is explicit and can differ from the legacy parser's
@@ -95,6 +98,90 @@ TorchSpec supervision definition. These cases fail rather than falling back.
 
 ## Validation and performance
 
+### Required correctness gate
+
+`tests/tokenizer_contract/fixtures/manifest.json` pins the exact model revisions,
+tokenizer/template artifact SHA256s, reference library versions, required case
+inventory and fixture digests. Initial profiles are Qwen3-0.6B, the NousResearch
+Llama-3-8B-Instruct checkpoint, and MiniMax-M2.5. These are exact checkpoints;
+passing one does not qualify its entire model family.
+
+Every accepted fixture contains checkpoint-rendered bytes and reference IDs,
+plus explicitly authored assistant bodies, byte annotations and frozen token
+positions for both end-marker policies. The oracle does not import the SMG
+renderer, TorchSpec template registry or production loss-mask implementation.
+Llama's unsupported reasoning/tool cases are required rejection tests.
+Empty bodies can intentionally have zero loss when end-marker loss is disabled.
+
+From the repository root, in an environment with TorchSpec and the binding:
+
+```bash
+python -m pip install -r tools/qualification/tokenizer-requirements.txt
+PYTHONPATH=. python tools/qualification/tokenizer_contract.py \
+  --backend smg --encode-path v1 --report tokenizer-contract.json
+```
+
+The runner fails on skipped, xfailed or deselected tests, missing assets, hash
+mismatches, or encoder fallback. It downloads only pinned tokenizer assets;
+model weights are unnecessary. To use existing local snapshots, set
+`TORCHSPEC_TOKENIZER_PATHS` to a JSON file mapping each manifest model ID to its
+directory. All listed artifacts are still verified, and an incomplete mapping
+fails. `--backend hf` runs the independent reference/annotation gate without
+requiring the extension; it does not qualify SMG.
+
+For a binding built without the v1 feature, use `--encode-path default`. This
+requires the manifest's explicit paths: native for Qwen/MiniMax and `tokenizers`
+for this Llama checkpoint. It does not assume every model uses the native path.
+
+Coverage includes exact renders and IDs, masks at every truncation position,
+last-turn selection before truncation, rejected delimiter injection, JSON tool
+arguments, packed-mask/padding roundtrips, fresh/warm encoders, concurrent calls,
+and deterministic Unicode differential fuzzing. Raw fuzzing checks IDs only;
+reviewed conversation fixtures establish supervision semantics.
+
+The existing on-demand CPU workflow requires the pinned HF gate. The separate
+`SMG tokenizer contract` workflow builds the companion binding at an explicitly
+provided immutable SMG commit and requires both default-build and v1 gates. Until that companion
+commit is accessible on GitHub, run the full gate in the development environment.
+Making a check branch-protection-required is a repository setting, not established
+by this source change.
+
+Fixture changes are intentional specification changes. Record candidates with:
+
+```bash
+PYTHONPATH=. python tools/qualification/record_tokenizer_candidates.py \
+  --paths model-paths.json --output /tmp/tokenizer-candidates-new
+```
+
+The recorder refuses to overwrite the reviewed fixture directory. Review the
+rendered bytes, authored bodies, token positions and dependency/revision changes
+before copying candidate files. Do not regenerate expectations to accommodate an
+unexplained backend mismatch. SMG's Bellwether is the wider rendering/encoding
+conformance suite; these fixtures add TorchSpec-specific training semantics and
+do not claim to replace or run Bellwether's entire corpus.
+
+### Actual training alignment smoke
+
+In a CUDA environment with TorchSpec's HFRunner dependencies installed:
+
+```bash
+PYTHONPATH=. python tools/qualification/check_training_alignment.py \
+  --report training-alignment.json
+```
+
+This executes real HFRunner inference, mask resolution, padding, and
+Eagle3Trainer forward/backward using tiny random target/draft networks and full
+checkpoint token vocabularies. Hooks inspect actual target/draft embedding
+inputs, returned hidden states, supervision masks and three speculative depths.
+The smoke freezes the existing Eagle3 convention: initial draft inputs and
+target hidden states shift left once, while the initial loss mask stays in its
+original coordinates; each subsequent depth shifts the inputs and mask once
+more. It does not redefine this convention as ordinary next-token SFT labels.
+It bypasses FSDP setup and queue/RDMA transport. It does not qualify pretrained
+model numerics, vLLM/SGLang, multimodal expansion or distributed execution.
+
+### Performance measurements
+
 ```bash
 PYTHONPATH=. pytest -q tests/test_smg_renderer.py tests/test_renderer_registry.py tests/test_kimi_k3_renderer.py
 TOKENIZERS_PARALLELISM=false RAYON_NUM_THREADS=1 PYTHONPATH=. \
@@ -103,7 +190,9 @@ TOKENIZERS_PARALLELISM=false RAYON_NUM_THREADS=1 PYTHONPATH=. \
 
 `models.json` is a list of `{ "name": "model label", "path": "/pinned/local/snapshot",
 "chat_template": "qwen3-thinking" }`. Omit `--gigatoken` when it is not installed.
-The harness verifies exact IDs and masks before timing 2K/50K English/CJK cases.
+The harness compares IDs and masks before timing 2K/50K English/CJK cases.
+Its HF comparison shares the supervision algorithm, so mask agreement there is
+only a consistency check. Use the independent correctness gate above first.
 It reports actual backend selection, environment, individual samples and medians.
 Its synthetic repeated vocabulary warms word caches; it does not predict cold,
 unique-corpus throughput or GPU training throughput.

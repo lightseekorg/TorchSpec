@@ -106,7 +106,7 @@ def _strings(value):
 
 
 class SmgRenderer:
-    CACHE_VERSION = "text-spans-v1"
+    CACHE_VERSION = "text-spans-v2-eot-marker-only"
 
     def __init__(
         self,
@@ -220,7 +220,13 @@ class SmgRenderer:
             for delimiter in (self.header, self.template.user_header):
                 if delimiter and text.find(delimiter, body, end) >= 0:
                     raise ValueError("SMG assistant span crosses a role boundary")
-            spans.append((body, end + len(self.end) if self.include_end_token else end))
+            # Registry delimiters sometimes include a formatting newline
+            # (Qwen), sometimes only the marker (MiniMax). End-token loss has
+            # one meaning across profiles: supervise the marker itself, not
+            # the newline separating it from the next role.
+            spans.append(
+                (body, end + len(self.end.rstrip("\n")) if self.include_end_token else end)
+            )
             cursor = end + len(self.end)
         if len(spans) != expected:
             raise ValueError(

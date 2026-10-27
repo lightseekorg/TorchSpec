@@ -150,6 +150,7 @@ jobs:
         #     test_build_eagle3_block_mask, test_flex_attention
         run: |
           pytest tests/ -q -p no:cacheprovider \
+            --ignore=tests/tokenizer_contract \
             --ignore=tests/test_placement_group.py \
             --ignore=tests/test_vllm_engine.py \
             --ignore=tests/test_sgl_engine_factory.py \
@@ -167,6 +168,12 @@ jobs:
             --junit-xml=junit-main.xml \
             --html=report-main.html --self-contained-html
 
+      - name: Required pinned tokenizer reference contract
+        run: |
+          uv pip install --system -r tools/qualification/tokenizer-requirements.txt
+          PYTHONPATH=. python tools/qualification/tokenizer_contract.py \
+            --backend hf --report tokenizer-contract.json
+
       - name: Run import-isolating tests in their own process
         if: always()
         run: |
@@ -182,6 +189,7 @@ jobs:
           path: |
             report-*.html
             junit-*.xml
+            tokenizer-contract.json
 
   report:
     name: Publish results

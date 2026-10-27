@@ -1,0 +1,575 @@
+[
+  {
+    "name": "ascii",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer one."
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nQuestion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nAnswer one.<|eot_id|>",
+    "input_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      2374,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      14924,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      16533,
+      832,
+      13,
+      128009
+    ],
+    "assistant_annotations": [
+      {
+        "body": "Answer one.",
+        "end": "<|eot_id|>",
+        "byte_span": [
+          186,
+          197,
+          207
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          19,
+          20,
+          21
+        ],
+        "with_end": [
+          19,
+          20,
+          21,
+          22
+        ]
+      }
+    ]
+  },
+  {
+    "name": "unicode",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "你好 café 🧠 é ‍\tend"
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nQuestion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n你好 café 🧠 é ‍\tend<|eot_id|>",
+    "input_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      2374,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      14924,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      57668,
+      53901,
+      53050,
+      11410,
+      100,
+      254,
+      384,
+      54939,
+      639,
+      235,
+      6379,
+      128009
+    ],
+    "assistant_annotations": [
+      {
+        "body": "你好 café 🧠 é ‍\tend",
+        "end": "<|eot_id|>",
+        "byte_span": [
+          186,
+          215,
+          225
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29
+        ],
+        "with_end": [
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30
+        ]
+      }
+    ]
+  },
+  {
+    "name": "whitespace",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "\n\nAnswer one.\n"
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nQuestion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nAnswer one.<|eot_id|>",
+    "input_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      2374,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      14924,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      16533,
+      832,
+      13,
+      128009
+    ],
+    "assistant_annotations": [
+      {
+        "body": "Answer one.",
+        "end": "<|eot_id|>",
+        "byte_span": [
+          186,
+          197,
+          207
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          19,
+          20,
+          21
+        ],
+        "with_end": [
+          19,
+          20,
+          21,
+          22
+        ]
+      }
+    ]
+  },
+  {
+    "name": "empty",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": ""
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nQuestion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n<|eot_id|>",
+    "input_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      2374,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      14924,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      128009
+    ],
+    "assistant_annotations": [
+      {
+        "body": "",
+        "end": "<|eot_id|>",
+        "byte_span": [
+          186,
+          186,
+          196
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [],
+        "with_end": [
+          19
+        ]
+      }
+    ]
+  },
+  {
+    "name": "multi_turn",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer one."
+      },
+      {
+        "role": "user",
+        "content": "Second question?"
+      },
+      {
+        "role": "assistant",
+        "content": "Answer two."
+      }
+    ],
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nQuestion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nAnswer one.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSecond question?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nAnswer two.<|eot_id|>",
+    "input_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      2374,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      14924,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      16533,
+      832,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      16041,
+      3488,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      16533,
+      1403,
+      13,
+      128009
+    ],
+    "assistant_annotations": [
+      {
+        "body": "Answer one.",
+        "end": "<|eot_id|>",
+        "byte_span": [
+          186,
+          197,
+          207
+        ]
+      },
+      {
+        "body": "Answer two.",
+        "end": "<|eot_id|>",
+        "byte_span": [
+          322,
+          333,
+          343
+        ]
+      }
+    ],
+    "assistant_tokens": [
+      {
+        "body": [
+          19,
+          20,
+          21
+        ],
+        "with_end": [
+          19,
+          20,
+          21,
+          22
+        ]
+      },
+      {
+        "body": [
+          35,
+          36,
+          37
+        ],
+        "with_end": [
+          35,
+          36,
+          37,
+          38
+        ]
+      }
+    ]
+  },
+  {
+    "name": "reasoning",
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "reasoning_content": "Reason one.",
+        "content": "Answer one."
+      }
+    ],
+    "reject": "dropped supervised reasoning",
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nQuestion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nAnswer one.<|eot_id|>",
+    "input_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      2374,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      14924,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      16533,
+      832,
+      13,
+      128009
+    ]
+  },
+  {
+    "name": "tools",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "weather",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "messages": [
+      {
+        "role": "system",
+        "content": "System."
+      },
+      {
+        "role": "user",
+        "content": "Question?"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call1",
+            "type": "function",
+            "function": {
+              "name": "weather",
+              "arguments": {
+                "city": "北京"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call1",
+        "name": "weather",
+        "content": "sunny"
+      },
+      {
+        "role": "assistant",
+        "content": "It is sunny."
+      }
+    ],
+    "reject": "dropped a tool call",
+    "template_kwargs": {
+      "preserve_thinking": true,
+      "enable_thinking": true
+    },
+    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nSystem.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nQuestion?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n<|eot_id|><|start_header_id|>tool<|end_header_id|>\n\nsunny<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nIt is sunny.<|eot_id|>",
+    "input_ids": [
+      128000,
+      128006,
+      9125,
+      128007,
+      271,
+      2374,
+      13,
+      128009,
+      128006,
+      882,
+      128007,
+      271,
+      14924,
+      30,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      128009,
+      128006,
+      14506,
+      128007,
+      271,
+      82,
+      28397,
+      128009,
+      128006,
+      78191,
+      128007,
+      271,
+      2181,
+      374,
+      40798,
+      13,
+      128009
+    ]
+  }
+]

@@ -1,0 +1,73 @@
+name: SMG tokenizer contract
+
+# Companion binding is not published yet. Require an immutable commit that
+# contains bindings/tokenizer-python; no implicit latest-main dependency.
+on:
+  workflow_dispatch:
+    inputs:
+      smg_repository:
+        description: Repository containing the standalone SMG tokenizer binding
+        default: smg-project/smg
+        required: true
+      smg_revision:
+        description: Full 40-character commit SHA containing the binding
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        encode_path: [default, v1]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - name: Require immutable SMG source
+        env:
+          SMG_REVISION: ${{ inputs.smg_revision }}
+        run: '[[ "$SMG_REVISION" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ${{ inputs.smg_repository }}
+          ref: ${{ inputs.smg_revision }}
+          path: smg-source
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - name: Install reference and CPU dependencies
+        run: |
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system -e '.[dev]' maturin -r tools/qualification/tokenizer-requirements.txt
+          rustup toolchain install 1.98.0 --profile minimal
+      - name: Build pinned SMG binding
+        env:
+          RUSTUP_TOOLCHAIN: '1.98.0'
+          ENCODE_PATH: ${{ matrix.encode_path }}
+        run: |
+          features=()
+          if [[ "$ENCODE_PATH" == v1 ]]; then features=(--features tokenizers-v1); fi
+          maturin build --release --locked "${features[@]}" \
+            --manifest-path smg-source/bindings/tokenizer-python/Cargo.toml --out wheelhouse
+          uv pip install --system wheelhouse/smg_tokenizer-*.whl
+      - name: Require exact rendering, IDs, masks and encoder selection
+        env:
+          TOKENIZERS_PARALLELISM: 'false'
+          RAYON_NUM_THREADS: '1'
+          PYTHONPATH: .
+          ENCODE_PATH: ${{ matrix.encode_path }}
+        run: |
+          python tools/qualification/tokenizer_contract.py --backend smg \
+            --encode-path "$ENCODE_PATH" --report tokenizer-contract.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: tokenizer-contract-${{ matrix.encode_path }}
+          path: tokenizer-contract.json

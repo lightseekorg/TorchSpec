@@ -62,7 +62,7 @@ def test_real_smg_ids_and_reviewed_mask(checkpoint, last_turn_only, include_end)
     spans = [
         (
             text.index(body),
-            text.index(body) + len(body) + (len("<|im_end|>\n") if include_end else 0),
+            text.index(body) + len(body) + (len("<|im_end|>") if include_end else 0),
         )
         for body in contents
     ]
