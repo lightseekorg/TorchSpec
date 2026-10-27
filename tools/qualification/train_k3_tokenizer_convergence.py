@@ -155,6 +155,7 @@ def main():
         "torchspec_source_sha256": {
             str(path.relative_to(Path(__file__).resolve().parents[2])): digest_file(path)
             for path in sorted(Path(__file__).resolve().parents[2].glob("torchspec/**/*.py"))
+            if not path.name.startswith(".")
         },
         "qualification_source_sha256": {
             path.name: digest_file(path)
