@@ -26,6 +26,7 @@ from tools.qualification.train_tokenizer_convergence import (
     trainer_args,
 )
 from torchspec.data.dataset import load_conversation_dataset
+from torchspec.data.renderers.smg import effective_renderer
 from torchspec.data.utils import unpack_loss_mask
 from torchspec.utils.distributed import init_gloo_group
 
@@ -62,7 +63,7 @@ def prepare(args):
                 cache_dir=str(args.output / "dataset-cache"),
             )
             actual = load_conversation_dataset(cfg)
-            assert cfg.renderer == ("kimi-k3" if backend == "hf" else "smg-kimi-k3")
+            assert effective_renderer(cfg) == ("kimi-k3" if backend == "hf" else "smg-kimi-k3")
             assert len(actual) == len(selected)
             rows = []
             for got, expected in zip(actual, selected):
