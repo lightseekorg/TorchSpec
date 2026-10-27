@@ -154,10 +154,15 @@ def test_mask_packing_and_collator_keep_alignment():
 
 @pytest.mark.parametrize("profile", list(MANIFEST["profiles"]))
 @pytest.mark.parametrize("num_proc", [1, 2])
-def test_dataset_workers_and_cache_match_goldens(profile, num_proc, checkpoints, tmp_path):
+def test_dataset_workers_and_cache_match_goldens(
+    profile, num_proc, checkpoints, tokenizers, tmp_path
+):
     from torchspec.data.dataset import load_conversation_dataset
 
     cases = [c for c in load_cases(profile) if "reject" not in c]
+    # Explicitly initialize native state in the parent, even when this test is
+    # run alone. Linux fork after this point used to hang the workers.
+    assert tokenizers[profile].encode(cases[-1]["text"]) == cases[-1]["input_ids"]
     source = tmp_path / "conversations.jsonl"
     source.write_text(
         "\n".join(

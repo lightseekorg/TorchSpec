@@ -507,7 +507,12 @@ def load_conversation_dataset(args):
         worker_init(*worker_initargs)
         pool_ctx = contextlib.nullcontext()
     else:
-        pool_ctx = mp.Pool(num_proc, initializer=worker_init, initargs=worker_initargs)
+        # A parent may have already encoded with SMG (e.g. train then eval).
+        # Forking inherits native tokenizer thread-pool/lock state without its
+        # threads and can deadlock Linux workers. Start clean interpreters for
+        # SMG; keep the existing multiprocessing policy for other renderers.
+        pool_factory = mp.get_context("spawn").Pool if renderer_name == "smg" else mp.Pool
+        pool_ctx = pool_factory(num_proc, initializer=worker_init, initargs=worker_initargs)
 
     with pool_ctx as pool:
         # Pass 1: collect and normalize raw samples (fast I/O, no tokenization)

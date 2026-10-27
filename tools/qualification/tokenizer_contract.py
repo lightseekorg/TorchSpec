@@ -83,7 +83,18 @@ def main():
     plugin = RequiredCases()
     # Do not inherit caller flags that could select only passing cases.
     os.environ.pop("PYTEST_ADDOPTS", None)
-    code = pytest.main([*files, "-q", "-o", "addopts=", "--strict-markers"], plugins=[plugin])
+    code = pytest.main(
+        [
+            *files,
+            "-q",
+            "-o",
+            "addopts=",
+            "--strict-markers",
+            "--timeout=180",
+            "--timeout-method=thread",
+        ],
+        plugins=[plugin],
+    )
     info.update(exit_code=int(code), passed=plugin.passed, skipped_or_deselected=plugin.invalid)
     report = Path(args.report)
     report.parent.mkdir(parents=True, exist_ok=True)

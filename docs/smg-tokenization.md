@@ -112,6 +112,10 @@ positions for both end-marker policies. The oracle does not import the SMG
 renderer, TorchSpec template registry or production loss-mask implementation.
 Llama's unsupported reasoning/tool cases are required rejection tests.
 Empty bodies can intentionally have zero loss when end-marker loss is disabled.
+SMG dataset workers use the `spawn` multiprocessing context on Linux as well as
+macOS: forking a parent that has already used native tokenizers can inherit
+unusable thread-pool/lock state. The worker tests explicitly warm the parent
+first. Required cases have a 180-second timeout so a regression fails the gate.
 
 From the repository root, in an environment with TorchSpec and the binding:
 
