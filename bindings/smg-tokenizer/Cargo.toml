@@ -1,0 +1,24 @@
+[package]
+name = "torchspec-smg-tokenizer"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[features]
+tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
+
+[dependencies]
+# Immutable upstream source; no SMG patches required.
+llm-tokenizer = { git = "https://github.com/smg-project/smg.git", rev = "df17c6c24b7be9e6eae50d23373f5d459e7f722b" }
+pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py311"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+chrono = "0.4"
+
+[build-dependencies]
+pyo3-build-config = "0.29.0"

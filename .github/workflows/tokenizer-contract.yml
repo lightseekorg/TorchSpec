@@ -1,17 +1,9 @@
 name: SMG tokenizer contract
 
-# Companion binding is not published yet. Require an immutable commit that
-# contains bindings/tokenizer-python; no implicit latest-main dependency.
+# The Python bridge lives here. Cargo.toml pins upstream SMG and Cargo.lock pins
+# its dependency graph; no separate SMG checkout or companion branch is needed.
 on:
   workflow_dispatch:
-    inputs:
-      smg_repository:
-        description: Repository containing the standalone SMG tokenizer binding
-        default: smg-project/smg
-        required: true
-      smg_revision:
-        description: Full 40-character commit SHA containing the binding
-        required: true
 
 permissions:
   contents: read
@@ -28,16 +20,6 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
-      - name: Require immutable SMG source
-        env:
-          SMG_REVISION: ${{ inputs.smg_revision }}
-        run: '[[ "$SMG_REVISION" =~ ^[0-9a-f]{40}$ ]]'
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-        with:
-          repository: ${{ inputs.smg_repository }}
-          ref: ${{ inputs.smg_revision }}
-          path: smg-source
-          persist-credentials: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
@@ -47,7 +29,7 @@ jobs:
           uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install --system -e '.[dev]' maturin -r tools/qualification/tokenizer-requirements.txt
           rustup toolchain install 1.98.0 --profile minimal
-      - name: Build pinned SMG binding
+      - name: Build TorchSpec-owned SMG binding
         env:
           RUSTUP_TOOLCHAIN: '1.98.0'
           ENCODE_PATH: ${{ matrix.encode_path }}
@@ -55,8 +37,10 @@ jobs:
           features=()
           if [[ "$ENCODE_PATH" == v1 ]]; then features=(--features tokenizers-v1); fi
           maturin build --release --locked "${features[@]}" \
-            --manifest-path smg-source/bindings/tokenizer-python/Cargo.toml --out wheelhouse
+            --manifest-path bindings/smg-tokenizer/Cargo.toml --out wheelhouse
           uv pip install --system wheelhouse/smg_tokenizer-*.whl
+      - name: Test standalone binding
+        run: python -m pytest -q bindings/smg-tokenizer/tests
       - name: Require exact rendering, IDs, masks and encoder selection
         env:
           TOKENIZERS_PARALLELISM: 'false'

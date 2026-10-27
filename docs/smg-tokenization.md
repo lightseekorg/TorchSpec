@@ -7,23 +7,34 @@ complete, teacher-forced **text** conversations, not universal model support.
 
 ## Installation
 
-The standalone binding is part of the companion SMG change under
-`bindings/tokenizer-python`; installing the existing `smg` gateway package is
-not sufficient. From that SMG checkout, in the Python environment used by all
-dataset worker processes:
+TorchSpec owns the thin PyO3 bridge under `bindings/smg-tokenizer`. Cargo builds
+it against unmodified upstream SMG at commit
+`df17c6c24b7be9e6eae50d23373f5d459e7f722b`; `Cargo.lock` pins transitive
+dependencies. No SMG fork, companion PR, separate checkout or gateway is needed.
+Rust executes in each Python process and releases the GIL during rendering and
+encoding. The default HF installation does not require Rust.
+
+From the TorchSpec checkout, in the Python environment used by dataset workers:
 
 ```bash
 python -m pip install maturin
-maturin develop --release --manifest-path bindings/tokenizer-python/Cargo.toml
+rustup toolchain install 1.98.0 --profile minimal
+RUSTUP_TOOLCHAIN=1.98.0 maturin develop --release --locked --manifest-path bindings/smg-tokenizer/Cargo.toml
 # Optional faster encoder (build-time opt-in):
-maturin develop --release --manifest-path bindings/tokenizer-python/Cargo.toml --features tokenizers-v1
+RUSTUP_TOOLCHAIN=1.98.0 maturin develop --release --locked --manifest-path bindings/smg-tokenizer/Cargo.toml --features tokenizers-v1
 ```
 
-Use SMG's pinned Rust toolchain. A wheel built with `maturin build --release`
-can be installed on other machines of the same OS/architecture; macOS wheels
-cannot be installed on the Linux Grace hosts. The library exposes
-`Tokenizer.encode_path` (`native`, `v1`, `tokenizers`, or `tiktoken`) so a
-benchmark can verify the actual selected path instead of assuming it.
+For deployment, use `maturin build --release --locked` with the same manifest
+and install the resulting `smg_tokenizer` wheel in each worker environment.
+The first build fetches the pinned upstream Rust source and crates; an installed
+wheel needs neither Rust nor an SMG checkout. Build separately for each
+OS/architecture; macOS wheels cannot run on Linux Grace hosts. The bridge is
+optional and its wheel is not currently published to PyPI.
+
+The library exposes `Tokenizer.encode_path` (`native`, `v1`, `tokenizers`, or
+`tiktoken`) so qualification verifies the actual selected path. When changing the
+Rust revision or bridge behavior, update the lockfile and bridge package version
+(which participates in TorchSpec's cache key), then rerun the contract gates.
 
 ## Configuration
 
@@ -144,9 +155,9 @@ and deterministic Unicode differential fuzzing. Raw fuzzing checks IDs only;
 reviewed conversation fixtures establish supervision semantics.
 
 The existing on-demand CPU workflow requires the pinned HF gate. The separate
-`SMG tokenizer contract` workflow builds the companion binding at an explicitly
-provided immutable SMG commit and requires both default-build and v1 gates. Until that companion
-commit is accessible on GitHub, run the full gate in the development environment.
+`SMG tokenizer contract` workflow builds this repository's binding against its
+pinned upstream dependency and requires both default-build and v1 gates.
+It has no external source-selection inputs.
 Making a check branch-protection-required is a repository setting, not established
 by this source change.
 
