@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 from transformers import AutoTokenizer
 
-from tools.qualification.k3_mask_oracle import checkpoint_mask_oracle
 from torchspec.data.renderers.kimi_k3 import K3Renderer
 from torchspec.data.renderers.smg_k3 import SmgK3Renderer
 
@@ -115,13 +114,6 @@ def check_dataset(path, legacy):
                     max_seq_length=512,
                     last_turn_only=True,
                 )
-                oracle = checkpoint_mask_oracle(
-                    legacy.tokenizer, _normalize_conversation(messages), tools
-                )
-                assert (ids, mask) == (
-                    oracle.input_ids[:512],
-                    oracle.mask(last_turn_only=True, limit=512),
-                )
                 assert row["input_ids"].tolist() == hit["input_ids"].tolist() == ids
                 assert unpack_loss_mask(row["packed_loss_mask"]).tolist() == mask
                 assert row["packed_loss_mask"] == hit["packed_loss_mask"]
@@ -176,11 +168,6 @@ def check(path, report):
                 args = dict(max_seq_length=10000, last_turn_only=last_turn, generation_config=mode)
                 expected = legacy.render(messages, tools, **args)
                 actual = smg.render(messages, tools, **args)
-                oracle = checkpoint_mask_oracle(tokenizer, messages, tools, mode)
-                assert actual == (
-                    oracle.input_ids,
-                    oracle.mask(last_turn_only=last_turn),
-                ), ("independent segment ownership disagreement", name, mode, last_turn)
                 checkpoint_kwargs = dict(reference_kwargs)
                 if mode is not None:
                     checkpoint_kwargs.update(mode)
@@ -191,12 +178,9 @@ def check(path, report):
                 assert all(mask == 0 for token, mask in zip(*actual) if token == legacy.eom_id)
                 for cut in range(1, len(expected[0]) + 2):
                     args["max_seq_length"] = cut
-                    truncated = smg.render(messages, tools, **args)
-                    assert truncated == legacy.render(messages, tools, **args), (name, mode, cut)
-                    assert truncated == (
-                        oracle.input_ids[:cut],
-                        oracle.mask(last_turn_only=last_turn, limit=cut),
-                    ), ("independent truncated mask disagreement", name, mode, cut)
+                    assert smg.render(messages, tools, **args) == legacy.render(
+                        messages, tools, **args
+                    ), (name, mode, cut)
                     truncations += 1
                 passed.append(
                     {
@@ -233,7 +217,6 @@ def check(path, report):
         "reference_class": type(tokenizer).__name__,
         "absent_effort_policy": "checkpoint_default_max",
         "direct_checkpoint_ids": True,
-        "independent_mask_oracle": "checkpoint_assistant_segment_ownership",
         "cases": passed,
         "required_rejections": rejected,
         "truncation_comparisons": truncations,

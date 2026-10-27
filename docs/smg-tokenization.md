@@ -111,34 +111,23 @@ already-tokenized rows.
 
 ## Correctness gates and measured training
 
-Frozen fixtures record text, IDs and assistant masks. The independent K3 mask
-oracle labels segment objects returned by the real checkpoint's assistant-body
-renderer, including the outer closing tag, before encoding each segment. It
-never calls TorchSpec's mask matcher or infers ownership from token headers.
-The K3 gate compares both backends against that oracle, checks missing-versus-null
-behavior, every truncation boundary and long segmentation, and exercises worker
-spawning and cache reloads.
+Frozen fixtures record text, IDs and assistant masks. The K3 gate calls the
+real checkpoint API directly, checks missing-versus-null behavior, every
+truncation boundary and long segmentation, and exercises worker spawning and
+cache reloads.
 
 ```bash
 PYTHONPATH=. python tools/qualification/tokenizer_contract.py \
   --backend smg --encode-path default --report tokenizer-contract.json
 PYTHONPATH=. python tools/qualification/k3_tokenizer_contract.py \
   --checkpoint /path/to/Kimi-K3 --report k3-contract.json
-K3_TOKENIZER_PATH=/path/to/Kimi-K3 PYTHONPATH=. python -m pytest -q \
-  tests/test_k3_mask_oracle.py
 ```
 
-The additional real-checkpoint suite covers adversarial control-token literals,
-named/consecutive/empty assistant turns, reasoning, repeated content across
-roles, reordered tool results, compound-argument rejection and mutations that
-fool backend-parity checks. Its CPU training probe executes the real loader,
-cache reload, packed-mask resolution, collator, `Eagle3Trainer._forward`, three
-Eagle3 depths and eager loss/backpropagation. It checks mask indices, shifted
-input IDs and target-state positions independently, using the existing trainer
-anchor-position convention. Only CUDA transfers, the unused Mooncake transport
-import and the large draft/target weights are replaced by CPU test fixtures.
-This is local alignment qualification, not GPU/distributed training qualification.
-Without `K3_TOKENIZER_PATH`, normal CI skips the private-checkpoint suite.
+Additional local qualification used an independent checkpoint segment-ownership
+oracle and CPU probes through dataset loading, cache reload, batching, three
+Eagle3 depths and loss/backpropagation. The local harness is outside this PR.
+It used synthetic hidden states and a tiny draft, and preserved the trainer's
+existing anchor-position convention; it does not qualify GPU/distributed training.
 
 Paired 1,000-step tests used real target states with matched initialization and
 sample order. Both pairs produced identical metrics, 11 evaluations and checkpoint
