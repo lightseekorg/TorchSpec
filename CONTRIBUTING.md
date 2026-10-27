@@ -32,11 +32,11 @@ Or install into your current environment:
 pip install -e ".[dev]"
 ```
 
-3. The native SMG extension is bundled automatically. See
-   [installation details](docs/smg-tokenization.md#installation) for wheel builds
-   and the explicit `dataset.rendering_backend=huggingface` runtime fallback.
+The native SMG extension is bundled automatically. See
+[installation details](docs/smg-tokenization.md#installation) for wheel builds
+and the explicit `dataset.rendering_backend=huggingface` runtime fallback.
 
-4. (Optional) Install Flash Attention for full feature support:
+3. (Optional) Install Flash Attention for full feature support:
 
 ```bash
 pip install -e ".[fa]"

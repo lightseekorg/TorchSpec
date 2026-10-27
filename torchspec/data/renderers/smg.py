@@ -40,6 +40,24 @@ SMG_DEFAULT_TEMPLATES = frozenset({"llama3", "qwen", "qwen3-thinking", "minimax-
 
 
 def effective_renderer(args):
+    """Select a renderer for the requested backend and training mode.
+
+    Args:
+        args: Namespace with optional rendering_backend, renderer,
+            target_model_path, chat_template, smg_exclude_k3,
+            defer_tokenization and train_with_decode attributes. K3 detection
+            also reads model_type from a local checkpoint's config.json.
+
+    Returns:
+        "smg" or "smg-kimi-k3" for supported SMG routes, "kimi-k3" for the
+        legacy K3 route, an explicit custom renderer name, or None for the
+        legacy template parser. Auto routing preserves unsupported modes and
+        templates on the legacy path; explicit custom renderers are preserved.
+
+    Raises:
+        ValueError: The backend is unknown, forced SMG would override a custom
+            renderer, or an SMG route requires an incompatible training mode.
+    """
     backend = getattr(args, "rendering_backend", "auto")
     renderer = getattr(args, "renderer", None)
     if backend not in ("auto", "huggingface", "smg"):
@@ -153,6 +171,13 @@ def _strings(value):
 
 
 class SmgRenderer:
+    """Render complete text conversations with the bundled SMG tokenizer.
+
+    Assistant supervision is derived from template delimiter spans and aligned
+    token offsets. Ambiguous delimiters, native segmented encodings and dropped
+    supervised reasoning raise errors rather than selecting another backend.
+    """
+
     CACHE_VERSION = "text-spans-v2-eot-marker-only"
 
     def __init__(
@@ -189,6 +214,33 @@ class SmgRenderer:
     def render(
         self, messages, tools=None, *, max_seq_length, last_turn_only=False, generation_config=None
     ):
+        """Render and tokenize a complete conversation with an assistant loss mask.
+
+        Args:
+            messages: Message dictionaries with system, developer, user,
+                assistant or tool roles and string or null content. Reasoning
+                fields and tool calls are passed to SMG; inputs are copied.
+            tools: Optional tool definitions passed to the chat template.
+            max_seq_length: Positive integer limiting both returned sequences.
+            last_turn_only: Supervise only the final assistant span, selected
+                before right truncation, even if truncation removes that span.
+            generation_config: Optional dictionary whose chat_template_kwargs
+                and explicit thinking/reasoning settings override the renderer's
+                template kwargs for this row.
+
+        Returns:
+            An (input_ids, loss_mask) tuple of equally sized lists, right-truncated
+            to max_seq_length. The binary mask covers selected assistant spans
+            and, when configured, their end markers. Tokens crossing a span
+            boundary are excluded when offsets are available.
+
+        Raises:
+            ValueError: The length, roles, content, generation settings or tool
+                JSON are invalid; payloads forge delimiters; output is segmented;
+                assistant spans are unclosed, cross roles or have the wrong count;
+                tool calls or supervised reasoning are dropped; or token offsets
+                or offset-free encoding boundaries cannot be aligned safely.
+        """
         if (
             not isinstance(max_seq_length, int)
             or isinstance(max_seq_length, bool)

@@ -36,6 +36,21 @@ class _K3Tokenizer:
         }
 
     def apply_chat_template(self, messages, *, tools=None, thinking=True, **kwargs):
+        """Return native segmented K3 IDs for a complete text conversation.
+
+        Callers must supply tokenize=True, add_generation_prompt=False,
+        preserve_thinking=True, padding=False, truncation=False,
+        return_tensors=None and return_dict=False, with no extra kwargs except
+        thinking_effort. Omitted effort retains SMG's checkpoint default;
+        explicit null effort is rejected when thinking is enabled.
+
+        Object, array and float tool-argument values, including those parsed
+        from JSON strings, are rejected because checkpoint-equivalent formatting
+        is not guaranteed. Invalid JSON strings remain native raw JSON blocks.
+        ValueError is raised for these unsupported values, non-text content,
+        an incompatible keyword contract, or non-segmented native output.
+        Returned IDs are neither re-encoded nor truncated here.
+        """
         template_kwargs = {"thinking": thinking}
         if "thinking_effort" in kwargs:
             effort = kwargs.pop("thinking_effort")
@@ -91,6 +106,13 @@ class _K3Tokenizer:
 
 
 class SmgK3Renderer(K3Renderer):
+    """Render Kimi-K3 text using SMG's native segmented encoding.
+
+    Construct with a local checkpoint source path. The parent renderer supplies
+    assistant-mask construction, end-of-message exclusion, last-turn selection
+    and synchronized truncation of token IDs and masks.
+    """
+
     # Reuse the established thinking validation, token-ID matcher, EOM policy,
     # last-turn selection and truncation without duplicating training semantics.
     CACHE_VERSION = "smg-k3-native-v3-" + K3Renderer.CACHE_VERSION
