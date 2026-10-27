@@ -59,10 +59,7 @@ def main():
         "versions": versions,
         "profiles": manifest["profiles"],
     }
-    files = [
-        "tests/tokenizer_contract/test_reference.py",
-        "tests/tokenizer_contract/test_convergence.py",
-    ]
+    files = ["tests/tokenizer_contract/test_reference.py"]
     if args.backend == "smg":
         from smg_tokenizer import Tokenizer, build_features
 

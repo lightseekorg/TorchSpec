@@ -1,5 +1,12 @@
 ARG TRTLLM_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc18
-FROM ${TRTLLM_IMAGE} AS trtllm
+FROM ${TRTLLM_IMAGE} AS base
+
+# Compile against the runtime base for matching architecture and libc.
+FROM base AS smg-builder
+COPY bindings/smg-tokenizer /tmp/smg-tokenizer
+RUN bash /tmp/smg-tokenizer/build-wheel.sh
+
+FROM base AS trtllm
 
 WORKDIR /root/
 
@@ -14,6 +21,12 @@ COPY patches/trtllm/v1.3.0rc18/*.patch /tmp/patches/
 RUN cd /usr/local/lib/python3.12/dist-packages && \
     for p in /tmp/patches/*.patch; do patch -p1 < "$p"; done && \
     rm -rf /tmp/patches
+
+# Only the compiled extension is needed at runtime; no Rust toolchain.
+COPY --from=smg-builder /opt/smg-wheels/ /tmp/smg-wheels/
+RUN python3 -m pip install --no-cache-dir --no-deps /tmp/smg-wheels/*.whl && \
+    python3 -c "from smg_tokenizer import Tokenizer, build_features; assert build_features == 'default'" && \
+    rm -rf /tmp/smg-wheels
 
 COPY . /root/torchspec
 RUN cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"

@@ -1,7 +1,10 @@
 # TorchSpec SMG tokenizer bridge
 
-This optional package runs SMG's Rust tokenizer inside Python processes using
-PyO3. TorchSpec owns the bridge; the Rust crate comes from the immutable upstream
+This native extension runs SMG's Rust tokenizer inside Python dataset workers
+using PyO3. The wheel is an installation artifact, not a separate service or
+independently maintained project. TorchSpec owns the bridge; its Dockerfiles
+build the wheel in a separate stage and install it in each training image.
+The Rust crate comes from the immutable upstream
 revision in `Cargo.toml`, with transitive dependencies pinned in `Cargo.lock`.
 It needs no SMG fork, gateway or separate source checkout.
 

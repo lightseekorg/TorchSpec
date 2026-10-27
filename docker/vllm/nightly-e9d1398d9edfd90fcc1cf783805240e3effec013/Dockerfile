@@ -1,4 +1,11 @@
-FROM vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013@sha256:95bed119f39e2414973cf7224df31c9a3ed213566138722346d7bd360edf842b
+FROM vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013@sha256:95bed119f39e2414973cf7224df31c9a3ed213566138722346d7bd360edf842b AS base
+
+# Compile against the runtime base for matching architecture and libc.
+FROM base AS smg-builder
+COPY bindings/smg-tokenizer /tmp/smg-tokenizer
+RUN bash /tmp/smg-tokenizer/build-wheel.sh
+
+FROM base AS runtime
 
 ENV VLLM_USE_V2_MODEL_RUNNER=1
 
@@ -45,6 +52,12 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
 # apache-tvm-ffi>=0.1.12, while the pinned vLLM, TileLang, and TokenSpeed stack
 # requires apache-tvm-ffi==0.1.11. Routing-validation configs use
 # flex_attention instead.
+# Only the compiled extension is needed at runtime; no Rust toolchain.
+COPY --from=smg-builder /opt/smg-wheels/ /tmp/smg-wheels/
+RUN python3 -m pip install --no-cache-dir --no-deps /tmp/smg-wheels/*.whl && \
+    python3 -c "from smg_tokenizer import Tokenizer, build_features; assert build_features == 'default'" && \
+    rm -rf /tmp/smg-wheels
+
 COPY . /root/torchspec
 RUN cd /root/torchspec && pip install --no-cache-dir -e .
 

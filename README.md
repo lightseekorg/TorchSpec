@@ -126,14 +126,10 @@ pip install -e ".[fa]"
 ### Training tokenizer
 
 Supported text profiles (`llama3`, `qwen`, `qwen3-thinking`, `minimax-m2`) and
-Kimi-K3 now use SMG by default. After activating the environment, build the
-TorchSpec-owned binding on each worker OS/architecture:
-
-```bash
-python -m pip install maturin
-rustup toolchain install 1.98.0 --profile minimal
-RUSTUP_TOOLCHAIN=1.98.0 maturin develop --release --locked --manifest-path bindings/smg-tokenizer/Cargo.toml
-```
+Kimi-K3 use SMG's Rust tokenizer in-process by default. The repository's Docker
+images build and install the TorchSpec-owned Python bridge automatically;
+training does not need a Rust toolchain. For other environments, see the
+[wheel build instructions](docs/smg-tokenization.md#installation).
 
 To explicitly use the old tokenizer, set `dataset.rendering_backend: huggingface`
 or pass `dataset.rendering_backend=huggingface` on the CLI. Deferred/decode training,

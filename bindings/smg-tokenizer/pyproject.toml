@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "smg-tokenizer"
 version = "0.1.2"
 requires-python = ">=3.11"
-description = "Standalone Python bindings for SMG rendering and tokenization"
+description = "TorchSpec's in-process bridge to SMG's Rust tokenizer"
 license = "Apache-2.0"
 
 [tool.maturin]

@@ -7,3 +7,5 @@ docker/
 *.egg-info/
 __pycache__/
 .ruff_cache/
+**/target/
+**/.venv/

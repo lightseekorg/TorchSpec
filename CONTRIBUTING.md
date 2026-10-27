@@ -25,7 +25,7 @@ Or install into your current environment:
 pip install -e ".[dev]"
 ```
 
-3. For default supported text-training paths, install the SMG binding using
+3. Outside the repository's Docker images, install the SMG binding using
    [the setup instructions](docs/smg-tokenization.md#installation). Explicit
    `dataset.rendering_backend=huggingface` keeps the old tokenizer without Rust.
 

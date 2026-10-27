@@ -1,5 +1,12 @@
 ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.14-cu130
-FROM ${SGLANG_IMAGE} AS sglang
+FROM ${SGLANG_IMAGE} AS base
+
+# Compile against the runtime base for matching architecture and libc.
+FROM base AS smg-builder
+COPY bindings/smg-tokenizer /tmp/smg-tokenizer
+RUN bash /tmp/smg-tokenizer/build-wheel.sh
+
+FROM base AS sglang
 
 WORKDIR /root/
 
@@ -8,6 +15,12 @@ RUN cd /sgl-workspace/sglang && \
     git apply --3way /sgl-workspace/sglang.patch && \
     rm /sgl-workspace/sglang.patch && \
     cd python && pip install -e .
+
+# Only the compiled extension is needed at runtime; no Rust toolchain.
+COPY --from=smg-builder /opt/smg-wheels/ /tmp/smg-wheels/
+RUN python3 -m pip install --no-cache-dir --no-deps /tmp/smg-wheels/*.whl && \
+    python3 -c "from smg_tokenizer import Tokenizer, build_features; assert build_features == 'default'" && \
+    rm -rf /tmp/smg-wheels
 
 COPY . /root/torchspec
 RUN cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"
