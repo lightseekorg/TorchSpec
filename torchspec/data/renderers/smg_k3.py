@@ -1,5 +1,7 @@
 """SMG's segmented K3 encoding with checkpoint-default generation settings."""
 
+import json
+
 from torchspec.data.renderers.kimi_k3 import K3Renderer
 
 
@@ -41,6 +43,23 @@ class _K3Tokenizer:
                     "SMG K3 training currently accepts text-only string content; "
                     "set dataset.rendering_backend=huggingface for the legacy path"
                 )
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    arguments = call.get("function", call).get("arguments")
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            # Both renderers preserve invalid JSON as a raw block.
+                            continue
+                    if isinstance(arguments, dict) and any(
+                        isinstance(value, (dict, list, float)) for value in arguments.values()
+                    ):
+                        raise ValueError(
+                            "SMG K3 tool arguments containing objects, arrays or floats "
+                            "are not checkpoint-equivalent; set "
+                            "dataset.rendering_backend=huggingface"
+                        )
         result = self.native.render(
             messages,
             tools=tools,
@@ -54,7 +73,7 @@ class _K3Tokenizer:
 class SmgK3Renderer(K3Renderer):
     # Reuse the established thinking validation, token-ID matcher, EOM policy,
     # last-turn selection and truncation without duplicating training semantics.
-    CACHE_VERSION = "smg-k3-native-v2-" + K3Renderer.CACHE_VERSION
+    CACHE_VERSION = "smg-k3-native-v3-" + K3Renderer.CACHE_VERSION
 
     def __init__(self, source):
         super().__init__(_K3Tokenizer(source))

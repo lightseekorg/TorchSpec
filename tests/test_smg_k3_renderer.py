@@ -1,5 +1,6 @@
 """Policy/negative-path tests; real checkpoint parity is a separate required gate."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +47,33 @@ def test_k3_rejects_explicit_null_instead_of_silently_using_max():
     tokenizer = object.__new__(_K3Tokenizer)
     with pytest.raises(ValueError, match="explicit null"):
         tokenizer.apply_chat_template([], thinking=True, thinking_effort=None)
+
+
+@pytest.mark.parametrize("value", [[1, 2], {"x": "y"}, 1e-7])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_k3_rejects_non_equivalent_tool_values_before_native_render(value, as_json):
+    tokenizer = object.__new__(_K3Tokenizer)
+    arguments = {"value": value}
+    if as_json:
+        arguments = json.dumps(arguments)
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": arguments}}],
+        }
+    ]
+    with pytest.raises(ValueError, match="not checkpoint-equivalent.*huggingface"):
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            preserve_thinking=True,
+            padding=False,
+            truncation=False,
+            return_tensors=None,
+            return_dict=False,
+        )
 
 
 def test_k3_refuses_flat_encoding_and_nontext_inputs():
