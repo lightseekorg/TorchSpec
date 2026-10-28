@@ -10,6 +10,13 @@ SMG owns chat formatting and encoding. TorchSpec owns assistant supervision,
 last-turn selection and truncation. Rendering always consumes a complete
 conversation: no generation header or continuation of the final message.
 
+The pinned SMG API does not expose assistant spans or masks. Its Jinja renderer
+treats `{% generation %}` blocks as plain blocks without retaining their bounds.
+TorchSpec therefore still needs template delimiter metadata for generic text
+masking and a K3 adapter for native segmented IDs. Token offsets alone do not
+identify which message owns a token. Removing these adapters requires SMG to
+provide assistant ownership aligned with the exact returned token IDs.
+
 ## Selection and fallback
 
 `dataset.rendering_backend: auto` is the default:
@@ -30,8 +37,9 @@ dataset:
 
 The same override works on the CLI: `dataset.rendering_backend=huggingface`.
 `smg` forces the SMG route; `auto` selects it only for supported configurations.
-`smg_exclude_k3: true` remains a K3-only fallback. Missing bindings, unsupported
-media and rendering errors are actionable failures, never silent backend swaps.
+The same backend selector applies to K3; there is no separate K3 exclusion flag.
+Missing bindings, unsupported media and rendering errors are actionable failures,
+never silent backend swaps.
 Both backends retain their existing mode restrictions. Routes are logged and
 backend/tokenizer/policy changes produce distinct dataset cache keys.
 

@@ -37,8 +37,9 @@ def test_k3_defaults_and_explicit_rollback(identification, tmp_path):
     args.rendering_backend = "huggingface"
     assert effective_renderer(args) == "kimi-k3"
     args.rendering_backend = "auto"
-    args.smg_exclude_k3 = True
-    assert effective_renderer(args) == "kimi-k3"
+    assert effective_renderer(args) == "smg-kimi-k3"
+    args.rendering_backend = "smg"
+    assert effective_renderer(args) == "smg-kimi-k3"
 
 
 @pytest.mark.parametrize("mode", ["defer_tokenization", "train_with_decode"])
@@ -80,7 +81,7 @@ def test_missing_binding_requires_install_or_explicit_legacy(monkeypatch):
     assert effective_renderer(args) is None
 
 
-@pytest.mark.parametrize("backend", ["auto", "huggingface"])
+@pytest.mark.parametrize("backend", ["auto", "smg", "huggingface"])
 def test_saved_config_preserves_backend_and_mask_routing(tmp_path, backend):
     cfg = OmegaConf.structured(Config)
     cfg.model.target_model_path = "org/Kimi-K3"
@@ -91,7 +92,7 @@ def test_saved_config_preserves_backend_and_mask_routing(tmp_path, backend):
     reloaded = load_config(config_path=str(path))
     args = config_to_flat_args(reloaded)
     assert reloaded.dataset.rendering_backend == backend
-    assert args.renderer == ("smg-kimi-k3" if backend == "auto" else "kimi-k3")
+    assert args.renderer == ("kimi-k3" if backend == "huggingface" else "smg-kimi-k3")
     assert args.dynamic_loss_mask is (backend == "huggingface")
 
 

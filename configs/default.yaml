@@ -14,7 +14,6 @@ dataset:
   train_data_path: ???
   chat_template: llama3
   rendering_backend: auto  # SMG for supported text; huggingface forces the old tokenizer
-  smg_exclude_k3: false
 
 training:
   micro_batch_size: 2

@@ -13,9 +13,7 @@ from torchspec.data.renderers.smg_k3 import _K3Tokenizer
 def test_k3_opt_in_rejects_unsupported_training_modes(flag):
     with pytest.raises(ValueError, match="requires"):
         effective_renderer(
-            SimpleNamespace(
-                rendering_backend="smg", renderer="kimi-k3", smg_exclude_k3=False, **{flag: True}
-            )
+            SimpleNamespace(rendering_backend="smg", renderer="kimi-k3", **{flag: True})
         )
 
 

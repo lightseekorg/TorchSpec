@@ -45,7 +45,6 @@ class DatasetConfig:
     prompt_key: str = "conversations"
     renderer: Optional[str] = None  # registered ConversationRenderer; overrides chat_template
     rendering_backend: str = "auto"  # SMG for supported text profiles; huggingface forces legacy
-    smg_exclude_k3: bool = False  # optional K3-only override to the checkpoint-Python renderer
     smg_revision: Optional[str] = None  # pin tokenizer files when loading from the Hub
     smg_template_kwargs: dict = field(default_factory=dict)
     smg_include_end_token: bool = True

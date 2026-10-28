@@ -174,14 +174,14 @@ def test_fingerprint_changes_when_template_changes(checkpoint):
     assert prepare_checkpoint(path)[1] != first
 
 
-def test_k3_flag_keeps_existing_renderer_without_smg_import(tmp_path):
-    args = SimpleNamespace(rendering_backend="smg", renderer="kimi-k3", smg_exclude_k3=True)
+def test_k3_backend_selects_explicit_fallback_or_native_renderer(tmp_path):
+    args = SimpleNamespace(rendering_backend="huggingface", renderer="kimi-k3")
     assert effective_renderer(args) == "kimi-k3"
-    args.smg_exclude_k3 = False
+    args.rendering_backend = "smg"
     assert effective_renderer(args) == "smg-kimi-k3"
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "kimi_k3"}))
     args.renderer = None
-    args.smg_exclude_k3 = True
+    args.rendering_backend = "huggingface"
     args.target_model_path = str(tmp_path)
     assert effective_renderer(args) == "kimi-k3"
 
@@ -202,7 +202,6 @@ def test_default_config_selects_smg_including_k3_and_allows_legacy():
     config.model.target_model_path = "Qwen/Qwen3-0.6B"
     config.dataset.chat_template = "qwen3-thinking"
     assert config.dataset.rendering_backend == "auto"
-    assert config.dataset.smg_exclude_k3 is False
     args = config_to_flat_args(config)
     assert args.renderer == "smg" and args.dynamic_loss_mask is False
     config.dataset.renderer = "kimi-k3"

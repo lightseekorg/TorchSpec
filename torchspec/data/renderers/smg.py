@@ -44,8 +44,8 @@ def effective_renderer(args):
 
     Args:
         args: Namespace with optional rendering_backend, renderer,
-            target_model_path, chat_template, smg_exclude_k3,
-            defer_tokenization and train_with_decode attributes. K3 detection
+            target_model_path, chat_template, defer_tokenization and
+            train_with_decode attributes. K3 detection
             also reads model_type from a local checkpoint's config.json.
 
     Returns:
@@ -82,8 +82,6 @@ def effective_renderer(args):
     incompatible = getattr(args, "defer_tokenization", False) or getattr(
         args, "train_with_decode", False
     )
-    if is_k3 and getattr(args, "smg_exclude_k3", False):
-        return legacy_renderer
     if backend == "auto":
         if incompatible:
             return legacy_renderer
