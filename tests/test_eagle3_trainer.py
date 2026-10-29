@@ -278,5 +278,66 @@ class TestInitModelInitialDraft(unittest.TestCase):
             self._run_init_model(str(self.root / "does-not-exist"), target_dir)
 
 
+class TestNextTargetValidity(unittest.TestCase):
+    def _check_forward(self, attention_mask, loss_mask, expected, pruned):
+        trainer = object.__new__(Eagle3Trainer)
+        trainer.verifier_norm = None
+        trainer.t2d = torch.ones(4, dtype=torch.bool) if pruned else None
+        trainer.target_lm_head_weight = torch.eye(4)
+        trainer.eagle3 = Namespace(length=3)
+        trainer.model = mock.Mock(return_value=([], [], [], [], []))
+        bsz, width = attention_mask.shape
+        # Nonzero position markers distinguish real states from zero padding.
+        states = torch.arange(1, bsz * width * 4 + 1).float().reshape(bsz, width, 4)
+        states = states * attention_mask.unsqueeze(-1)
+        batch = {
+            "input_ids": torch.ones(bsz, width, dtype=torch.long),
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
+            "hidden_states": states,
+            "last_hidden_states": states,
+        }
+        original_mask = loss_mask.clone()
+        with mock.patch.object(torch.Tensor, "cuda", lambda tensor: tensor):
+            trainer._forward(batch)
+        call = trainer.model.call_args.kwargs
+        torch.testing.assert_close(call["loss_mask"], expected)
+        torch.testing.assert_close(batch["loss_mask"], original_mask)
+        torch.testing.assert_close(call["attention_mask"], attention_mask)
+        if pruned:
+            torch.testing.assert_close(call["target"].position_mask, expected.float())
+        else:
+            # Follow all three depth slices, not just the initial mask shape.
+            for depth in range(3):
+                step_mask = torch.zeros_like(expected)
+                if depth < width:
+                    step_mask[:, : width - depth] = expected[:, depth:]
+                targets = call["target"].hidden_states_padded[:, depth : depth + width]
+                self.assertTrue((targets[step_mask.bool()] != 0).all())
+
+    def test_truncated_and_padded_samples_in_both_target_paths(self):
+        attention = torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]])
+        mask = torch.tensor([[0, 1, 1, 1], [1, 1, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]])
+        expected = torch.tensor([[0, 1, 1, 0], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]])
+        for pruned in (False, True):
+            for dtype in (torch.long, torch.float32):
+                for trailing_dim in (False, True):
+                    with self.subTest(pruned=pruned, dtype=dtype, trailing_dim=trailing_dim):
+                        value = mask.to(dtype)
+                        if trailing_dim:
+                            value = value.unsqueeze(-1)
+                        self._check_forward(attention, value, expected.to(dtype), pruned)
+
+    def test_usp_valid_halo_and_existing_mask_exclusions_are_preserved(self):
+        # A four-token USP chunk plus three halo positions: the chunk's final
+        # anchor remains supervised when its next target is in the real halo.
+        attention = torch.tensor([[1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0, 0]])
+        mask = torch.tensor([[0, 1, 1, 1, 1, 1, 0], [0, 1, 1, 1, 1, 0, 0]])
+        expected = torch.tensor([[0, 1, 1, 1, 1, 1, 0], [0, 1, 1, 1, 0, 0, 0]])
+        for pruned in (False, True):
+            with self.subTest(pruned=pruned):
+                self._check_forward(attention, mask, expected, pruned)
+
+
 if __name__ == "__main__":
     unittest.main()

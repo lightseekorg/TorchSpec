@@ -291,6 +291,10 @@ class Eagle3Trainer(Trainer):
         if loss_mask.dim() == 3:
             loss_mask = loss_mask.squeeze(-1)
         loss_mask = loss_mask.cuda()
+        attention_mask = batch["attention_mask"].cuda()
+        # Targets shift left by one. Exclude anchors whose next position is
+        # padding, including each sample's tail and the end of a USP halo.
+        loss_mask = loss_mask * padding(attention_mask, left=False).bool()
 
         if self.t2d is not None:
             target = compute_target_p_padded(
@@ -310,7 +314,7 @@ class Eagle3Trainer(Trainer):
 
         plosses, vlosses, acces, acc_counts, alphas = self.model(
             input_ids=input_ids,
-            attention_mask=batch["attention_mask"].cuda(),
+            attention_mask=attention_mask,
             target=target,
             loss_mask=loss_mask,
             hidden_states=batch["hidden_states"].cuda(),
