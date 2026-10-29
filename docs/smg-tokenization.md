@@ -58,6 +58,12 @@ per-row `generation_config` overrides it. `smg_include_end_token` defaults to tr
 the formatting newline after the end marker is not supervised. Clock-dependent
 templates require a pinned RFC3339 `smg_render_instant`. Ambiguous assistant
 boundaries and discarded supervised reasoning/tool calls are rejected.
+For structured reasoning and tool calls, substring presence alone is insufficient:
+ordinary content can repeat the same text. The adapter renders a copy with a unique
+field marker and requires it in the corresponding assistant body. These probes
+preserve call/result structure, add preprocessing work only for structured fields,
+and never supply the IDs used for training. A cache-version bump prevents old
+cached rows from bypassing this validation.
 
 ## Installation
 

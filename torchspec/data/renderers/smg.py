@@ -176,7 +176,7 @@ class SmgRenderer:
     supervised reasoning raise errors rather than selecting another backend.
     """
 
-    CACHE_VERSION = "text-spans-v2-eot-marker-only"
+    CACHE_VERSION = "text-spans-v3-content-preservation"
 
     def __init__(
         self,
@@ -339,27 +339,56 @@ class SmgRenderer:
             raise ValueError(
                 f"SMG rendered {len(spans)} assistant spans for {expected} assistant messages; check dataset.chat_template"
             )
-        assistants = [m for m in messages if m["role"] == "assistant"]
-        for message, (a, b) in zip(assistants, spans):
-            for call in message.get("tool_calls") or []:
+        assistant_indices = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+
+        def preserves_field(message_index, fields=(), call_index=None):
+            # Ordinary content may repeat a tool name or reasoning text. Verify
+            # provenance with a unique marker in a COPY, keeping call/result IDs
+            # and the conversation structure intact. Train on the original IDs.
+            marker = "torchspec_metadata_probe"
+            while marker in text:
+                marker += "_"
+            probe = deepcopy(messages)
+            for field in fields:
+                if probe[message_index].get(field):
+                    probe[message_index][field] = marker
+            if call_index is not None:
+                call = probe[message_index]["tool_calls"][call_index]
+                call.get("function", call)["name"] = marker
+            probe_text = self.tokenizer.render(
+                probe, tools=tools, template_kwargs=kwargs, now=self.render_instant
+            )["text"]
+            turns = probe_text.split(self.header)
+            if len(turns) != expected + 1:
+                raise ValueError("SMG metadata probe changed assistant turn boundaries")
+            body = turns[assistant_indices.index(message_index) + 1].split(self.end, 1)[0]
+            return marker in body
+
+        for index, (a, b) in zip(assistant_indices, spans):
+            for call_index, call in enumerate(messages[index].get("tool_calls") or []):
                 name = call.get("function", call).get("name")
-                if name and name not in text[a:b]:
+                if (name and name not in text[a:b]) or not preserves_field(
+                    index, call_index=call_index
+                ):
                     raise ValueError("SMG template dropped a tool call from the conversation")
-        selected = list(zip(assistants, spans))
+        selected = list(zip(assistant_indices, spans))
         if last_turn_only:
             selected = selected[-1:]
-        for message, (a, b) in selected:
+        reasoning_fields = ("reasoning_content", "reasoning", "thinking", "thinking_content")
+        for index, (a, b) in selected:
             body = text[a:b]
-            for key in ("reasoning_content", "reasoning", "thinking", "thinking_content"):
-                reasoning = message.get(key)
-                if (
-                    isinstance(reasoning, str)
-                    and reasoning.strip()
-                    and reasoning.strip() not in body
-                ):
-                    raise ValueError(
-                        "SMG template dropped supervised reasoning; use compatible template options or last-turn-only loss"
-                    )
+            reasoning_values = [
+                value.strip()
+                for key in reasoning_fields
+                if isinstance(value := messages[index].get(key), str) and value.strip()
+            ]
+            if reasoning_values and (
+                any(value not in body for value in reasoning_values)
+                or not preserves_field(index, fields=reasoning_fields)
+            ):
+                raise ValueError(
+                    "SMG template dropped supervised reasoning; use compatible template options or last-turn-only loss"
+                )
         if last_turn_only:
             spans = spans[-1:]
         mask = [0] * len(ids)

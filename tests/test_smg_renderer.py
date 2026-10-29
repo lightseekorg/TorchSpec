@@ -363,3 +363,23 @@ def test_public_preprocessing_routes_and_caches_by_backend(checkpoint, tmp_path,
     assert smg[0]["input_ids"].tolist() == cached[0]["input_ids"].tolist() == [expected_ids]
     assert unpack_loss_mask(smg[0]["packed_loss_mask"]).tolist() == expected_mask
     assert smg[0]["packed_loss_mask"] != legacy[0]["packed_loss_mask"]
+
+
+@pytest.mark.parametrize("field", ["tool_calls", "reasoning_content"])
+def test_repeated_content_cannot_hide_dropped_metadata(checkpoint, field):
+    path, hf = checkpoint
+    # This template deliberately ignores structured metadata. The same text in
+    # content used to fool the output substring checks into accepting the row.
+    hf.chat_template = "{% for m in messages %}{{ '<|im_start|>' + m.role + '\\n' + (m.content or '') + '<|im_end|>\\n' }}{% endfor %}"
+    hf.save_pretrained(path)
+    message = {"role": "assistant", "content": "lookup shared reason"}
+    message[field] = (
+        [{"function": {"name": "lookup", "arguments": {"x": 1}}}]
+        if field == "tool_calls"
+        else "shared reason"
+    )
+    with pytest.raises(ValueError, match="dropped"):
+        SmgRenderer(path, "qwen").render(
+            [{"role": "user", "content": "question"}, message],
+            max_seq_length=4096,
+        )
