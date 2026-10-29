@@ -29,3 +29,6 @@ python -m pytest -q bindings/smg-tokenizer/tests
 The internal Rust binding version is exposed for dataset cache invalidation. Version
 0.1.2 exposes special-token lookup for TorchSpec's K3 token-ID mask policy.
 Rendering and encoding continue to use the pinned upstream Rust implementation.
+
+0.1.3 enables serde_json float round-tripping so Python tool-argument floats
+retain their exact binary value across the native JSON boundary.

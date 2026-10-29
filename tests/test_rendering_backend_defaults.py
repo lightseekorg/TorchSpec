@@ -96,9 +96,10 @@ def test_saved_config_preserves_backend_and_mask_routing(tmp_path, backend):
     assert args.dynamic_loss_mask is (backend == "huggingface")
 
 
-def test_outdated_binding_is_not_silently_used(monkeypatch):
+@pytest.mark.parametrize("version", ["0.1.0", "0.1.2"])
+def test_outdated_binding_is_not_silently_used(monkeypatch, version):
     monkeypatch.setitem(
-        sys.modules, "torchspec_smg", SimpleNamespace(__version__="0.1.0", build_features="default")
+        sys.modules, "torchspec_smg", SimpleNamespace(__version__=version, build_features="default")
     )
-    with pytest.raises(ImportError, match="binding >=0.1.2"):
+    with pytest.raises(ImportError, match="binding >=0.1.3"):
         prepare_checkpoint("unused")

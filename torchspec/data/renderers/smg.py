@@ -105,11 +105,11 @@ def prepare_checkpoint(source, revision=None):
         from torchspec_smg import __version__ as version
         from torchspec_smg import build_features
 
-        if Version(version) < Version("0.1.2"):
-            raise ImportError(f"smg-tokenizer {version} is older than the required 0.1.2")
+        if Version(version) < Version("0.1.3"):
+            raise ImportError(f"smg-tokenizer {version} is older than the required 0.1.3")
     except ImportError as exc:
         raise ImportError(
-            "SMG rendering needs TorchSpec's bundled native binding >=0.1.2; "
+            "SMG rendering needs TorchSpec's bundled native binding >=0.1.3; "
             "reinstall TorchSpec with its native extension (see docs/smg-tokenization.md), or set "
             "dataset.rendering_backend=huggingface to use the legacy tokenizer"
         ) from exc

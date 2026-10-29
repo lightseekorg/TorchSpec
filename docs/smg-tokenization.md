@@ -111,6 +111,8 @@ prefixes. Assistant bodies/internal XTML are supervised; outer headers and EOM
 are excluded. Last-turn selection happens before truncation.
 
 SMG owns tool argument serialization, including nested objects/arrays and floats.
+Binding >=0.1.3 enables exact JSON float round-tripping; decimal spelling may
+change, but the parsed numeric value must not. Older bindings are rejected.
 Its compact JSON and exponent spellings may differ from HF; formatting equality
 with HF is not an acceptance requirement. TorchSpec preserves SMG's native IDs
 and derives the mask from those same IDs. No prompt/ID rewriting or silent

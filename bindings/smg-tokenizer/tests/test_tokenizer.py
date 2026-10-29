@@ -49,3 +49,17 @@ def test_complete_conversation_options_are_reserved(checkpoint, key):
     smg, _ = checkpoint
     with pytest.raises(ValueError, match="complete-conversation"):
         smg.render([{"role": "user", "content": "Hello"}], template_kwargs={key: True})
+
+
+@pytest.mark.parametrize("value", [2021.4285714285713, 0.8455124082255701, 1e-7])
+def test_json_bridge_preserves_float_value(checkpoint, tmp_path, value):
+    # The native JSON decoder must preserve the Python float, not merely emit
+    # approximately equivalent decimal text. This also covers nested values.
+    template = tmp_path / "float.jinja"
+    template.write_text("{{ messages[0].payload | tojson }}")
+    smg = Tokenizer(tmp_path, chat_template_path=str(template))
+    payload = {"number": value, "nested": [value]}
+    result = smg.render([{"role": "user", "content": "", "payload": payload}])
+    restored = json.loads(result["text"])
+    assert restored["number"].hex() == value.hex()
+    assert restored["nested"][0].hex() == value.hex()
