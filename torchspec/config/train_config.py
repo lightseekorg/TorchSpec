@@ -42,6 +42,7 @@ class DatasetConfig:
     last_turn_loss_only: Any = "auto"  # bool or "auto"
     length_group_size: int = 32
     min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
+    num_proc: int = 64  # dataset preprocessing workers
     prompt_key: str = "conversations"
     renderer: Optional[str] = None  # registered ConversationRenderer; overrides chat_template
     rendering_backend: str = "auto"  # SMG for supported text profiles; huggingface forces legacy

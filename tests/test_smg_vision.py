@@ -219,3 +219,23 @@ def test_prepared_generation_does_not_render_image_inputs():
     )
     assert values[0] is prepared
     assert values[1]["prompt_token_ids"] == [1, 2]
+
+
+def test_training_recipe_resolves_prepared_inputs():
+    from torchspec.config.train_config import config_to_flat_args, load_config
+    from torchspec.models.draft.auto import AutoDraftModelConfig
+
+    config = load_config(
+        "configs/vllm_qwen3_vl_2b_smg.yaml",
+        cli_args=[
+            "dataset.train_data_path=/tmp/train.jsonl",
+            "dataset.eval_data_path=/tmp/val.jsonl",
+        ],
+    )
+    args = config_to_flat_args(config)
+    draft = AutoDraftModelConfig.from_file(args.draft_model_config)
+    assert args.renderer == "smg-qwen3-vl" and not args.dynamic_loss_mask
+    assert not args.defer_tokenization and not args.train_with_decode
+    assert args.inference_engine_type == "vllm"
+    assert len(args.aux_hidden_states_layers) == draft.num_aux_hidden_states
+    assert args.embedding_key == args.lm_head_key

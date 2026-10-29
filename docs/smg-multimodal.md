@@ -14,7 +14,9 @@ TORCHSPEC_SMG_FEATURES=multimodal pip install -e '.[vllm]'
 
 Use `TORCHSPEC_SMG_FEATURES=tokenizers-v1,multimodal` to combine build features.
 A text-only build remains supported and reports an actionable error if this
-renderer is selected. Prebuilt images need a wheel built with `multimodal`.
+renderer is selected. The pinned `nightly-e9d1398d9...` vLLM Dockerfile builds
+with `multimodal` and checks the installed native feature. Other prebuilt images
+need a wheel built with `multimodal`.
 
 Set these fields in an otherwise complete training config:
 
@@ -33,6 +35,20 @@ training:
 inference:
   inference_engine_type: vllm
 ```
+
+The complete two-GPU recipe is
+[`configs/vllm_qwen3_vl_2b_smg.yaml`](../configs/vllm_qwen3_vl_2b_smg.yaml).
+From the repository root, supply your image-conversation datasets:
+
+```bash
+SMG_MM_THREADS=1 python -m torchspec.train_entry \
+  --config configs/vllm_qwen3_vl_2b_smg.yaml \
+  dataset.train_data_path=/absolute/path/train.jsonl \
+  dataset.eval_data_path=/absolute/path/validation.jsonl
+```
+
+The recipe specifies the target's tied embedding/head keys, final norm key,
+three auxiliary layers, and a matching one-layer Eagle3 draft configuration.
 
 This explicit renderer is not selected by `auto` detection. Its prepared-input
 adapter targets vLLM's 0.26 API; older versions without that interface fail instead
@@ -69,3 +85,12 @@ content-addressed cache or worker-side placement can reuse the same input contra
 universally requires equivalent processor and engine-adapter validation for each
 supported path. Exhaustive checkpoint comparisons and GPU harnesses stay local;
 focused regressions are in `tests/test_smg_vision.py`.
+
+The initial qualification used Qwen3-VL-2B-Instruct on GB300 with vLLM
+`0.26.1rc1.dev1102+ge9d1398d9`. On 64 ChartQA training images and 16 held-out
+images, HF and SMG produced identical final IDs, pixels, grids, masks, and four
+captured target-state layers. Paired 1,000-step Eagle3 runs produced identical
+step metrics and final weights; held-out depth-0 loss fell from 11.46 to 2.29.
+A separate two-GPU run exercised the real Ray/controller/Mooncake TCP path for
+16 steps, including evaluation and checkpoint saving. These are bounded
+correctness and convergence checks, not large-corpus performance measurements.
