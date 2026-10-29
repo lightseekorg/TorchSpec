@@ -120,7 +120,32 @@ class SmgK3Renderer(K3Renderer):
         generation_config=None,
         return_formatted_text=False,
     ):
-        """Mask native SMG IDs; optionally return the same render's full text."""
+        """Render a complete K3 conversation and mask its native segmented IDs.
+
+        Args:
+            messages: Message dictionaries with string or null content, including
+                optional reasoning fields and tool calls, passed to SMG.
+            tools: Optional tool definitions passed to the renderer.
+            max_seq_length: Positive integer limiting both returned sequences.
+            last_turn_only: Supervise only the final assistant span, selected
+                before right truncation, even if truncation removes that span.
+            generation_config: Optional per-row thinking and effort settings.
+                Missing or null effort with thinking enabled uses SMG's max default.
+            return_formatted_text: Append the same render's full, untruncated text
+                as a third result; it is metadata, never a source for re-encoding.
+
+        Returns:
+            An (input_ids, loss_mask) tuple of equally sized lists, right-truncated
+            to max_seq_length. The binary mask includes selected assistant bodies
+            and their outer closing tags, excluding headers and end-of-message
+            tokens. With return_formatted_text=True, returns
+            (input_ids, loss_mask, formatted_text) instead.
+
+        Raises:
+            ValueError: The length, generation settings, or content are invalid;
+                thinking is disabled with nonempty assistant reasoning; or SMG
+                does not return native segmented encoding.
+        """
         if (
             not isinstance(max_seq_length, int)
             or isinstance(max_seq_length, bool)

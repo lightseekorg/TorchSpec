@@ -11,10 +11,10 @@ transitive dependencies pinned in `Cargo.lock`. Rust executes directly inside
 Python dataset workers through PyO3, releasing the GIL during heavy work.
 
 See [installation and qualification](../../docs/smg-tokenization.md) for build
-commands, supported inputs, supervision policy and the convergence gate.
+commands, supported inputs, supervision policy, and the convergence gate.
 
 `Tokenizer.render` handles complete conversations and returns rendered text,
-exact token IDs, optional UTF-8 byte offsets and a segmented-encoding indicator.
+exact token IDs, optional UTF-8 byte offsets, and a segmented-encoding indicator.
 It preserves native deferred encoding jobs. Flat offsets require an extra
 reference encode with identical IDs; segmented encodings have no flat offsets.
 TorchSpec defines the training loss mask, not this bridge. Media processing is

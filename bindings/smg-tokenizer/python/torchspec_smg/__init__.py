@@ -34,11 +34,26 @@ class Tokenizer:
         return self._inner.raw_tool_call_arguments
 
     def render(self, messages, *, tools=None, template_kwargs=None, now=None):
-        """Return text, exact token IDs, and optional UTF-8 byte offsets.
+        """Render a complete conversation with exact token IDs and encoding metadata.
 
         This entry point renders a complete conversation without a generation
         header. It never flattens and re-encodes a native renderer's segments.
         Offsets are absent if the exact encoding cannot be mapped to flat text.
+
+        Args:
+            messages: JSON-serializable message dictionaries in conversation order.
+            tools: Optional list of tool definitions passed to the renderer.
+            template_kwargs: Optional renderer settings. These cannot override
+                messages, tools, add_generation_prompt, or continue_final_message.
+            now: Optional RFC3339 timestamp string for clock-dependent templates;
+                None leaves the clock selection to SMG.
+
+        Returns:
+            A dictionary with text (the full rendered string), input_ids (exact
+            token IDs), offsets (per-token UTF-8 byte ranges, or None), and
+            segmentwise (whether a native deferred encoding job produced the IDs).
+            When segmentwise is True, offsets is always None and re-encoding the
+            flat text is not guaranteed to reproduce the returned IDs.
         """
         text, ids, offsets, segmentwise = self._inner.render_json(
             json.dumps(

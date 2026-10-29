@@ -1,13 +1,13 @@
 # SMG training tokenization
 
 TorchSpec calls SMG's Rust `llm-tokenizer` library **inside each Python dataset
-worker** through a small PyO3 extension. Loading, rendering and encoding release
+worker** through a small PyO3 extension. Loading, rendering, and encoding release
 the GIL. The native `torchspec_smg._native` module and its Python wrapper
 ship inside the **TorchSpec wheel**. There is no separate tokenizer distribution,
-server or subprocess, and no SMG fork is needed.
+server, or subprocess, and no SMG fork is needed.
 
 SMG owns chat formatting and encoding. TorchSpec owns assistant supervision,
-last-turn selection and truncation. Rendering always consumes a complete
+last-turn selection, and truncation. Rendering always consumes a complete
 conversation: no generation header or continuation of the final message.
 
 The pinned SMG API does not expose assistant spans or masks. Its Jinja renderer
@@ -38,7 +38,7 @@ dataset:
 The same override works on the CLI: `dataset.rendering_backend=huggingface`.
 `smg` forces the SMG route; `auto` selects it only for supported configurations.
 The same backend selector applies to K3; there is no separate K3 exclusion flag.
-Missing bindings, unsupported media and rendering errors are actionable failures,
+Missing bindings, unsupported media, and rendering errors are actionable failures,
 never silent backend swaps.
 Both backends retain their existing mode restrictions. Routes are logged and
 backend/tokenizer/policy changes produce distinct dataset cache keys.
@@ -47,7 +47,7 @@ The public `preprocess_conversations` and `build_eagle3_dataset` APIs use the sa
 `rendering_backend="auto"` policy. Pass `rendering_backend="huggingface"` for the
 legacy implementation. SMG loads artifacts from `tokenizer.name_or_path`, or an
 explicit `target_model_path`; `smg_revision` pins remote artifacts. `smg_options`
-accepts `template_kwargs`, `include_end_token` and `render_instant`. Per-row `tools`
+accepts `template_kwargs`, `include_end_token`, and `render_instant`. Per-row `tools`
 and `generation_config` are forwarded. Native renderers are initialized inside
 map workers, and explicit dataset cache names include backend/assets and mask
 policy. Preformatted text and generation-prefix requests keep their legacy routes;
@@ -81,7 +81,7 @@ C/C++ toolchain. Installing a prebuilt TorchSpec wheel needs neither. The existi
 HF runtime fallback remains available; it does not disable native compilation
 when building TorchSpec from source.
 
-The vLLM, SGLang and TensorRT-LLM Dockerfiles build this same **TorchSpec wheel**
+The vLLM, SGLang, and TensorRT-LLM Dockerfiles build this same **TorchSpec wheel**
 in a separate stage using the same base image/architecture, then install it and
 resolve Python dependencies in the runtime image. The compiler stays in the build
 stage. The checkout remains in `/root/torchspec` for configs/tools and Python development.
@@ -97,7 +97,7 @@ python -m build --outdir wheelhouse
 
 `Cargo.toml` pins SMG at `df17c6c24b7be9e6eae50d23373f5d459e7f722b`, and builds
 use `Cargo.lock` with `--locked`. The source archive includes the Rust sources,
-manifest, lockfile and toolchain declaration. Set `TORCHSPEC_SMG_FEATURES=tokenizers-v1`
+manifest, lockfile, and toolchain declaration. Set `TORCHSPEC_SMG_FEATURES=tokenizers-v1`
 at build time for accelerated encoders. `Tokenizer.encode_path` and `build_features`
 expose the actual selection; K3 uses tiktoken in either build. Generic offset
 validation performs an extra reference encode, so encoder speedups do not imply
@@ -119,7 +119,7 @@ and derives the mask from those same IDs. No prompt/ID rewriting or silent
 backend fallback is performed. The K3 cache version is bumped for this policy.
 
 Absent `generation_config`, an empty config, or thinking-enabled missing/null
-effort uses SMG's `max` default. Explicit effort names remain `low`, `high` or
+effort uses SMG's `max` default. Explicit effort names remain `low`, `high`, or
 `max`; contradictory reasoning metadata is rejected. Thinking-off rejects
 nonempty assistant reasoning. The explicit HF fallback retains its existing
 validation and does not gain SMG's null-effort semantics. K3 continues to reject
@@ -135,9 +135,9 @@ already-tokenized rows.
 
 ## Correctness gates and measured training
 
-Frozen fixtures record text, IDs and assistant masks. The K3 parity gate covers the shared subset with the
+Frozen fixtures record text, IDs, and assistant masks. The K3 parity gate covers the shared subset with the
 real checkpoint API directly, checks missing-versus-null behavior, every
-truncation boundary and long segmentation, and exercises worker spawning and
+truncation boundary, and long segmentation, and exercises worker spawning and
 cache reloads.
 
 ```bash
@@ -149,16 +149,16 @@ PYTHONPATH=. python tools/qualification/k3_tokenizer_contract.py \
 
 Additional local qualification used an independent checkpoint segment-ownership
 oracle and CPU probes through dataset loading, cache reload, batching, three
-Eagle3 depths and loss/backpropagation. The local harness is outside this PR.
+Eagle3 depths, and loss/backpropagation. The local harness is outside this PR.
 It used synthetic hidden states and a tiny draft, and preserved the trainer's
 existing anchor-position convention; it does not qualify GPU/distributed training.
 
 Prior paired 1,000-step tests used real target states with matched initialization and
-sample order. Both pairs produced identical metrics, 11 evaluations and checkpoint
+sample order. Both pairs produced identical metrics, 11 evaluations, and checkpoint
 bytes: Qwen3-0.6B/UltraChat held-out loss 12.973 → 5.399; corrected K3 loss
 14.508 → 4.865 and depth-0 accuracy 0% → 44.69%. K3 used 256 training/64 held-out
 conversations, length 512, fresh TP8/PP2 targets, and one-rank Eagle3 training on
-GB200. This does not qualify multimodal, distributed queues/RDMA or live acceptance.
+GB200. This does not qualify multimodal, distributed queues/RDMA, or live acceptance.
 
 The experimental runners and full provenance remain available at the
 [qualified source snapshot](https://github.com/lightseekorg/TorchSpec/tree/2d47940ea1844327553e26a21890467c60d5d42c/tools/qualification).

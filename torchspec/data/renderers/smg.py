@@ -100,7 +100,20 @@ def effective_renderer(args):
 
 
 def prepare_checkpoint(source, revision=None):
-    """Resolve once before multiprocessing, and fingerprint actual tokenizer assets."""
+    """Resolve once before multiprocessing, and fingerprint actual tokenizer assets.
+
+    Args:
+        source: Local checkpoint directory or Hugging Face repository ID.
+        revision: Optional repository revision used when downloading artifacts.
+
+    Returns:
+        A (resolved_path, digest) tuple containing the absolute local checkpoint
+        directory and a SHA-256 fingerprint of the binding version, build features,
+        adapter cache version, and tokenizer asset paths and contents.
+
+    Raises:
+        ImportError: The bundled native binding is missing or older than required.
+    """
     try:
         from torchspec_smg import __version__ as version
         from torchspec_smg import build_features

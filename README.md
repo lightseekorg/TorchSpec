@@ -142,9 +142,9 @@ See [installation details](docs/smg-tokenization.md#installation).
 
 To explicitly use the old tokenizer, set `dataset.rendering_backend: huggingface`
 or pass `dataset.rendering_backend=huggingface` on the CLI. Deferred/decode training,
-other templates and custom renderers retain their existing auto routing. Missing
+other templates, and custom renderers retain their existing auto routing. Missing
 SMG bindings and rendering errors never silently change the selected backend.
-See [SMG setup, supported paths and correctness gates](docs/smg-tokenization.md).
+See [SMG setup, supported paths, and correctness gates](docs/smg-tokenization.md).
 
 ### Backend-Specific Usage
 
