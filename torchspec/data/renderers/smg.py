@@ -51,12 +51,16 @@ def effective_renderer(args):
     Returns:
         "smg" or "smg-kimi-k3" for supported SMG routes, "kimi-k3" for the
         legacy K3 route, an explicit custom renderer name, or None for the
-        legacy template parser. Auto routing preserves unsupported modes and
-        templates on the legacy path; explicit custom renderers are preserved.
+        legacy template parser. For non-K3 models, auto routing preserves
+        unsupported modes and templates on the legacy path. Both built-in K3
+        renderers require complete, unformatted conversations; selecting
+        huggingface does not enable deferred/decode or preformatted/prefix modes.
+        Explicit custom renderers retain their own mode contracts.
 
     Raises:
         ValueError: The backend is unknown, forced SMG would override a custom
-            renderer, or an SMG route requires an incompatible training mode.
+            renderer, or a forced SMG route is incompatible with the requested
+            training mode. Legacy renderers validate modes at their entry points.
     """
     backend = getattr(args, "rendering_backend", "auto")
     renderer = getattr(args, "renderer", None)
@@ -92,6 +96,13 @@ def effective_renderer(args):
         ):
             return legacy_renderer
     if incompatible:
+        if is_k3:
+            raise ValueError(
+                "K3 rendering requires complete, unformatted conversations under every backend, "
+                "including huggingface. Set defer_tokenization=false and train_with_decode=false; "
+                "for public preprocessing, set is_preformatted=false and add_generation_prompt=false. "
+                "The built-in template parser has no K3 XTML template or mask policy."
+            )
         raise ValueError(
             "SMG rendering requires defer_tokenization=false and train_with_decode=false; "
             "set dataset.rendering_backend=huggingface for the legacy path"

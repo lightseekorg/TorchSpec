@@ -141,8 +141,10 @@ builds need Rust 1.98.0; prebuilt wheels and our Docker runtime images do not.
 See [installation details](docs/smg-tokenization.md#installation).
 
 To explicitly use the old tokenizer, set `dataset.rendering_backend: huggingface`
-or pass `dataset.rendering_backend=huggingface` on the CLI. Deferred/decode training,
-other templates, and custom renderers retain their existing auto routing. Missing
+or pass `dataset.rendering_backend=huggingface` on the CLI. Non-K3 deferred/decode training,
+other templates, and custom renderers retain their existing auto routing. Both built-in
+K3 backends require complete, unformatted conversations; the HF fallback does not
+enable deferred/decode or preformatted/generation-prefix modes. Missing
 SMG bindings and rendering errors never silently change the selected backend.
 See [SMG setup, supported paths, and correctness gates](docs/smg-tokenization.md).
 

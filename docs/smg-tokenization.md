@@ -24,8 +24,10 @@ require an upstream SMG span API.
 | Input/configuration | Route |
 | --- | --- |
 | Text with `llama3`, `qwen`, `qwen3-thinking`, `minimax-m2` | SMG |
-| Kimi-K3 text, identified by renderer/model name/local config | SMG K3 |
-| Deferred tokenization, decode training, other templates, custom renderers | Existing path |
+| Kimi-K3 complete text conversations, identified by renderer/model name/local config | SMG K3 |
+| Kimi-K3 deferred/decode training or preformatted/generation-prefix public APIs | Rejected by both built-in backends |
+| Non-K3 deferred/decode training or preformatted/generation-prefix public APIs, other templates | Existing path |
+| Explicit custom renderers | Existing renderer and its mode contract |
 | Pretokenized datasets with masks | No re-rendering |
 
 To select the Python implementation explicitly:
@@ -50,7 +52,7 @@ explicit `target_model_path`; `smg_revision` pins remote artifacts. `smg_options
 accepts `template_kwargs`, `include_end_token`, and `render_instant`. Per-row `tools`
 and `generation_config` are forwarded. Native renderers are initialized inside
 map workers, and explicit dataset cache names include backend/assets and mask
-policy. Preformatted text and generation-prefix requests keep their legacy routes;
+policy. Non-K3 preformatted text and generation-prefix requests keep their legacy routes;
 forcing SMG for those modes raises an error.
 
 For generic SMG text profiles, `smg_template_kwargs` configures rendering and
@@ -104,6 +106,19 @@ validation performs an extra reference encode, so encoder speedups do not imply
 the same end-to-end training speedup.
 
 ## K3 policy
+
+Both built-in K3 renderers require complete, unformatted conversations:
+`defer_tokenization=false` and `train_with_decode=false`, or
+`is_preformatted=false` and `add_generation_prompt=false` for public preprocessing.
+Choosing `rendering_backend=huggingface` selects the checkpoint-Python K3 renderer;
+it does not enable these unsupported modes. Use complete message lists with these
+flags disabled. Supporting K3 deferred/decode or prefix inputs requires a separate
+implementation that preserves native segmented IDs and their assistant masks.
+
+This is a compatibility change: before this integration, leaving `renderer` unset
+could send K3 inputs through the generic template/parser path. The built-in registry
+has no K3 XTML template or mask policy, so that route is now rejected rather than
+treated as a valid fallback. Explicit custom renderers keep their own contracts.
 
 Use `renderer: kimi-k3` explicitly when a model alias hides its family. SMG keeps
 K3's native segmented IDs; TorchSpec never flattens/re-encodes or strips generated
