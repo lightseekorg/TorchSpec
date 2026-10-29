@@ -1,5 +1,12 @@
 ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.14-cu130
-FROM ${SGLANG_IMAGE} AS sglang
+FROM ${SGLANG_IMAGE} AS base
+
+# Compile against the runtime base for matching architecture and libc.
+FROM base AS torchspec-builder
+COPY . /tmp/torchspec
+RUN bash /tmp/torchspec/bindings/smg-tokenizer/build-wheel.sh
+
+FROM base AS sglang
 
 WORKDIR /root/
 
@@ -9,8 +16,14 @@ RUN cd /sgl-workspace/sglang && \
     rm /sgl-workspace/sglang.patch && \
     cd python && pip install -e .
 
+# Install this checkout as one wheel, then resolve its Python dependencies.
+COPY --from=torchspec-builder /opt/torchspec-wheels/ /tmp/torchspec-wheels/
+RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/torchspec-wheels/*.whl && \
+    python3 -c "from torchspec_smg import Tokenizer, build_features; assert build_features == 'default'" && \
+    rm -rf /tmp/torchspec-wheels
+
 COPY . /root/torchspec
-RUN cd /root/torchspec && pip install --no-cache-dir -e ".[fa]"
+RUN python3 -m pip install --no-cache-dir "torchspec[fa]==$(python3 -c 'from importlib.metadata import version; print(version("torchspec"))')"
 
 # TorchSpec's dependency pulls the generic CUDA 12 Mooncake wheel. Replace it
 # with the CUDA 13 wheel that matches this image family.

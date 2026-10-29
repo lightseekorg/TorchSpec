@@ -44,6 +44,11 @@ class DatasetConfig:
     min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
     prompt_key: str = "conversations"
     renderer: Optional[str] = None  # registered ConversationRenderer; overrides chat_template
+    rendering_backend: str = "auto"  # SMG for supported text profiles; huggingface forces legacy
+    smg_revision: Optional[str] = None  # pin tokenizer files when loading from the Hub
+    smg_template_kwargs: dict = field(default_factory=dict)
+    smg_include_end_token: bool = True
+    smg_render_instant: Optional[str] = None  # RFC3339 instant for clock-dependent templates
     shuffle_dataset: bool = True
     train_data_path: str = ""
 
@@ -428,6 +433,9 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
                 _add(f"{prefix}{key}", val, f"{section_name}.{key}")
 
     # --- Computed / alias fields ---
+    from torchspec.data.renderers.smg import effective_renderer
+
+    flat["renderer"] = effective_renderer(argparse.Namespace(**flat))
     flat["world_size"] = flat["training_num_nodes"] * flat["training_num_gpus_per_node"]
     flat["rank"] = 0
     if flat.get("inference_engine_type") == "offline":
@@ -441,6 +449,7 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
         flat.get("inference_engine_type") != "offline"
         and (flat["defer_tokenization"] or bool(flat.get("renderer")))
         and not flat["train_with_decode"]
+        and flat.get("renderer") not in ("smg", "smg-kimi-k3")  # SMG supplies packed masks
     )
     flat["use_wandb"] = flat.get("use_wandb", False) or flat.get("report_to") == "wandb"
     flat["use_tensorboard"] = (

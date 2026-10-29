@@ -40,9 +40,14 @@ def get_assistant_token_ids(
         the formatting newline after the role name.
     """
     from torchspec.data.renderers import RENDERER_REGISTRY
+    from torchspec.data.renderers.smg import effective_renderer
     from torchspec.data.template import TEMPLATE_REGISTRY
 
-    renderer_name = getattr(args, "renderer", None)
+    renderer_name = effective_renderer(args)
+    if renderer_name in ("smg", "smg-kimi-k3"):
+        # No dynamic re-masking: SMG's supported text path supplies the mask
+        # against the exact IDs sent to the target model.
+        return None, None, 0
     if renderer_name:
         tokenizer = load_tokenizer(args.target_model_path, trust_remote_code=True)
         renderer = RENDERER_REGISTRY.create(renderer_name, tokenizer)

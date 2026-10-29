@@ -1,0 +1,4 @@
+include version.txt rust-toolchain.toml
+include bindings/smg-tokenizer/Cargo.toml bindings/smg-tokenizer/Cargo.lock
+include bindings/smg-tokenizer/build.rs
+recursive-include bindings/smg-tokenizer/src *.rs

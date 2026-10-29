@@ -7,3 +7,9 @@ docker/
 *.egg-info/
 __pycache__/
 .ruff_cache/
+**/target/
+**/.venv/
+dist/
+wheelhouse/
+bindings/smg-tokenizer/python/torchspec_smg/*.so
+bindings/smg-tokenizer/python/torchspec_smg/*.pyd

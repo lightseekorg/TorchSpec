@@ -32,6 +32,7 @@ Draft models trained with TorchSpec, available from other organizations:
 
 ## 🚀 Blogs and Announcements
 
+- TorchSpec now integrates [SMG](https://github.com/smg-project/smg) for chat templating and tokenization in supported text training paths. (Oct 2026)
 - 🔥 [TorchSpec: Speculative Decoding Training at Scale](https://www.youtube.com/watch?v=M7fbxwBSIeI) (Youtube Video, Ray Summit 2026)
 - [Releasing Kimi K3 Draft Collection: Efficient Draft Training in TorchSpec](https://lightseek.org/blog/kimi-k3-draft-collection.html) (Sep 2026)
 - [EAGLE 3.1: Advancing Speculative Decoding Through Collaboration Between the EAGLE Team, vLLM, and TorchSpec](https://lightseek.org/blog/eagle-3-1.html) (May 2026)
@@ -94,6 +95,14 @@ Override config values directly from the CLI:
 
 ### Quick Setup
 
+Source installs build the bundled Rust tokenizer. Install [Rust/rustup](https://rustup.rs/)
+and select the pinned toolchain first (prebuilt wheels and Docker runtime images
+do not need a compiler):
+
+```bash
+rustup toolchain install 1.98.0 --profile minimal
+```
+
 ```bash
 # Install with vLLM
 ./tools/build_conda.sh 1 vllm
@@ -122,6 +131,22 @@ Optional: install Flash Attention support:
 ```bash
 pip install -e ".[fa]"
 ```
+
+### Training tokenizer
+
+Supported text profiles (`llama3`, `qwen`, `qwen3-thinking`, `minimax-m2`) and
+Kimi-K3 use SMG's Rust tokenizer in-process by default. Its native extension ships
+in the TorchSpec wheel, and `pip install -e .` builds it automatically. Source
+builds need Rust 1.98.0; prebuilt wheels and our Docker runtime images do not.
+See [installation details](docs/smg-tokenization.md#installation).
+
+To explicitly use the old tokenizer, set `dataset.rendering_backend: huggingface`
+or pass `dataset.rendering_backend=huggingface` on the CLI. Non-K3 deferred/decode training,
+other templates, and custom renderers retain their existing auto routing. Both built-in
+K3 backends require complete, unformatted conversations; the HF fallback does not
+enable deferred/decode or preformatted/generation-prefix modes. Missing
+SMG bindings and rendering errors never silently change the selected backend.
+See [SMG setup, supported paths, and correctness gates](docs/smg-tokenization.md).
 
 ### Backend-Specific Usage
 
