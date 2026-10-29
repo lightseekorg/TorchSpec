@@ -15,7 +15,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        encode_path: [default, v1]
+        include:
+          - variant: default
+            encode_path: default
+            features: ''
+          - variant: v1
+            encode_path: v1
+            features: tokenizers-v1
+          - variant: multimodal
+            encode_path: default
+            features: multimodal
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
@@ -32,14 +41,22 @@ jobs:
       - name: Build and install TorchSpec with its native extension
         env:
           RUSTUP_TOOLCHAIN: '1.98.0'
-          ENCODE_PATH: ${{ matrix.encode_path }}
+          TORCHSPEC_SMG_FEATURES: ${{ matrix.features }}
         run: |
-          if [[ "$ENCODE_PATH" == v1 ]]; then export TORCHSPEC_SMG_FEATURES=tokenizers-v1; fi
           python -m build --outdir wheelhouse
           uv pip install --system wheelhouse/torchspec-*.whl pytest -r tools/qualification/tokenizer-requirements.txt
           python -I -c "import torchspec, torchspec_smg, torchspec_smg._native"
       - name: Test bundled binding
         run: python -m pytest -q bindings/smg-tokenizer/tests
+      - name: Require native image preparation
+        if: matrix.variant == 'multimodal'
+        env:
+          SMG_MM_THREADS: '1'
+          TOKENIZERS_PARALLELISM: 'false'
+          PYTHONPATH: .
+        run: |
+          python -I -c "from torchspec_smg import _native; assert _native.MULTIMODAL"
+          python -m pytest -q tests/test_smg_vision.py -k 'not vllm and not generation'
       - name: Require exact rendering, IDs, masks and encoder selection
         env:
           TOKENIZERS_PARALLELISM: 'false'
@@ -52,5 +69,5 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: tokenizer-contract-${{ matrix.encode_path }}
+          name: tokenizer-contract-${{ matrix.variant }}
           path: tokenizer-contract.json
