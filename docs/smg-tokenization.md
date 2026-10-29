@@ -163,7 +163,7 @@ GB200. This does not qualify multimodal, distributed queues/RDMA or live accepta
 The experimental runners and full provenance remain available at the
 [qualified source snapshot](https://github.com/lightseekorg/TorchSpec/tree/2d47940ea1844327553e26a21890467c60d5d42c/tools/qualification).
 They are kept out of this integration's final diff. Earlier K3 explicit-null
-convergence established old-path equivalence only; the results above use the
+convergence established old-path equivalence only; the paired results reported here use the
 corrected checkpoint default.
 
 The newly accepted K3 nested/float arguments and null-effort inputs require

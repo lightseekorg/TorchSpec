@@ -14,6 +14,8 @@ from tests.tokenizer_contract.support import load_manifest, resolve_checkpoint
 
 
 class RequiredCases:
+    """Track skipped, xfailed or deselected cases; fail if any exist or none pass."""
+
     def __init__(self):
         self.invalid = []
         self.passed = 0

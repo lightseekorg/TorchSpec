@@ -16,17 +16,21 @@ class Tokenizer:
         self._inner = _Tokenizer(str(path), chat_template_path)
 
     def encode(self, text, *, add_special_tokens=False):
+        """Return token IDs for text, optionally adding the encoder's special tokens."""
         return self._inner.encode(text, add_special_tokens)
 
     def token_to_id(self, token):
+        """Return the vocabulary ID for a token, or None if it is unknown."""
         return self._inner.token_to_id(token)
 
     @property
     def encode_path(self):
+        """Return the name of the selected native encoder path."""
         return self._inner.encode_path
 
     @property
     def raw_tool_call_arguments(self):
+        """Return whether the renderer accepts raw JSON strings as tool-call arguments."""
         return self._inner.raw_tool_call_arguments
 
     def render(self, messages, *, tools=None, template_kwargs=None, now=None):

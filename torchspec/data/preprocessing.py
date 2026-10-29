@@ -196,6 +196,9 @@ def preprocess_conversations(
         add_generation_prompt: Whether to append assistant header for generation.
                                Only used when is_preformatted=False.
         return_formatted_text: If True, include full, untruncated rendered text.
+        last_turn_loss_only: Whether to supervise only the final assistant turn.
+        min_loss_tokens: Minimum supervised tokens required after truncation;
+            sequences with no supervised tokens are always skipped.
         rendering_backend: Shared auto/smg/huggingface selection. Auto uses SMG
             for supported complete text conversations; preformatted and generation
             inputs keep their existing paths.
@@ -363,6 +366,15 @@ def build_eagle3_dataset(
                         If False, expects "conversations" column with ShareGPT format.
         include_attention_mask: Whether to include attention_mask in the output.
                                If False, attention_mask can be generated as ones on the inference side.
+        rendering_backend: Shared auto/smg/huggingface selection. Auto uses SMG
+            for supported complete text conversations; preformatted inputs keep
+            their existing path.
+        target_model_path: Checkpoint artifacts for SMG; defaults to tokenizer.name_or_path.
+        smg_revision: Optional checkpoint revision, resolved before loading SMG.
+        smg_options: Renderer options: template_kwargs, include_end_token, render_instant.
+        last_turn_loss_only: Whether to supervise only the final assistant turn.
+        min_loss_tokens: Minimum supervised tokens required after truncation;
+            sequences with no supervised tokens are always skipped.
 
     Returns:
         The processed HF dataset.

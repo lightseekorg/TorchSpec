@@ -24,6 +24,13 @@ from torchspec.data.renderers.kimi_k3 import K3Renderer
 
 
 class _K3Tokenizer:
+    """Adapt SMG's native segmented encoding to the K3 checkpoint interface.
+
+    Attributes:
+        native: Bundled SMG tokenizer used for rendering and encoding.
+        special_tokens: K3 message-boundary token strings mapped to their IDs.
+    """
+
     def __init__(self, source):
         from torchspec_smg import Tokenizer
 
