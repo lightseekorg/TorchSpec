@@ -287,6 +287,7 @@ def test_explicit_legacy_dataset_does_not_import_smg(checkpoint, tmp_path, monke
         use_packed_loss_mask=True,
         add_generation_prompt=False,
         return_formatted_text=True,
+        rendering_backend="huggingface",
         last_turn_loss_only=True,
     )
     args = SimpleNamespace(
@@ -312,3 +313,53 @@ def test_explicit_legacy_dataset_does_not_import_smg(checkpoint, tmp_path, monke
         unpack_loss_mask(rows[0]["packed_loss_mask"]).tolist()
         == unpack_loss_mask(expected["packed_loss_mask"][0]).tolist()
     )
+
+
+@pytest.mark.parametrize("num_proc", [None, 2])
+def test_public_preprocessing_routes_and_caches_by_backend(checkpoint, tmp_path, num_proc):
+    from datasets import Dataset
+
+    from torchspec.data.preprocessing import build_eagle3_dataset, preprocess_conversations
+    from torchspec.data.utils import unpack_loss_mask
+
+    path, hf = checkpoint
+    rows = messages()
+    options = {"include_end_token": False}
+    expected_ids, expected_mask, text = SmgRenderer(path, "qwen", **options).render(
+        rows,
+        max_seq_length=4096,
+        last_turn_only=True,
+        return_formatted_text=True,
+    )
+    direct = preprocess_conversations(
+        hf,
+        [rows],
+        "qwen",
+        max_length=4096,
+        target_model_path=str(path),
+        smg_options=options,
+        last_turn_loss_only=True,
+        return_formatted_text=True,
+    )
+    assert direct["input_ids"][0].tolist() == [expected_ids]
+    assert unpack_loss_mask(direct["packed_loss_mask"][0]).tolist() == expected_mask
+    assert direct["formatted_text"] == [text]
+    dataset = Dataset.from_dict({"conversations": [rows, rows]})
+    kwargs = dict(
+        chat_template="qwen",
+        max_length=4096,
+        target_model_path=str(path),
+        num_proc=num_proc,
+        smg_options=options,
+        last_turn_loss_only=True,
+        cache_dir=str(tmp_path / "cache"),
+        cache_key="same-key",
+        shuffle_seed=None,
+    )
+    smg = build_eagle3_dataset(dataset, hf, **kwargs)
+    cached = build_eagle3_dataset(dataset, hf, **kwargs)
+    legacy = build_eagle3_dataset(dataset, hf, rendering_backend="huggingface", **kwargs)
+    assert len(list((tmp_path / "cache").glob("*.pkl"))) == 2 * (num_proc or 1)
+    assert smg[0]["input_ids"].tolist() == cached[0]["input_ids"].tolist() == [expected_ids]
+    assert unpack_loss_mask(smg[0]["packed_loss_mask"]).tolist() == expected_mask
+    assert smg[0]["packed_loss_mask"] != legacy[0]["packed_loss_mask"]

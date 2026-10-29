@@ -210,7 +210,14 @@ class SmgRenderer:
             )
 
     def render(
-        self, messages, tools=None, *, max_seq_length, last_turn_only=False, generation_config=None
+        self,
+        messages,
+        tools=None,
+        *,
+        max_seq_length,
+        last_turn_only=False,
+        generation_config=None,
+        return_formatted_text=False,
     ):
         """Render and tokenize a complete conversation with an assistant loss mask.
 
@@ -225,6 +232,8 @@ class SmgRenderer:
             generation_config: Optional dictionary whose chat_template_kwargs
                 and explicit thinking/reasoning settings override the renderer's
                 template kwargs for this row.
+            return_formatted_text: Append the same render's full, untruncated text
+                as a third result; it is metadata, never a source for re-encoding.
 
         Returns:
             An (input_ids, loss_mask) tuple of equally sized lists, right-truncated
@@ -378,4 +387,5 @@ class SmgRenderer:
                         "SMG tokenizer has no offsets and BPE crosses a supervision boundary"
                     )
                 mask[len(left) : len(right)] = [1] * (len(right) - len(left))
-        return ids[:max_seq_length], mask[:max_seq_length]
+        output = (ids[:max_seq_length], mask[:max_seq_length])
+        return (*output, text) if return_formatted_text else output

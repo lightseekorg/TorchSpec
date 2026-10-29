@@ -20,8 +20,6 @@
 
 """SMG's segmented K3 encoding with checkpoint-default generation settings."""
 
-import json
-
 from torchspec.data.renderers.kimi_k3 import K3Renderer
 
 
@@ -40,27 +38,19 @@ class _K3Tokenizer:
 
         Callers must supply tokenize=True, add_generation_prompt=False,
         preserve_thinking=True, padding=False, truncation=False,
-        return_tensors=None and return_dict=False, with no extra kwargs except
+        return_tensors=None and a boolean return_dict, with no extra kwargs except
         thinking_effort. Omitted effort retains SMG's checkpoint default;
-        explicit null effort is rejected when thinking is enabled.
+        null effort follows SMG's default when thinking is enabled.
 
-        Object, array and float tool-argument values, including those parsed
-        from JSON strings, are rejected because checkpoint-equivalent formatting
-        is not guaranteed. Invalid JSON strings remain native raw JSON blocks.
-        ValueError is raised for these unsupported values, non-text content,
-        an incompatible keyword contract, or non-segmented native output.
-        Returned IDs are neither re-encoded nor truncated here.
+        Tool arguments are serialized by SMG, including nested values and floats.
+        Returned IDs are neither re-encoded nor truncated here. return_dict=True
+        additionally returns native text for callers requesting formatted output.
         """
         template_kwargs = {"thinking": thinking}
         if "thinking_effort" in kwargs:
             effort = kwargs.pop("thinking_effort")
-            # SMG currently maps explicit null to max, unlike the checkpoint.
-            # Reject this unsupported mode instead of rewriting rendered IDs.
-            if thinking and effort is None:
-                raise ValueError(
-                    "SMG K3 does not support explicit null effort with thinking enabled"
-                )
             template_kwargs["thinking_effort"] = effort
+        return_dict = kwargs.pop("return_dict", False)
         expected = {
             "tokenize": True,
             "add_generation_prompt": False,
@@ -68,9 +58,8 @@ class _K3Tokenizer:
             "padding": False,
             "truncation": False,
             "return_tensors": None,
-            "return_dict": False,
         }
-        if kwargs != expected:
+        if kwargs != expected or not isinstance(return_dict, bool):
             raise ValueError("SMG K3 requires the complete-conversation training contract")
         for message in messages:
             if message.get("content") is not None and not isinstance(message["content"], str):
@@ -78,23 +67,6 @@ class _K3Tokenizer:
                     "SMG K3 training currently accepts text-only string content; "
                     "set dataset.rendering_backend=huggingface for the legacy path"
                 )
-            if message.get("role") == "assistant":
-                for call in message.get("tool_calls") or []:
-                    arguments = call.get("function", call).get("arguments")
-                    if isinstance(arguments, str):
-                        try:
-                            arguments = json.loads(arguments)
-                        except json.JSONDecodeError:
-                            # Both renderers preserve invalid JSON as a raw block.
-                            continue
-                    if isinstance(arguments, dict) and any(
-                        isinstance(value, (dict, list, float)) for value in arguments.values()
-                    ):
-                        raise ValueError(
-                            "SMG K3 tool arguments containing objects, arrays or floats "
-                            "are not checkpoint-equivalent; set "
-                            "dataset.rendering_backend=huggingface"
-                        )
         result = self.native.render(
             messages,
             tools=tools,
@@ -102,20 +74,69 @@ class _K3Tokenizer:
         )
         if not result["segmentwise"]:
             raise ValueError("Expected the native segmented K3 renderer")
-        return result["input_ids"]
+        return result if return_dict else result["input_ids"]
 
 
 class SmgK3Renderer(K3Renderer):
     """Render Kimi-K3 text using SMG's native segmented encoding.
 
     Construct with a local checkpoint source path. The parent renderer supplies
-    assistant-mask construction, end-of-message exclusion, last-turn selection
-    and synchronized truncation of token IDs and masks.
+    assistant-mask construction, end-of-message exclusion and last-turn selection.
+    IDs and masks are truncated together after native rendering.
     """
 
     # Reuse the established thinking validation, token-ID matcher, EOM policy,
-    # last-turn selection and truncation without duplicating training semantics.
-    CACHE_VERSION = "smg-k3-native-v3-" + K3Renderer.CACHE_VERSION
+    # last-turn selection. SMG owns tool-argument serialization.
+    CACHE_VERSION = "smg-k3-native-v4-" + K3Renderer.CACHE_VERSION
 
     def __init__(self, source):
         super().__init__(_K3Tokenizer(source))
+
+    @classmethod
+    def _resolve_generation_config(cls, generation_config):
+        # SMG treats missing/null effort as its default max. Keep the shared
+        # validation for invalid effort names and contradictory row metadata.
+        if isinstance(generation_config, dict):
+            generation_config = dict(generation_config)
+            generation_config.setdefault("thinking", True)
+            if generation_config["thinking"] and generation_config.get("thinking_effort") is None:
+                generation_config["thinking_effort"] = "max"
+        return super()._resolve_generation_config(generation_config)
+
+    def render(
+        self,
+        messages,
+        tools=None,
+        *,
+        max_seq_length,
+        last_turn_only=False,
+        generation_config=None,
+        return_formatted_text=False,
+    ):
+        """Mask native SMG IDs; optionally return the same render's full text."""
+        if (
+            not isinstance(max_seq_length, int)
+            or isinstance(max_seq_length, bool)
+            or max_seq_length <= 0
+        ):
+            raise ValueError("max_seq_length must be a positive integer")
+        thinking, effort = self._resolve_generation_config(generation_config)
+        if not thinking:
+            self._validate_disabled_thinking_messages(messages)
+        result = self.tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            thinking=thinking,
+            thinking_effort=effort,
+            tokenize=True,
+            add_generation_prompt=False,
+            preserve_thinking=True,
+            padding=False,
+            truncation=False,
+            return_tensors=None,
+            return_dict=True,
+        )
+        ids = self._normalize_token_ids(result["input_ids"])
+        mask = self.compute_loss_mask(ids, last_turn_only=last_turn_only)
+        output = (ids[:max_seq_length], mask[:max_seq_length])
+        return (*output, result["text"]) if return_formatted_text else output

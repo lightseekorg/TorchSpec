@@ -23,12 +23,15 @@
 import os
 import warnings
 from collections import Counter
+from functools import partial
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numba
 import numpy as np
 import torch
 from datasets import Dataset as HFDataset
+from datasets.fingerprint import Hasher
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
@@ -41,6 +44,9 @@ except ImportError:
     process_vision_info = None
 
 from torchspec.data.parse import create_parser
+from torchspec.data.renderers.kimi_k3 import K3Renderer
+from torchspec.data.renderers.smg import SmgRenderer, effective_renderer, prepare_checkpoint
+from torchspec.data.renderers.smg_k3 import SmgK3Renderer
 from torchspec.data.template import TEMPLATE_REGISTRY, ChatTemplate
 from torchspec.data.utils import (
     pack_loss_mask,
@@ -95,11 +101,69 @@ def _normalize_conversation(conversation: Conversation) -> Conversation:
     return conversation
 
 
+def _prepare_conversation_renderer(
+    tokenizer,
+    chat_template,
+    *,
+    rendering_backend,
+    is_preformatted,
+    add_generation_prompt=False,
+    target_model_path=None,
+    smg_revision=None,
+    smg_options=None,
+):
+    """Resolve the shared backend policy and a process-local renderer factory."""
+    template_name = next(
+        (
+            name
+            for name, template in TEMPLATE_REGISTRY.templates.items()
+            if template == chat_template
+        ),
+        None,
+    )
+    source = target_model_path or getattr(tokenizer, "name_or_path", "")
+    name = effective_renderer(
+        SimpleNamespace(
+            rendering_backend=rendering_backend,
+            chat_template=template_name,
+            target_model_path=source,
+            defer_tokenization=is_preformatted,
+            train_with_decode=add_generation_prompt,
+        )
+    )
+    if name and (is_preformatted or add_generation_prompt):
+        raise ValueError("Registered dataset renderers require complete, unformatted conversations")
+    options = dict(smg_options or {})
+    signature = {"renderer": name, "source": str(source), "options": options}
+    if name in ("smg", "smg-kimi-k3"):
+        if not source:
+            raise ValueError("SMG requires tokenizer.name_or_path or target_model_path")
+        source, signature["assets"] = prepare_checkpoint(source, smg_revision)
+        if name == "smg-kimi-k3":
+            if options.get("template_kwargs") or options.get("render_instant") is not None:
+                raise ValueError(
+                    "SMG K3 uses per-row generation_config; template overrides are unsupported"
+                )
+            factory = partial(SmgK3Renderer, source)
+            signature["version"] = SmgK3Renderer.CACHE_VERSION
+        else:
+            if template_name is None:
+                raise ValueError("SMG requires a registered chat_template for assistant boundaries")
+            factory = partial(SmgRenderer, source, template_name, **options)
+            signature["version"] = SmgRenderer.CACHE_VERSION
+    elif name == "kimi-k3":
+        factory = partial(K3Renderer, tokenizer)
+        signature["version"] = K3Renderer.CACHE_VERSION
+    else:
+        factory = None
+    return factory, signature
+
+
 # Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
 def preprocess_conversations(
     tokenizer: PreTrainedTokenizer,
     conversations: Union[List[Conversation], List[str]],
-    chat_template: ChatTemplate,
+    chat_template: Union[ChatTemplate, str, None],
     max_length: int = 2048,
     is_preformatted: bool = False,
     include_attention_mask: bool = True,
@@ -108,6 +172,11 @@ def preprocess_conversations(
     return_formatted_text: bool = False,
     last_turn_loss_only: bool = False,
     min_loss_tokens: int = 0,  # DFlash: skip sequences with too few supervised tokens for anchor sampling
+    rendering_backend: str = "auto",
+    target_model_path: Optional[str] = None,
+    smg_revision: Optional[str] = None,
+    smg_options: Optional[dict] = None,
+    _renderer=None,
     **kwargs,
 ) -> Dict[str, List]:
     """
@@ -126,7 +195,13 @@ def preprocess_conversations(
                              If False, store as tensor (legacy behavior).
         add_generation_prompt: Whether to append assistant header for generation.
                                Only used when is_preformatted=False.
-        return_formatted_text: If True, include 'formatted_text' in the output.
+        return_formatted_text: If True, include full, untruncated rendered text.
+        rendering_backend: Shared auto/smg/huggingface selection. Auto uses SMG
+            for supported complete text conversations; preformatted and generation
+            inputs keep their existing paths.
+        target_model_path: Checkpoint artifacts for SMG; defaults to tokenizer.name_or_path.
+        smg_revision: Optional checkpoint revision, resolved before loading SMG.
+        smg_options: Renderer options: template_kwargs, include_end_token, render_instant.
 
     Returns:
         A dictionary containing:
@@ -146,7 +221,24 @@ def preprocess_conversations(
     if return_formatted_text:
         results["formatted_text"] = []
 
-    parser = create_parser(tokenizer, chat_template)
+    if isinstance(chat_template, str):
+        chat_template = TEMPLATE_REGISTRY.get(chat_template)
+    renderer = _renderer
+    if renderer is None:
+        factory, _ = _prepare_conversation_renderer(
+            tokenizer,
+            chat_template,
+            rendering_backend=rendering_backend,
+            is_preformatted=is_preformatted,
+            add_generation_prompt=add_generation_prompt,
+            target_model_path=target_model_path,
+            smg_revision=smg_revision,
+            smg_options=smg_options,
+        )
+        renderer = factory() if factory is not None else None
+    if renderer is None and chat_template is None:
+        raise ValueError("chat_template is required unless the checkpoint identifies Kimi-K3")
+    parser = create_parser(tokenizer, chat_template) if renderer is None else None
 
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
@@ -155,20 +247,57 @@ def preprocess_conversations(
     for source, kwargs_item in zip(conversations, kwargs_list):
         if not source:
             continue
-        source = _normalize_conversation(source)
-
-        if is_preformatted:
-            formatted = source
-        else:
-            formatted = parser.format(
-                source, add_generation_prompt=add_generation_prompt, **kwargs_item
+        if renderer is not None:
+            source = _normalize_conversation(source)
+            render_kwargs = dict(
+                max_seq_length=max_length,
+                last_turn_only=last_turn_loss_only,
+                generation_config=kwargs_item.get("generation_config"),
             )
-        input_ids, loss_mask = parser.parse(
-            formatted,
-            max_length,
-            preformatted=True,
-            last_turn_only=last_turn_loss_only,
-        )
+            if isinstance(renderer, (SmgRenderer, SmgK3Renderer)):
+                input_ids, loss_mask, formatted = renderer.render(
+                    source,
+                    kwargs_item.get("tools"),
+                    return_formatted_text=True,
+                    **render_kwargs,
+                )
+            else:
+                input_ids, loss_mask = renderer.render(
+                    source, kwargs_item.get("tools"), **render_kwargs
+                )
+                formatted = None
+                if return_formatted_text:
+                    thinking, effort = renderer._resolve_generation_config(
+                        kwargs_item.get("generation_config")
+                    )
+                    effort_kwargs = (
+                        {"thinking_effort": effort} if effort is not None or not thinking else {}
+                    )
+                    formatted = tokenizer.apply_chat_template(
+                        source,
+                        tools=kwargs_item.get("tools"),
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        preserve_thinking=True,
+                        thinking=thinking,
+                        **effort_kwargs,
+                    )
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+            loss_mask = torch.tensor(loss_mask, dtype=torch.long)
+        else:
+            if is_preformatted:
+                formatted = source
+            else:
+                source = _normalize_conversation(source)
+                formatted = parser.format(
+                    source, add_generation_prompt=add_generation_prompt, **kwargs_item
+                )
+            input_ids, loss_mask = parser.parse(
+                formatted,
+                max_length,
+                preformatted=True,
+                last_turn_only=last_turn_loss_only,
+            )
 
         # Skip sequences with insufficient supervised tokens. For DFlash, anchor
         # sampling needs enough valid positions; sequences with near-zero loss_mask
@@ -200,9 +329,18 @@ def build_eagle3_dataset(
     cache_key: Optional[str] = None,
     is_preformatted: Optional[bool] = False,
     include_attention_mask: bool = True,
+    rendering_backend: str = "auto",
+    target_model_path: Optional[str] = None,
+    smg_revision: Optional[str] = None,
+    smg_options: Optional[dict] = None,
+    last_turn_loss_only: bool = False,
+    min_loss_tokens: int = 0,
 ) -> HFDataset:
     """
-    build eagle3 dataset
+    Build an Eagle3 dataset using the shared rendering backend policy.
+
+    SMG workers initialize their native renderer once. Explicit caches include
+    backend, checkpoint assets, input data and supervision settings in their key.
 
     Args:
         dataset: HF dataset to process.
@@ -229,32 +367,55 @@ def build_eagle3_dataset(
     Returns:
         The processed HF dataset.
     """
-    if chat_template is None:
-        raise ValueError("chat_template must be provided for all dataset types")
+    template = TEMPLATE_REGISTRY.get(chat_template) if chat_template is not None else None
 
-    assert chat_template in TEMPLATE_REGISTRY.get_all_template_names(), (
-        f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
+    factory, renderer_signature = _prepare_conversation_renderer(
+        tokenizer,
+        template,
+        rendering_backend=rendering_backend,
+        is_preformatted=is_preformatted,
+        target_model_path=target_model_path,
+        smg_revision=smg_revision,
+        smg_options=smg_options,
     )
-
-    template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
+    if factory is None and template is None:
+        raise ValueError("chat_template is required unless the checkpoint identifies Kimi-K3")
+    # SMG workers only need resolved checkpoint paths, not a pickled HF tokenizer.
+    worker_tokenizer = (
+        None if renderer_signature["renderer"] in ("smg", "smg-kimi-k3") else tokenizer
+    )
+    renderer = None  # Native objects are initialized inside each map worker.
 
     if shuffle_seed is not None:
         dataset = dataset.shuffle(seed=shuffle_seed)
     original_cols = dataset.column_names
 
     def preprocess_function(examples):
+        nonlocal renderer
+        if renderer is None and factory is not None:
+            renderer = factory()
+        backend_kwargs = dict(
+            rendering_backend=rendering_backend,
+            target_model_path=target_model_path,
+            smg_revision=smg_revision,
+            smg_options=smg_options,
+            _renderer=renderer,
+            last_turn_loss_only=last_turn_loss_only,
+            min_loss_tokens=min_loss_tokens,
+        )
         if is_preformatted:
             if "text" not in examples:
                 raise ValueError(
                     f"Expected 'text' column for is_preformatted=True, but found columns: {list(examples.keys())}"
                 )
             processed = preprocess_conversations(
-                tokenizer,
+                worker_tokenizer,
                 examples["text"],
                 template,
                 max_length,
                 is_preformatted=True,
                 include_attention_mask=include_attention_mask,
+                **backend_kwargs,
             )
         else:
             if "conversations" not in examples:
@@ -265,22 +426,40 @@ def build_eagle3_dataset(
             if "id" in examples:
                 examples.pop("id")
             processed = preprocess_conversations(
-                tokenizer,
+                worker_tokenizer,
                 conversations,
                 template,
                 max_length,
                 is_preformatted=False,
                 include_attention_mask=include_attention_mask,
+                **backend_kwargs,
                 **examples,
             )
 
         return processed
 
+    # Explicit cache names must distinguish backend/assets/policy as well as rows.
+    cache_digest = Hasher.hash(
+        (
+            "conversation-backend-v1",
+            dataset._fingerprint,
+            worker_tokenizer,
+            renderer_signature,
+            template.model_dump_json() if template is not None else None,
+            max_length,
+            is_preformatted,
+            include_attention_mask,
+            last_turn_loss_only,
+            min_loss_tokens,
+        )
+    )
+    load_from_cache_file = False
+    cache_file_name = None
     # Process dataset only once
     if cache_dir and cache_key:
         load_from_cache_file = True
         os.makedirs(cache_dir, exist_ok=True)
-        cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
+        cache_file_name = os.path.join(cache_dir, f"{cache_key}-{cache_digest}.pkl")
         print(f"dataset is cached at {cache_file_name}")
     elif cache_dir is None and cache_key is None:
         load_from_cache_file = False

@@ -273,6 +273,7 @@ def _tokenize_single(args):
         use_packed_loss_mask=True,
         add_generation_prompt=train_with_decode,
         return_formatted_text=True,
+        rendering_backend="huggingface",  # Backend was already resolved by this worker.
         last_turn_loss_only=last_turn_only,
         min_loss_tokens=_worker_state.get("min_loss_tokens", 0),
     )
