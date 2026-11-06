@@ -23,7 +23,7 @@ require an upstream SMG span API.
 
 | Input/configuration | Route |
 | --- | --- |
-| Text with `llama3`, `qwen`, `qwen3-thinking`, `minimax-m2` | SMG |
+| Text with `llama3`, `qwen`, `qwen3-thinking` | SMG |
 | Kimi-K3 complete text conversations, identified by renderer/model name/local config | SMG K3 |
 | Kimi-K3 deferred/decode training or preformatted/generation-prefix public APIs | Rejected by both built-in backends |
 | Non-K3 deferred/decode training or preformatted/generation-prefix public APIs, other templates | Existing path |

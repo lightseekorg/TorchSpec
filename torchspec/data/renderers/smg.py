@@ -36,7 +36,7 @@ from torchspec.data.template import TEMPLATE_REGISTRY
 
 # Default routing is deliberately bounded to the supported text profiles.
 # Additional templates can still be requested explicitly with backend="smg".
-SMG_DEFAULT_TEMPLATES = frozenset({"llama3", "qwen", "qwen3-thinking", "minimax-m2"})
+SMG_DEFAULT_TEMPLATES = frozenset({"llama3", "qwen", "qwen3-thinking"})
 
 
 def effective_renderer(args):
@@ -352,7 +352,7 @@ class SmgRenderer:
                 if delimiter and text.find(delimiter, body, end) >= 0:
                     raise ValueError("SMG assistant span crosses a role boundary")
             # Registry delimiters sometimes include a formatting newline
-            # (Qwen), sometimes only the marker (MiniMax). End-token loss has
+            # (Qwen), sometimes only the marker (Llama 3). End-token loss has
             # one meaning across profiles: supervise the marker itself, not
             # the newline separating it from the next role.
             spans.append(

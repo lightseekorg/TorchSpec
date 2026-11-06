@@ -18,7 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import json
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -38,7 +37,6 @@ __all__ = [
     "GeneralParser",
     "HarmonyParser",
     "KimiK25Parser",
-    "MiniMaxParser",
     "create_parser",
     "has_thinking_content",
     "has_unbalanced_thinking_tags",
@@ -536,170 +534,6 @@ class KimiK25Parser(Parser):
         )
 
 
-class MiniMaxParser(Parser):
-    """Parser for MiniMax-M2 model with manual string formatting.
-
-    Handles:
-    - Interleaved thinking: preserves <think>...</think> only in the last
-      assistant turn (after the last user message), strips it from earlier turns.
-    - Tool calls with <minimax:tool_call> XML format.
-    - Consecutive tool responses grouped under a single ]~b]tool header.
-    - Multimodal content with vision token placeholders.
-    """
-
-    BOS = "]~!b["
-    ROLE_PREFIX = "]~b]"
-    END_TOKEN = "[e~["
-    SYSTEM_HEADER = "]~!b[]~b]system\n"
-    USER_HEADER = "]~b]user\n"
-    ASSISTANT_HEADER = "]~b]ai\n"
-    TOOL_HEADER = "]~b]tool"
-    TOOL_CALL_BEGIN = "<minimax:tool_call>"
-    TOOL_CALL_END = "</minimax:tool_call>"
-    MEDIA_TOKEN = "]<]start of image[>[" + "]<]vision pad[>[" + "]<]end of image[>["
-    IMAGE_PLACEHOLDER = "<image>"
-
-    THINK_PATTERN = re.compile(r"<think>[\s\S]*?</think>")
-
-    def __init__(self, tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate):
-        super().__init__(tokenizer, chat_template)
-        if chat_template.image_placeholder:
-            self.IMAGE_PLACEHOLDER = chat_template.image_placeholder
-
-    def _format_content(self, content: str, role: str) -> str:
-        if role == "user":
-            return content.replace(self.IMAGE_PLACEHOLDER, self.MEDIA_TOKEN + "\n")
-        return content
-
-    def _strip_thinking(self, content: str) -> str:
-        return self.THINK_PATTERN.sub("", content).lstrip("\n")
-
-    def _extract_thinking(self, content: str) -> Tuple[str, str]:
-        """Split content into (reasoning, remaining) following MiniMax jinja logic."""
-        if "</think>" in content:
-            before, after = content.split("</think>", 1)
-            reasoning = before.split("<think>")[-1].strip("\n")
-            remaining = after.strip("\n")
-            return reasoning, remaining
-        return "", content
-
-    def _format_tool_calls(self, tool_calls: list) -> str:
-        """Format structured tool_calls into MiniMax XML tags."""
-        tc_parts = []
-        for tc in tool_calls:
-            func = tc.get("function", tc)
-            name = func.get("name", "")
-            args = func.get("arguments", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except (json.JSONDecodeError, ValueError):
-                    args = {"raw": args}
-            invoke_lines = [f'<invoke name="{name}">']
-            if isinstance(args, dict):
-                for k, v in args.items():
-                    val = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
-                    invoke_lines.append(f'<parameter name="{k}">{val}</parameter>')
-            invoke_lines.append("</invoke>")
-            tc_parts.append("\n".join(invoke_lines))
-        return "\n" + self.TOOL_CALL_BEGIN + "\n" + "\n".join(tc_parts) + "\n" + self.TOOL_CALL_END
-
-    def format(self, conversation: "Conversation", **kwargs) -> str:
-        add_generation_prompt = kwargs.pop("add_generation_prompt", False)
-        expand_media_tokens = kwargs.pop("expand_media_tokens", True)
-        parts = []
-
-        messages = list(conversation)
-        system_content = None
-        if messages and messages[0]["role"] == "system":
-            system_content = messages[0]["content"]
-            messages = messages[1:]
-
-        if system_content is None:
-            system_content = self.chat_template.system_prompt or "You are a helpful assistant."
-
-        parts.append(f"{self.SYSTEM_HEADER}{system_content}{self.END_TOKEN}\n")
-
-        last_user_idx = max(
-            (i for i, msg in enumerate(messages) if msg["role"] == "user"),
-            default=-1,
-        )
-
-        for idx, msg in enumerate(messages):
-            role = msg["role"]
-            content = msg.get("content", "") or ""
-
-            if not isinstance(content, str):
-                if isinstance(content, list):
-                    text_parts = []
-                    for item in content:
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif item.get("type") in ("image", "image_url"):
-                            if expand_media_tokens:
-                                text_parts.append(self.MEDIA_TOKEN + "\n")
-                            else:
-                                text_parts.append(self.IMAGE_PLACEHOLDER)
-                    content = "".join(text_parts)
-                else:
-                    content = str(content)
-            else:
-                if expand_media_tokens:
-                    content = self._format_content(content, role)
-
-            if role == "user":
-                parts.append(f"{self.USER_HEADER}{content}{self.END_TOKEN}\n")
-            elif role == "assistant":
-                reasoning = msg.get("reasoning_content", "")
-                if not reasoning:
-                    reasoning, content = self._extract_thinking(content)
-
-                assistant_text = ""
-                if reasoning and idx > last_user_idx:
-                    assistant_text += f"<think>\n{reasoning}\n</think>\n\n"
-
-                if content:
-                    assistant_text += content
-
-                tool_calls = msg.get("tool_calls")
-                if tool_calls:
-                    assistant_text += self._format_tool_calls(tool_calls)
-
-                parts.append(f"{self.ASSISTANT_HEADER}{assistant_text}{self.END_TOKEN}\n")
-            elif role == "tool":
-                if idx == 0 or messages[idx - 1]["role"] != "tool":
-                    parts.append(self.TOOL_HEADER)
-                parts.append(f"\n<response>{content}</response>")
-                if idx == len(messages) - 1 or messages[idx + 1]["role"] != "tool":
-                    parts.append(f"{self.END_TOKEN}\n")
-
-        if add_generation_prompt:
-            parts.append(f"{self.ASSISTANT_HEADER}<think>\n")
-
-        return "".join(parts)
-
-    def parse(
-        self,
-        conversation: "Conversation",
-        max_length: int,
-        preformatted: bool = False,
-        last_turn_only: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        text = self._prepare_text(conversation, preformatted, **kwargs)
-        self._ensure_pad_token()
-
-        assistant_pattern = (
-            re.escape(self.ASSISTANT_HEADER) + r"([\s\S]*?)" + re.escape(self.END_TOKEN)
-        )
-        return self._tokenize_with_loss_mask(
-            text,
-            max_length,
-            assistant_pattern,
-            last_turn_only=last_turn_only,
-        )
-
-
 def create_parser(tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate) -> Parser:
     """Create the appropriate parser based on chat_template.parser_type."""
     if chat_template.parser_type == "general":
@@ -710,7 +544,5 @@ def create_parser(tokenizer: PreTrainedTokenizer, chat_template: ChatTemplate) -
         return HarmonyParser(tokenizer, chat_template)
     elif chat_template.parser_type == "kimi-k25":
         return KimiK25Parser(tokenizer, chat_template)
-    elif chat_template.parser_type == "minimax-m2":
-        return MiniMaxParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")

@@ -22,14 +22,6 @@ PROFILES = {
         "end": "<|eot_id|>",
         "header": "<|start_header_id|>assistant<|end_header_id|>\n\n",
     },
-    "minimax25": {
-        "model": "MiniMaxAI/MiniMax-M2.5",
-        "revision": "2515a3ea0afec1dd22d0c7794b3a91557804d195",
-        "template": "minimax-m2",
-        "default_encode_path": "native",
-        "end": "[e~[",
-        "header": "]~b]ai\n",
-    },
 }
 
 REFERENCE_VERSIONS = {"transformers": "5.20.2", "tokenizers": "0.23.3"}
@@ -74,11 +66,7 @@ def cases(profile):
         "bodies": ["<think>\nReason one.\n</think>\n\nAnswer one."],
         **({"reject": "dropped supervised reasoning"} if profile == "llama3" else {}),
     }
-    tool_body = (
-        '<tool_call>\n{"name": "weather", "arguments": {"city": "北京"}}\n</tool_call>'
-        if profile == "qwen3"
-        else '\n<minimax:tool_call>\n<invoke name="weather">\n<parameter name="city">北京</parameter>\n</invoke>\n</minimax:tool_call>'
-    )
+    tool_body = '<tool_call>\n{"name": "weather", "arguments": {"city": "北京"}}\n</tool_call>'
     yield {
         "name": "tools",
         "tools": [

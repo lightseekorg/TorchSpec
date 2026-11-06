@@ -134,7 +134,7 @@ pip install -e ".[fa]"
 
 ### Training tokenizer
 
-Supported text profiles (`llama3`, `qwen`, `qwen3-thinking`, `minimax-m2`) and
+Supported text profiles (`llama3`, `qwen`, `qwen3-thinking`) and
 Kimi-K3 use SMG's Rust tokenizer in-process by default. Its native extension ships
 in the TorchSpec wheel, and `pip install -e .` builds it automatically. Source
 builds need Rust 1.98.0; prebuilt wheels and our Docker runtime images do not.
@@ -186,7 +186,6 @@ Commit your changes in the `_sglang` checkout, then regenerate `patches/sglang/<
 | [qwen3-8b-single-node](examples/qwen3-8b-single-node/) | Inference engine | Qwen3-8B |
 | [kimi-k25-2node-h200](examples/kimi-k25-2node-h200/) | Inference engine | Kimi-K2.5 |
 | [kimi-k25-3node-h100](examples/kimi-k25-3node-h100/) | Inference engine | Kimi-K2.5 |
-| [minimax-m25-5node-h200](examples/minimax-m25-5node-h200/) | Inference engine | MiniMax-M2.5 |
 
 See [examples/README.md](examples/README.md) for more details about each example.
 

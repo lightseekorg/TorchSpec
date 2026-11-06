@@ -11,7 +11,7 @@ from torchspec.config.train_config import Config, config_to_flat_args, load_conf
 from torchspec.data.renderers.smg import effective_renderer, prepare_checkpoint
 
 
-@pytest.mark.parametrize("template", ["llama3", "qwen", "qwen3-thinking", "minimax-m2"])
+@pytest.mark.parametrize("template", ["llama3", "qwen", "qwen3-thinking"])
 def test_supported_text_profiles_default_to_smg(template):
     args = SimpleNamespace(chat_template=template)
     assert effective_renderer(args) == "smg"
