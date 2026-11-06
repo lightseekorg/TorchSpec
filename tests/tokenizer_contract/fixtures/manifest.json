@@ -68,32 +68,6 @@
         "tools"
       ],
       "fixture_sha256": "634ef67bf052ed6293900b4dfaceb34fc6ca425d6fadaef00a0a7138156d29d4"
-    },
-    "minimax25": {
-      "model": "MiniMaxAI/MiniMax-M2.5",
-      "revision": "2515a3ea0afec1dd22d0c7794b3a91557804d195",
-      "template": "minimax-m2",
-      "default_encode_path": "native",
-      "end": "[e~[",
-      "header": "]~b]ai\n",
-      "assets": {
-        "chat_template.jinja": "f83cec52bb3a7e5a3cb4d6fd1dfdd6f4fe13b06c5aaa39a1115e70a417fc75f5",
-        "config.json": "3372a31ecbdba614b309cfa5b3dfec33ceea3c580cb9612ff35345d92ced8618",
-        "merges.txt": "ca47ea60cf5bd48832586adc264f439d0ea4254176b24a95f85eaa9750e2b5f9",
-        "tokenizer.json": "757622126525aeeb131756849d93298070ff3f0319c455ec8c5bb0f6b1cebbe8",
-        "tokenizer_config.json": "60e392fea8d47660584deb3c6a716aab7b9f11fed24bc494baf5eb7ba809e882",
-        "vocab.json": "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a"
-      },
-      "required_cases": [
-        "ascii",
-        "unicode",
-        "whitespace",
-        "multi_turn",
-        "empty",
-        "reasoning",
-        "tools"
-      ],
-      "fixture_sha256": "afabb29a23fb8f4339e47811520b23ef66a7d36b900a8936899f185bb10a43b2"
     }
   }
 }

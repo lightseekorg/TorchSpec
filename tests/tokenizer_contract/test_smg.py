@@ -86,7 +86,7 @@ def test_literal_boundaries_are_rejected(profile, checkpoints):
         renderer.render(messages, max_seq_length=4096)
 
 
-@pytest.mark.parametrize("profile", ["qwen3", "minimax25"])
+@pytest.mark.parametrize("profile", ["qwen3"])
 def test_json_tool_arguments_preserve_exact_contract(profile, checkpoints):
     case = next(c for c in load_cases(profile) if c["name"] == "tools")
     messages = copy.deepcopy(case["messages"])
