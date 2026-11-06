@@ -31,7 +31,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.activations import ACT2FN
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-from torchspec.config.utils import resolve_rope_theta
+from torchspec.config.utils import _normalize_rope_scaling, resolve_rope_theta
 from torchspec.models.draft.base import Eagle3DraftModel, build_lm_head, draft_sliding_window
 from torchspec.models.draft.eagle4_moe import Eagle4MoE
 from torchspec.models.ops.flex_attention import (
@@ -391,7 +391,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
-            seq_len=max_position_embeddings + 20,
+            seq_len=max_position_embeddings,
             device=self.inv_freq.device,
             dtype=torch.get_default_dtype(),
         )
@@ -470,13 +470,14 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
 
+        base = self.base
         if seq_len > self.max_position_embeddings:
             base = self.base * (
                 (self.scaling_factor * seq_len / self.max_position_embeddings)
                 - (self.scaling_factor - 1)
             ) ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
 
@@ -485,6 +486,13 @@ class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # Like transformers, drop a cache NTK-scaled for a longer sequence once
+        # the sequence fits the configured context again.
+        if seq_len and seq_len <= self.max_position_embeddings < self.max_seq_len_cached:
+            self._set_cos_sin_cache(self.max_position_embeddings, x.device, x.dtype)
+        return super().forward(x, seq_len)
 
 
 class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
@@ -642,7 +650,7 @@ def build_rotary_embedding(config, dim: int, max_position_embeddings: int):
     ):
         return NoRotaryEmbedding(dim, max_position_embeddings=max_position_embeddings)
 
-    rope_scaling = config.rope_scaling
+    rope_scaling = _normalize_rope_scaling(config.rope_scaling)
     rope_theta = resolve_rope_theta(config)
     rget = partial(rope_config_get, rope_scaling)
     scaling_type = rget("rope_type", rget("type"))
@@ -662,6 +670,7 @@ def build_rotary_embedding(config, dim: int, max_position_embeddings: int):
         return LlamaLinearScalingRotaryEmbedding(
             dim,
             max_position_embeddings=max_position_embeddings,
+            base=rope_theta,
             scaling_factor=scaling_factor,
         )
     if scaling_type == "dynamic":
@@ -670,6 +679,7 @@ def build_rotary_embedding(config, dim: int, max_position_embeddings: int):
         return LlamaDynamicNTKScalingRotaryEmbedding(
             dim,
             max_position_embeddings=max_position_embeddings,
+            base=rope_theta,
             scaling_factor=scaling_factor,
         )
     if scaling_type == "llama3":
@@ -683,7 +693,9 @@ def build_rotary_embedding(config, dim: int, max_position_embeddings: int):
             orig_max_position=rget("original_max_position_embeddings"),
         )
     if scaling_type == "mrope":
-        return LlamaMutiRotaryEmbedding(dim, max_position_embeddings=max_position_embeddings)
+        return LlamaMutiRotaryEmbedding(
+            dim, max_position_embeddings=max_position_embeddings, base=rope_theta
+        )
     if scaling_type == "yarn":
         return LlamaYarnRotaryEmbedding(
             dim,
