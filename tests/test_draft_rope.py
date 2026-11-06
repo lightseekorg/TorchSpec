@@ -32,14 +32,17 @@ import json
 import os
 import unittest
 
+import torch
 from transformers import LlamaConfig
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFLlamaRotaryEmbedding
 
 from torchspec.config.utils import resolve_rope_theta
 from torchspec.models.draft.auto import AutoDraftModelConfig
 from torchspec.models.draft.deepseek_eagle import DeepSeekMLAAttention
 from torchspec.models.draft.dflash import DFlashAttention, DFlashConfig
-from torchspec.models.draft.llama3_eagle import LlamaAttention
+from torchspec.models.draft.dspark import DSparkConfig
+from torchspec.models.draft.llama3_eagle import LlamaAttention, build_rotary_embedding
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DRAFT_CONFIG_DIR = os.path.join(REPO_ROOT, "configs", "draft_models")
@@ -141,6 +144,110 @@ class TestAttentionUsesResolvedTheta(unittest.TestCase):
             rope_theta=1000000.0,
         )
         self.assertEqual(DFlashAttention(cfg).rotary_emb.base, 1000000.0)
+
+
+def _tiny_llama(rope_scaling, rope_theta=1000000.0, max_position_embeddings=64):
+    return LlamaConfig(
+        hidden_size=8,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=max_position_embeddings,
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
+    )
+
+
+def _hf_cos(cfg, seq_len):
+    cos, _ = HFLlamaRotaryEmbedding(cfg)(torch.zeros(1, seq_len, 8), torch.arange(seq_len)[None])
+    return cos[0]
+
+
+class TestScaledRopeMatchesTransformers(unittest.TestCase):
+    """Scaled branches must reproduce transformers' tables, not only carry the base."""
+
+    def test_linear_and_dynamic_use_declared_theta(self):
+        for rope_type in ("linear", "dynamic"):
+            for theta in (10000.0, 1000000.0):
+                with self.subTest(rope_type=rope_type, theta=theta):
+                    cfg = _tiny_llama({"rope_type": rope_type, "factor": 2.0}, theta)
+                    rope = build_rotary_embedding(cfg, 8, 64)
+                    self.assertEqual(rope.base, theta)
+                    torch.testing.assert_close(rope.cos_cached[0, 0, :64], _hf_cos(cfg, 64))
+
+    def test_dynamic_resets_after_a_longer_sequence(self):
+        cfg = _tiny_llama({"rope_type": "dynamic", "factor": 2.0})
+        rope = build_rotary_embedding(cfg, 8, 64)
+        x = torch.zeros(1, 1, 128, 8)
+        rope(x, seq_len=128)
+        cos, _ = rope(x, seq_len=64)
+        torch.testing.assert_close(cos[0, 0], _hf_cos(cfg, 64))
+
+    def test_mrope_uses_declared_theta(self):
+        cfg = _tiny_llama({"rope_type": "mrope", "mrope_section": [1, 1, 2]})
+        self.assertEqual(build_rotary_embedding(cfg, 8, 64).base, 1000000.0)
+
+    def test_yarn_optional_keys_take_transformers_defaults(self):
+        cfg = _tiny_llama(
+            {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 16}
+        )
+        rope = build_rotary_embedding(cfg, 8, 64)
+        torch.testing.assert_close(rope.cos_cached[0, 0, :64], _hf_cos(cfg, 64))
+
+
+LLAMA3 = {
+    "rope_type": "llama3",
+    "factor": 8.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    "original_max_position_embeddings": 64,
+}
+YARN_MINIMAL = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32}
+
+
+class TestDFlashRopeScaling(unittest.TestCase):
+    """DFlash configs accept the rope blocks LlamaConfig does, and the attention applies them."""
+
+    def test_configs_accept_hf_rope_blocks(self):
+        for cls in (DFlashConfig, DSparkConfig):
+            for scaling in (LLAMA3, YARN_MINIMAL):
+                for key in ("rope_scaling", "rope_parameters"):
+                    with self.subTest(cls=cls.__name__, rope_type=scaling["rope_type"], key=key):
+                        cfg = cls(
+                            hidden_size=64,
+                            num_attention_heads=4,
+                            num_key_value_heads=2,
+                            max_position_embeddings=128,
+                            rope_theta=500000.0,
+                            **{key: dict(scaling)},
+                        )
+                        self.assertEqual(cfg.rope_scaling["rope_type"], scaling["rope_type"])
+                        self.assertEqual(DFlashAttention(cfg).rotary_emb.base, 500000.0)
+
+    def test_draft_config_file_path_accepts_yarn(self):
+        cfg = AutoDraftModelConfig.from_dict(
+            {
+                "architectures": ["DFlashDraftModel"],
+                "max_position_embeddings": 128,
+                "rope_scaling": dict(YARN_MINIMAL),
+            }
+        )
+        self.assertEqual(cfg.rope_scaling["beta_fast"], 32.0)
+
+    def test_attention_applies_declared_scaling(self):
+        scaling = {"rope_type": "linear", "factor": 2.0}
+        cfg = DFlashConfig(
+            hidden_size=8,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=8,
+            rope_theta=1000000.0,
+            rope_scaling=dict(scaling),
+        )
+        rope = DFlashAttention(cfg).rotary_emb
+        expected = _hf_cos(_tiny_llama(dict(scaling), max_position_embeddings=8), 8)
+        torch.testing.assert_close(rope.cos_cached[0, 0, :8], expected)
 
 
 if __name__ == "__main__":
