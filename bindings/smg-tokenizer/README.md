@@ -17,8 +17,10 @@ commands, supported inputs, supervision policy, and the convergence gate.
 exact token IDs, optional UTF-8 byte offsets, and a segmented-encoding indicator.
 It preserves native deferred encoding jobs. Flat offsets require an extra
 reference encode with identical IDs; segmented encodings have no flat offsets.
-TorchSpec defines the training loss mask, not this bridge. Media processing is
-outside its scope.
+TorchSpec defines the training loss mask, not this bridge. The optional
+`multimodal` build feature adds an `ImageProcessor` backed by SMG's pinned
+`llm-multimodal` crate. It returns Qwen3-VL pixels, grids, and token replacements;
+see the [opt-in image path](../../docs/smg-multimodal.md).
 
 Run binding tests after installing the wheel:
 

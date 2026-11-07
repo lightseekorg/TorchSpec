@@ -1,6 +1,6 @@
 [package]
 name = "torchspec-smg-tokenizer"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -12,10 +12,14 @@ crate-type = ["cdylib"]
 
 [features]
 tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
+multimodal = ["dep:llm-multimodal", "dep:image", "dep:bytes"]
 
 [dependencies]
 # Immutable upstream source; no SMG patches required.
 llm-tokenizer = { git = "https://github.com/smg-project/smg.git", rev = "df17c6c24b7be9e6eae50d23373f5d459e7f722b" }
+llm-multimodal = { git = "https://github.com/smg-project/smg.git", rev = "df17c6c24b7be9e6eae50d23373f5d459e7f722b", default-features = false, optional = true }
+image = { version = "0.25.10", default-features = false, optional = true }
+bytes = { version = "1", optional = true }
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py311"] }
 serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
 chrono = "0.4"

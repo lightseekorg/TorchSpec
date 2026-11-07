@@ -17,3 +17,8 @@ def test_explicit_vllm_model_runner_value_is_forwarded(monkeypatch):
     env = get_torchspec_env_vars()
 
     assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+
+
+def test_smg_image_thread_limit_reaches_ray_actors(monkeypatch):
+    monkeypatch.setenv("SMG_MM_THREADS", "1")
+    assert get_torchspec_env_vars()["SMG_MM_THREADS"] == "1"

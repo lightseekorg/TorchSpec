@@ -78,7 +78,7 @@ def main():
             else args.encode_path
             for name, profile in manifest["profiles"].items()
         }
-        if args.encode_path == "default" and build_features != "default":
+        if args.encode_path == "default" and build_features.split(",")[0] != "default":
             raise RuntimeError("The default encoder profile requires a default-feature binding")
         if info["actual_encode_paths"] != expected_paths:
             raise RuntimeError(f"Encoder fallback: {info['actual_encode_paths']}")

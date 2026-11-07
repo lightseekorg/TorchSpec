@@ -39,6 +39,7 @@ from torchspec.data.preprocessing import _normalize_conversation, preprocess_con
 from torchspec.data.renderers import RENDERER_REGISTRY
 from torchspec.data.renderers.smg import SmgRenderer, effective_renderer, prepare_checkpoint
 from torchspec.data.renderers.smg_k3 import SmgK3Renderer
+from torchspec.data.renderers.smg_vision import SmgVisionRenderer
 from torchspec.data.template import TEMPLATE_REGISTRY
 from torchspec.data.utils import (
     deserialize_packed_loss_mask,
@@ -192,11 +193,13 @@ def _init_tokenize_worker(
     _logging.getLogger("transformers_modules").setLevel(_logging.ERROR)
     tokenizer = (
         None
-        if renderer_name in ("smg", "smg-kimi-k3")
+        if renderer_name in ("smg", "smg-kimi-k3", "smg-qwen3-vl")
         else load_tokenizer(tokenizer_path, trust_remote_code=trust_remote_code)
     )
     _worker_state["tokenizer"] = tokenizer
-    if renderer_name == "smg-kimi-k3":
+    if renderer_name == "smg-qwen3-vl":
+        renderer = SmgVisionRenderer(tokenizer_path, **(smg_options or {}))
+    elif renderer_name == "smg-kimi-k3":
         renderer = SmgK3Renderer(tokenizer_path)
     elif renderer_name == "smg":
         renderer = SmgRenderer(tokenizer_path, chat_template_name, **(smg_options or {}))
@@ -241,13 +244,18 @@ def _tokenize_single(args):
     if renderer is not None:
         if train_with_decode:
             raise ValueError("Registered dataset renderers do not support train_with_decode=True")
-        input_ids, loss_mask = renderer.render(
+        render = (
+            renderer.render_prepared if isinstance(renderer, SmgVisionRenderer) else renderer.render
+        )
+        rendered = render(
             messages,
             tools,
             max_seq_length=max_length,
             last_turn_only=last_turn_only,
             generation_config=generation_config,
         )
+        input_ids, loss_mask = rendered[:2]
+        prepared = rendered[2] if isinstance(renderer, SmgVisionRenderer) else None
         # A renderer owns its own supervision, so a sample with no supervised
         # token is unusable rather than merely short.
         min_loss_tokens = max(1, _worker_state.get("min_loss_tokens", 0))
@@ -260,6 +268,7 @@ def _tokenize_single(args):
             "input_ids": np.asarray(input_ids, dtype=np.int64),
             "packed_loss_mask": packed_loss_mask,
             "formatted_prompt": None,
+            "prepared_multimodal": prepared,
             **auto_metadata,
         }
 
@@ -325,7 +334,10 @@ def _drop_stale_multimodal_masks(
     if not dynamic_loss_mask:
         return
     for prompt in prompts:
-        if prompt.get("multimodal_inputs") is None:
+        if (
+            prompt.get("multimodal_inputs") is None
+            or prompt["multimodal_inputs"].get("format") == "torchspec-smg-qwen3-vl-v1"
+        ):
             continue
         dropped = prompt.pop("packed_loss_mask", None)
         if (
@@ -384,7 +396,7 @@ def load_conversation_dataset(args):
         raise ValueError("Registered dataset renderers require defer_tokenization=False")
     if (
         renderer_name
-        and renderer_name not in ("smg", "smg-kimi-k3")
+        and renderer_name not in ("smg", "smg-kimi-k3", "smg-qwen3-vl")
         and renderer_name not in RENDERER_REGISTRY.get_all_renderer_names()
     ):
         available = ", ".join(RENDERER_REGISTRY.get_all_renderer_names()) or "<none>"
@@ -414,7 +426,7 @@ def load_conversation_dataset(args):
     smg_options = None
     smg_fingerprint = ""
     tokenizer_path = args.target_model_path
-    if renderer_name in ("smg", "smg-kimi-k3"):
+    if renderer_name in ("smg", "smg-kimi-k3", "smg-qwen3-vl"):
         if renderer_name == "smg" and not chat_template_name:
             raise ValueError("SMG needs dataset.chat_template for assistant supervision boundaries")
         tokenizer_path, smg_fingerprint = prepare_checkpoint(
@@ -445,7 +457,9 @@ def load_conversation_dataset(args):
     last_turn_loss_only_flag = getattr(args, "last_turn_loss_only", False)
     train_with_decode = getattr(args, "train_with_decode", False)
     min_loss_tokens_val = getattr(args, "min_loss_tokens", 0)
-    if renderer_name == "smg-kimi-k3":
+    if renderer_name == "smg-qwen3-vl":
+        renderer_version = SmgVisionRenderer.CACHE_VERSION
+    elif renderer_name == "smg-kimi-k3":
         renderer_version = SmgK3Renderer.CACHE_VERSION
     elif renderer_name == "smg":
         renderer_version = SmgRenderer.CACHE_VERSION
@@ -460,7 +474,7 @@ def load_conversation_dataset(args):
         f"-defer={defer_tokenization}-decode={train_with_decode}"
         f"-mlt={min_loss_tokens_val}"
     )
-    if renderer_name in ("smg", "smg-kimi-k3"):
+    if renderer_name in ("smg", "smg-kimi-k3", "smg-qwen3-vl"):
         cache_params += f"-smg={smg_fingerprint}-{json.dumps(smg_options, sort_keys=True)}"
         if renderer_name == "smg":
             cache_params += (
@@ -472,7 +486,10 @@ def load_conversation_dataset(args):
 
     dynamic_loss_mask = getattr(args, "dynamic_loss_mask", False)
 
-    if os.path.exists(cache_path):
+    # Image URLs/files can change without the JSONL changing. Until media-content
+    # manifests are part of cache keys, prepare this opt-in path on every load.
+    use_cache = renderer_name != "smg-qwen3-vl"
+    if use_cache and os.path.exists(cache_path):
         logger.info(f"Loading dataset from cache: {cache_path}")
         prompts = torch.load(cache_path, weights_only=False)
         _drop_stale_multimodal_masks(
@@ -484,7 +501,8 @@ def load_conversation_dataset(args):
         return prompts
 
     mode_label = "Formatting" if defer_tokenization else "Tokenizing"
-    logger.info(f"{mode_label} dataset (cache will be saved to {cache_path})")
+    cache_note = f"cache will be saved to {cache_path}" if use_cache else "media cache disabled"
+    logger.info(f"{mode_label} dataset ({cache_note})")
 
     total_estimate = estimate_row_count(args.train_data_path)
     num_proc = getattr(args, "num_proc", 64)
@@ -526,7 +544,9 @@ def load_conversation_dataset(args):
         # threads and can deadlock Linux workers. Start clean interpreters for
         # SMG; keep the existing multiprocessing policy for other renderers.
         pool_factory = (
-            mp.get_context("spawn").Pool if renderer_name in ("smg", "smg-kimi-k3") else mp.Pool
+            mp.get_context("spawn").Pool
+            if renderer_name in ("smg", "smg-kimi-k3", "smg-qwen3-vl")
+            else mp.Pool
         )
         pool_ctx = pool_factory(num_proc, initializer=worker_init, initargs=worker_initargs)
 
@@ -603,6 +623,8 @@ def load_conversation_dataset(args):
         if "has_thinking" in result:
             metadata["has_thinking"] = result["has_thinking"]
 
+        if renderer_name == "smg-qwen3-vl":
+            multimodal_inputs = result.get("prepared_multimodal")
         entry = {
             "data_id": data_id,
             "metadata": metadata,
@@ -612,7 +634,7 @@ def load_conversation_dataset(args):
 
         if not defer_tokenization:
             entry["input_ids"] = torch.from_numpy(result["input_ids"])
-            if multimodal_inputs is None:
+            if multimodal_inputs is None or renderer_name == "smg-qwen3-vl":
                 entry["packed_loss_mask"] = result["packed_loss_mask"]
             elif not dynamic_loss_mask:
                 raise ValueError(
@@ -641,7 +663,8 @@ def load_conversation_dataset(args):
         )
 
     os.makedirs(cache_dir, exist_ok=True)
-    torch.save(prompts, cache_path)
-    logger.info(f"Saved {len(prompts)} samples to cache: {cache_path}")
+    if use_cache:
+        torch.save(prompts, cache_path)
+        logger.info(f"Saved {len(prompts)} samples to cache: {cache_path}")
 
     return prompts

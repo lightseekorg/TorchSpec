@@ -66,6 +66,16 @@ def effective_renderer(args):
     renderer = getattr(args, "renderer", None)
     if backend not in ("auto", "huggingface", "smg"):
         raise ValueError("dataset.rendering_backend must be 'auto', 'huggingface' or 'smg'")
+    if renderer == "smg-qwen3-vl":
+        if backend == "huggingface":
+            raise ValueError("Remove renderer=smg-qwen3-vl to select the Hugging Face path")
+        if getattr(args, "defer_tokenization", False) or getattr(args, "train_with_decode", False):
+            raise ValueError(
+                "smg-qwen3-vl requires complete conversations and defer_tokenization=false"
+            )
+        if getattr(args, "inference_engine_type", "vllm") != "vllm":
+            raise ValueError("smg-qwen3-vl currently requires the vLLM engine")
+        return renderer
     # Preserve explicit custom renderers, including on K3 model paths.
     if renderer not in (None, "smg", "kimi-k3", "smg-kimi-k3"):
         if backend == "smg":
@@ -282,12 +292,7 @@ class SmgRenderer:
         for message in messages:
             if message.get("role") not in ("system", "developer", "user", "assistant", "tool"):
                 raise ValueError(f"Unsupported role: {message.get('role')!r}")
-            content = message.get("content")
-            if content is not None and not isinstance(content, str):
-                raise ValueError(
-                    "SMG training currently accepts text-only string content; for multimodal training "
-                    "set dataset.rendering_backend=huggingface"
-                )
+            self._validate_content(message)
             if not self.tokenizer.raw_tool_call_arguments:
                 for call in message.get("tool_calls") or []:
                     function = call.get("function", call)
@@ -442,3 +447,11 @@ class SmgRenderer:
                 mask[len(left) : len(right)] = [1] * (len(right) - len(left))
         output = (ids[:max_seq_length], mask[:max_seq_length])
         return (*output, text) if return_formatted_text else output
+
+    def _validate_content(self, message):
+        content = message.get("content")
+        if content is not None and not isinstance(content, str):
+            raise ValueError(
+                "SMG training currently accepts text-only string content; for multimodal training "
+                "set dataset.rendering_backend=huggingface"
+            )
