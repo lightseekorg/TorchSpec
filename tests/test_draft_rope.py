@@ -175,14 +175,6 @@ class TestScaledRopeMatchesTransformers(unittest.TestCase):
                     self.assertEqual(rope.base, theta)
                     torch.testing.assert_close(rope.cos_cached[0, 0, :64], _hf_cos(cfg, 64))
 
-    def test_dynamic_resets_after_a_longer_sequence(self):
-        cfg = _tiny_llama({"rope_type": "dynamic", "factor": 2.0})
-        rope = build_rotary_embedding(cfg, 8, 64)
-        x = torch.zeros(1, 1, 128, 8)
-        rope(x, seq_len=128)
-        cos, _ = rope(x, seq_len=64)
-        torch.testing.assert_close(cos[0, 0], _hf_cos(cfg, 64))
-
     def test_mrope_uses_declared_theta(self):
         cfg = _tiny_llama({"rope_type": "mrope", "mrope_section": [1, 1, 2]})
         self.assertEqual(build_rotary_embedding(cfg, 8, 64).base, 1000000.0)

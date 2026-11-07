@@ -226,7 +226,10 @@ class DFlashAttention(nn.Module):
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
         # Size the table by the position span, not the token count: dynamic NTK
         # derives its base from seq_len, as transformers does from max(position) + 1.
-        cos, sin = self.rotary_emb(q, seq_len=int(full_position_ids.max()) + 1)
+        # Anchors leave room for a whole block inside the context, so the span is
+        # ctx_len. A sample too short for that gets dummy blocks at [0, block_size),
+        # which draft_len bounds. Both are host ints, so no device sync per layer.
+        cos, sin = self.rotary_emb(q, seq_len=max(ctx_len, draft_len))
         cos = cos.to(q.device)
         sin = sin.to(q.device)
 
