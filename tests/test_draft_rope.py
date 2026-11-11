@@ -246,6 +246,20 @@ class TestScaledRopeMatchesTransformers(unittest.TestCase):
                 torch.testing.assert_close(cos[0], ref_cos)
                 torch.testing.assert_close(sin[0], ref_sin)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for bf16 autocast")
+    def test_dynamic_cache_reset_preserves_phase_under_cuda_autocast(self):
+        cfg = _tiny_llama({"rope_type": "dynamic", "factor": 2.0})
+        with torch.device("cuda"):
+            rope = build_rotary_embedding(cfg, 8, 64)
+            x = torch.zeros(1, 1, 96, 8, dtype=torch.bfloat16)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            before = rope(x, seq_len=48)
+            rope(x, seq_len=96)
+            after = rope(x, seq_len=48)
+
+        for initial, restored in zip(before, after):
+            torch.testing.assert_close(initial, restored, atol=0, rtol=0)
+
     def test_dynamic_cache_can_start_below_the_scaling_threshold(self):
         cfg = _tiny_llama({"rope_type": "dynamic", "factor": 2.0})
         rope = build_rotary_embedding(cfg, 8, 8)
