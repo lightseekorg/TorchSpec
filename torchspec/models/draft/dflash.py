@@ -99,6 +99,9 @@ class DFlashConfig(PretrainedConfig):
         if params is not None and params.get("rope_theta") is not None:
             self.rope_theta = float(params["rope_theta"])
         self.rope_parameters = params
+        # Transformers 4.x stores the legacy field independently.
+        if not hasattr(self, "rope_scaling"):
+            self.rope_scaling = params
 
 
 class DFlashRMSNorm(nn.Module):
@@ -119,6 +122,11 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+def rotary_position_span(position_ids: torch.Tensor) -> int:
+    """Table length needed to index these positions, including any offsets."""
+    return int(position_ids.max()) + 1 if position_ids.numel() else 0
 
 
 # NOTE: Not called in DFlashAttention.forward() (RoPE is applied inline there),
@@ -178,7 +186,7 @@ class DFlashAttention(nn.Module):
         self.k_norm = DFlashRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.rotary_emb = build_rotary_embedding(
-            config, self.head_dim, self.max_position_embeddings
+            config, self.head_dim, self.max_position_embeddings, supports_mrope=False
         )
 
     def forward(
@@ -188,6 +196,8 @@ class DFlashAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass with dual-source KV.
 
@@ -197,6 +207,7 @@ class DFlashAttention(nn.Module):
             draft_position_ids: [B, draft_len] — position IDs for draft tokens
             context_position_ids: [B, ctx_len] — position IDs for context tokens
             block_mask: FlexAttention BlockMask for block-causal attention
+            position_span: Precomputed table length for the supplied position IDs
         """
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -224,12 +235,9 @@ class DFlashAttention(nn.Module):
 
         # RoPE with concatenated position IDs (context + draft)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        # Size the table by the position span, not the token count: dynamic NTK
-        # derives its base from seq_len, as transformers does from max(position) + 1.
-        # Anchors leave room for a whole block inside the context, so the span is
-        # ctx_len. A sample too short for that gets dummy blocks at [0, block_size),
-        # which draft_len bounds. Both are host ints, so no device sync per layer.
-        cos, sin = self.rotary_emb(q, seq_len=max(ctx_len, draft_len))
+        if position_span is None:
+            position_span = rotary_position_span(full_position_ids)
+        cos, sin = self.rotary_emb(q, seq_len=position_span)
         cos = cos.to(q.device)
         sin = sin.to(q.device)
 
@@ -299,6 +307,8 @@ class DFlashDecoderLayer(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -309,6 +319,7 @@ class DFlashDecoderLayer(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            position_span=position_span,
         )
         draft_hidden = residual + draft_hidden
 
@@ -429,6 +440,8 @@ class DFlashDraftModel(PreTrainedModel):
         context_position_ids: torch.Tensor,
         block_mask=None,
         noise_embedding: Optional[torch.Tensor] = None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass through draft model.
 
@@ -441,6 +454,7 @@ class DFlashDraftModel(PreTrainedModel):
             block_mask: FlexAttention BlockMask, or a per-layer sequence of
                 BlockMasks for mixed attention schedules
             noise_embedding: [B, draft_len, D] — pre-computed embeddings (from training wrapper)
+            position_span: Precomputed table length for the supplied position IDs
 
         Returns:
             hidden_states: [B, draft_len, D] — pre-norm hidden states
@@ -449,6 +463,11 @@ class DFlashDraftModel(PreTrainedModel):
             draft_hidden = noise_embedding.to(context_feature.dtype)
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
+
+        if position_span is None:
+            position_span = rotary_position_span(
+                torch.cat([context_position_ids, draft_position_ids], dim=1)
+            )
 
         for layer_id, layer in enumerate(self.layers):
             layer_block_mask = block_mask
@@ -460,6 +479,7 @@ class DFlashDraftModel(PreTrainedModel):
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
                 block_mask=layer_block_mask,
+                position_span=position_span,
             )
 
         return self.final_norm(draft_hidden)

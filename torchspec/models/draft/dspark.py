@@ -50,6 +50,7 @@ from torchspec.models.draft.dflash import (
     DFlashDecoderLayer,
     DFlashDraftModel,
     DFlashRMSNorm,
+    rotary_position_span,
 )
 from torchspec.models.ops.flex_attention import compile_friendly_flex_attention
 
@@ -269,6 +270,8 @@ class K3DSparkMLAAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -298,7 +301,9 @@ class K3DSparkMLAAttention(nn.Module):
         k_rope = k_rope.unsqueeze(1)
 
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        cos, sin = self.rotary_emb(q_rope, seq_len=total_len)
+        if position_span is None:
+            position_span = rotary_position_span(full_position_ids)
+        cos, sin = self.rotary_emb(q_rope, seq_len=position_span)
         cos = cos.to(draft_hidden.device)
         sin = sin.to(draft_hidden.device)
         q_rope = _apply_rope_interleaved(q_rope, cos, sin, draft_position_ids)

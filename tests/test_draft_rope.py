@@ -31,6 +31,7 @@ import glob
 import json
 import os
 import unittest
+from types import SimpleNamespace
 
 import torch
 from transformers import LlamaConfig
@@ -38,10 +39,16 @@ from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFLlamaRotaryEmbedding
 
 from torchspec.config.utils import resolve_rope_theta
+from torchspec.models.dflash import DFlashModel
 from torchspec.models.draft.auto import AutoDraftModelConfig
 from torchspec.models.draft.deepseek_eagle import DeepSeekMLAAttention
-from torchspec.models.draft.dflash import DFlashAttention, DFlashConfig
-from torchspec.models.draft.dspark import DSparkConfig
+from torchspec.models.draft.dflash import DFlashAttention, DFlashConfig, DFlashDraftModel
+from torchspec.models.draft.dspark import (
+    DSparkConfig,
+    K3DSparkConfig,
+    K3DSparkMLAAttention,
+    K3DSparkModel,
+)
 from torchspec.models.draft.llama3_eagle import LlamaAttention, build_rotary_embedding
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -163,6 +170,22 @@ def _hf_cos(cfg, seq_len):
     return cos[0]
 
 
+def _tiny_dflash(config_cls, rope_scaling):
+    return config_cls(
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=8,
+        vocab_size=32,
+        max_position_embeddings=16,
+        num_target_layers=1,
+        target_hidden_size=8,
+        mask_token_id=31,
+        rope_scaling=rope_scaling,
+    )
+
+
 class TestScaledRopeMatchesTransformers(unittest.TestCase):
     """Scaled branches must reproduce transformers' tables, not only carry the base."""
 
@@ -185,6 +208,58 @@ class TestScaledRopeMatchesTransformers(unittest.TestCase):
         )
         rope = build_rotary_embedding(cfg, 8, 64)
         torch.testing.assert_close(rope.cos_cached[0, 0, :64], _hf_cos(cfg, 64))
+
+    def test_yarn_falls_back_to_config_context_length(self):
+        scaling = {"rope_type": "yarn", "factor": 4.0}
+        cfg = _tiny_dflash(DFlashConfig, scaling)
+        rope = DFlashAttention(cfg).rotary_emb
+        expected = _hf_cos(
+            _tiny_llama(dict(scaling), rope_theta=cfg.rope_theta, max_position_embeddings=16), 16
+        )
+        torch.testing.assert_close(rope.cos_cached[0, 0], expected)
+
+    def test_yarn_honors_explicit_attention_factor(self):
+        scaling = {
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 4,
+            "attention_factor": 1.75,
+        }
+        cfg = _tiny_dflash(DFlashConfig, scaling)
+        rope = DFlashAttention(cfg).rotary_emb
+        ref = HFLlamaRotaryEmbedding(
+            _tiny_llama(dict(scaling), rope_theta=cfg.rope_theta, max_position_embeddings=16)
+        )
+        cos, sin = ref(torch.zeros(1, 16, 8), torch.arange(16)[None])
+        torch.testing.assert_close(rope.cos_cached[0], cos)
+        torch.testing.assert_close(rope.sin_cached[0], sin)
+
+    def test_dynamic_cache_grows_and_resets_like_transformers(self):
+        cfg = _tiny_llama({"rope_type": "dynamic", "factor": 2.0})
+        rope = build_rotary_embedding(cfg, 8, 64)
+        ref = HFLlamaRotaryEmbedding(cfg)
+        for length in (8, 96, 8):
+            with self.subTest(length=length):
+                x = torch.zeros(1, length, 8)
+                cos, sin = rope(x, seq_len=length)
+                ref_cos, ref_sin = ref(x, torch.arange(length)[None])
+                torch.testing.assert_close(cos[0], ref_cos)
+                torch.testing.assert_close(sin[0], ref_sin)
+
+    def test_dynamic_cache_can_start_below_the_scaling_threshold(self):
+        cfg = _tiny_llama({"rope_type": "dynamic", "factor": 2.0})
+        rope = build_rotary_embedding(cfg, 8, 8)
+        self.assertEqual(rope.max_seq_len_cached, 8)
+        cos, _ = rope(torch.zeros(1, 16, 8), seq_len=16)
+        torch.testing.assert_close(cos[0, 0], _hf_cos(cfg, 16))
+
+    def test_shared_builder_accepts_rope_parameters_without_legacy_alias(self):
+        cfg = SimpleNamespace(
+            rope_parameters={"rope_type": "linear", "factor": 2.0, "rope_theta": 50000.0}
+        )
+        rope = build_rotary_embedding(cfg, 8, 16)
+        self.assertEqual(rope.base, 50000.0)
+        self.assertEqual(rope.scaling_factor, 2.0)
 
 
 LLAMA3 = {
@@ -240,6 +315,52 @@ class TestDFlashRopeScaling(unittest.TestCase):
         rope = DFlashAttention(cfg).rotary_emb
         expected = _hf_cos(_tiny_llama(dict(scaling), max_position_embeddings=8), 8)
         torch.testing.assert_close(rope.cos_cached[0, 0, :8], expected)
+
+    def test_dflash_and_k3_dspark_use_position_span_in_training(self):
+        scaling = {"rope_type": "dynamic", "factor": 2.0}
+        for model_cls, config_cls in (
+            (DFlashDraftModel, DFlashConfig),
+            (K3DSparkModel, K3DSparkConfig),
+        ):
+            with self.subTest(model=model_cls.__name__):
+                config = _tiny_dflash(config_cls, dict(scaling))
+                draft = model_cls(config)
+                model = DFlashModel(draft, block_size=5, num_anchors=4)
+                rotary = draft.layers[0].self_attn.rotary_emb
+                initial_inv_freq = rotary.inv_freq.clone()
+                input_ids = torch.arange(8).unsqueeze(0)
+                loss_mask = torch.ones_like(input_ids)
+                hidden, _, _, _ = model._draft_backbone(
+                    input_ids, [torch.randn(1, 8, 8)], loss_mask
+                )
+                self.assertEqual(hidden.shape, (1, 20, 8))
+                self.assertEqual(rotary.max_seq_len_cached, 16)
+                torch.testing.assert_close(rotary.inv_freq, initial_inv_freq)
+
+    def test_direct_attention_supports_offset_position_ids(self):
+        scaling = {"rope_type": "dynamic", "factor": 2.0}
+        cfg = _tiny_dflash(DFlashConfig, scaling)
+        attention = DFlashAttention(cfg)
+        attention(
+            torch.randn(1, 4, 8),
+            torch.randn(1, 8, 8),
+            torch.arange(24, 28)[None],
+            torch.arange(24, 32)[None],
+        )
+        self.assertEqual(attention.rotary_emb.max_seq_len_cached, 32)
+        ref = _tiny_llama(dict(scaling), rope_theta=cfg.rope_theta, max_position_embeddings=16)
+        torch.testing.assert_close(attention.rotary_emb.cos_cached[0, 0], _hf_cos(ref, 32))
+
+    def test_attention_rejects_mrope_without_three_axis_positions(self):
+        scaling = {"rope_type": "mrope", "mrope_section": [1, 1, 2]}
+        for attention_cls, config_cls in (
+            (DFlashAttention, DFlashConfig),
+            (K3DSparkMLAAttention, K3DSparkConfig),
+        ):
+            with self.subTest(attention=attention_cls.__name__):
+                cfg = _tiny_dflash(config_cls, dict(scaling))
+                with self.assertRaisesRegex(ValueError, "mRoPE requires three-axis position IDs"):
+                    attention_cls(cfg)
 
 
 if __name__ == "__main__":

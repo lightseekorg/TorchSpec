@@ -487,6 +487,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        *,
+        position_span: int | None = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -497,6 +499,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            position_span=position_span,
         )
         draft_hidden = self.attention_conv.finish(draft_hidden, attention_kernel)
         draft_hidden = residual + draft_hidden
@@ -541,6 +544,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         context_position_ids: torch.Tensor,
         block_mask=None,
         noise_embedding: torch.Tensor | None = None,
+        *,
+        position_span: int | None = None,
     ) -> torch.Tensor:
         if noise_embedding is None:
             noise_embedding = self.embed_tokens(draft_input_ids)
@@ -553,4 +558,5 @@ class DFlash2DraftModel(DFlashDraftModel):
             context_position_ids=context_position_ids,
             block_mask=block_mask,
             noise_embedding=noise_embedding,
+            position_span=position_span,
         )
