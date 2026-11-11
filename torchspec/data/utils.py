@@ -27,7 +27,7 @@ import torch
 from datasets import IterableDataset, load_dataset
 from huggingface_hub import hf_hub_download, list_repo_files
 
-from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
+from torchspec.models.ops.loss_mask import AssistantHeader, compute_assistant_loss_mask
 
 _LOCAL_DATA_EXTS = frozenset({".json", ".jsonl", ".parquet", ".arrow", ".csv", ".tsv", ".txt"})
 
@@ -222,7 +222,7 @@ def resolve_loss_mask(
     data: Dict[str, Any],
     *,
     dynamic_loss_mask: bool = False,
-    assistant_header_ids: Optional[List[int]] = None,
+    assistant_header_ids: list[int] | AssistantHeader | None = None,
     end_token_ids: Optional[List[int]] = None,
     last_turn_loss_only: bool = False,
     skip_after_header: int = 0,

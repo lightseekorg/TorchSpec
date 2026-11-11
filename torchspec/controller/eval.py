@@ -31,6 +31,10 @@ import ray
 import wandb
 from tqdm import tqdm
 
+from torchspec.data.parse import KimiK25Parser
+from torchspec.data.renderers.smg import SMG_MIN_BINDING_VERSION, effective_renderer
+from torchspec.data.template import TEMPLATE_REGISTRY
+from torchspec.models.ops.loss_mask import DYNAMIC_LOSS_MASK_CACHE_VERSION
 from torchspec.training.checkpoint import _read_checkpoint_metadata, _write_checkpoint_metadata
 from torchspec.utils.logging import logger
 
@@ -181,11 +185,25 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
 
     if eval_enabled:
         cache_dir = os.path.abspath(getattr(args, "cache_dir", "./cache"))
+        offline = getattr(args, "inference_engine_type", None) == "offline"
         data_source = (
             getattr(args, "offline_data_path", "")
-            if getattr(args, "inference_engine_type", None) == "offline"
+            if offline
             else getattr(args, "eval_data_path", "")
         )
+        # Cached eval batches already contain the rendered IDs and loss masks.
+        cache_policy = ""
+        if getattr(args, "dynamic_loss_mask", False):
+            cache_policy += f"|dynamic-mask={DYNAMIC_LOSS_MASK_CACHE_VERSION}"
+        if not offline:
+            renderer = effective_renderer(args)
+            template_name = getattr(args, "chat_template", None)
+            if renderer in ("smg", "smg-kimi-k3"):
+                cache_policy += f"|{renderer}-binding={SMG_MIN_BINDING_VERSION}"
+            elif renderer is None and template_name:
+                template = TEMPLATE_REGISTRY.get(template_name)
+                if template.parser_type == "kimi-k25":
+                    cache_policy += f"|kimi-k25-parser={KimiK25Parser.CACHE_VERSION}"
         aux_hidden_states_layers = getattr(args, "aux_hidden_states_layers", None)
         if aux_hidden_states_layers is not None:
             # Hydra exposes YAML sequences as OmegaConf ListConfig objects,
@@ -195,7 +213,8 @@ def setup_eval(controller, train_group, args, eval_dataset_size: int) -> EvalSet
             f"{data_source}|"
             f"{getattr(args, 'target_model_path', '')}|"
             f"{getattr(args, 'max_seq_length', 0)}|"
-            f"{json.dumps(aux_hidden_states_layers, separators=(',', ':'))}".encode()
+            f"{json.dumps(aux_hidden_states_layers, separators=(',', ':'))}"
+            f"{cache_policy}".encode()
         ).hexdigest()[:12]
         eval_cache_path = os.path.join(cache_dir, "eval_cache", cache_key)
 

@@ -34,6 +34,8 @@ from packaging.version import Version
 
 from torchspec.data.template import TEMPLATE_REGISTRY
 
+SMG_MIN_BINDING_VERSION = "0.1.4"
+
 # Default routing is deliberately bounded to the supported text profiles.
 # Additional templates can still be requested explicitly with backend="smg".
 SMG_DEFAULT_TEMPLATES = frozenset({"llama3", "qwen", "qwen3-thinking"})
@@ -129,11 +131,13 @@ def prepare_checkpoint(source, revision=None):
         from torchspec_smg import __version__ as version
         from torchspec_smg import build_features
 
-        if Version(version) < Version("0.1.3"):
-            raise ImportError(f"smg-tokenizer {version} is older than the required 0.1.3")
+        if Version(version) < Version(SMG_MIN_BINDING_VERSION):
+            raise ImportError(
+                f"smg-tokenizer {version} is older than the required {SMG_MIN_BINDING_VERSION}"
+            )
     except ImportError as exc:
         raise ImportError(
-            "SMG rendering needs TorchSpec's bundled native binding >=0.1.3; "
+            f"SMG rendering needs TorchSpec's bundled native binding >={SMG_MIN_BINDING_VERSION}; "
             "reinstall TorchSpec with its native extension (see docs/smg-tokenization.md), or set "
             "dataset.rendering_backend=huggingface to use the legacy tokenizer"
         ) from exc

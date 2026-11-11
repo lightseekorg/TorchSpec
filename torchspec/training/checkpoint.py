@@ -181,10 +181,16 @@ def _upgrade_to_eagle4(tensors: dict, expected: dict) -> dict:
     if eh_proj in expected and eh_proj not in tensors:
         qkv = [f"midlayer.self_attn.{p}_proj.weight" for p in "qkv"]
         sizes = [tensors[k].shape[0] for k in qkv]
-        u, s, vh = torch.linalg.svd(torch.cat([tensors[k] for k in qkv]).float(), False)
+        stacked = torch.cat([tensors[k] for k in qkv]).float()
         rank = expected[eh_proj].shape[0]
+        # For a narrow Q/K/V stack, keep an orthonormal basis for the additional
+        # eh_proj rows. Zero columns in Q/K/V preserve the original projection.
+        u, s, vh = torch.linalg.svd(stacked, full_matrices=stacked.shape[0] < rank)
+        projected = u[:, :rank] * s[:rank]
+        if projected.shape[1] < rank:
+            projected = torch.nn.functional.pad(projected, (0, rank - projected.shape[1]))
         tensors[eh_proj] = vh[:rank]
-        tensors.update(zip(qkv, (u[:, :rank] * s[:rank]).split(sizes)))
+        tensors.update(zip(qkv, projected.split(sizes)))
         tensors["midlayer.pre_attention_layernorm.weight"] = torch.ones(rank)
 
     # MoE: routed experts keep their no-op init (zero down projections) and a shared expert as

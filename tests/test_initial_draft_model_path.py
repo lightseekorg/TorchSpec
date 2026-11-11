@@ -204,6 +204,26 @@ class TestLoadInitialDraftWeights(unittest.TestCase):
             torch.cat([old[k] for k in qkv]),
         )
 
+    def test_upgrades_an_eagle3_checkpoint_with_narrow_qkv(self):
+        small = {**_EAGLE3, "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8}
+        published = _build(small, seed=0)
+        directory = _publish(published, self.tmpdir / "eagle3")
+        fresh = _build(
+            {**small, "architectures": ["LlamaForCausalLMEagle4"], "attn_norm": True},
+            seed=1,
+        )
+        load_initial_draft_weights(fresh, str(directory))
+
+        old, new = published.state_dict(), fresh.state_dict()
+        qkv = [f"midlayer.self_attn.{p}_proj.weight" for p in "qkv"]
+        eh_proj = new["midlayer.eh_proj.weight"]
+        assert eh_proj.shape == (64, 128)
+        torch.testing.assert_close(eh_proj @ eh_proj.T, torch.eye(64), atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            torch.cat([new[k] for k in qkv]) @ eh_proj,
+            torch.cat([old[k] for k in qkv]),
+        )
+
     def test_upcycles_a_dense_eagle3_draft_to_an_eagle4_moe(self):
         dense = {**_EAGLE3, "draft_vocab_size": 128}
         published = _build(dense, seed=0)

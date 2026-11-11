@@ -1,16 +1,47 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use llm_tokenizer::{
     chat_template::ChatTemplateParams, create_tokenizer_with_chat_template, HuggingFaceTokenizer,
     PromptEncoding, TokenizerTrait,
 };
 use pyo3::{exceptions::PyValueError, prelude::*};
+use regex::Regex;
 use serde_json::Value;
 
 type RenderOutput = (String, Vec<u32>, Option<Vec<(usize, usize)>>, bool);
 
 fn value_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
+}
+
+fn validate_json_integers(request: &str) -> PyResult<()> {
+    // Match whole strings so digits in keys, text and raw tool arguments stay
+    // opaque. serde_json checks syntax below, but it parses oversized integers
+    // as floats, so their original spelling must be checked here.
+    static TOKENS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#""(?:[^"\\]|\\.)*"|-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"#).unwrap()
+    });
+    for token in TOKENS.find_iter(request) {
+        let literal = token.as_str();
+        if literal.starts_with('"') || literal.contains(['.', 'e', 'E']) {
+            continue;
+        }
+        let in_range = if literal.starts_with('-') {
+            literal.parse::<i64>().is_ok()
+        } else {
+            literal.parse::<u64>().is_ok()
+        };
+        if !in_range {
+            return Err(value_error(format!(
+                "JSON integer at byte {} is outside the supported range [-2^63, 2^64 - 1]",
+                token.start()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[pyclass(frozen)]
@@ -56,6 +87,7 @@ impl Tokenizer {
     }
 
     fn render_json(&self, py: Python<'_>, request: &str) -> PyResult<RenderOutput> {
+        validate_json_integers(request)?;
         let request: Value = serde_json::from_str(request).map_err(value_error)?;
         let messages = request["messages"]
             .as_array()

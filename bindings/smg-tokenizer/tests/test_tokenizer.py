@@ -63,3 +63,20 @@ def test_json_bridge_preserves_float_value(checkpoint, tmp_path, value):
     restored = json.loads(result["text"])
     assert restored["number"].hex() == value.hex()
     assert restored["nested"][0].hex() == value.hex()
+
+
+@pytest.mark.parametrize("value", [2**64, -(2**63) - 1, 10**100])
+def test_json_bridge_rejects_out_of_range_integers(checkpoint, value):
+    smg, _ = checkpoint
+    messages = [{"role": "assistant", "content": "", "payload": {"nested": [value]}}]
+    with pytest.raises(ValueError, match="JSON integer.*outside the supported range"):
+        smg.render(messages)
+
+
+def test_json_bridge_keeps_integer_bounds_and_ignores_digits_in_strings(checkpoint, tmp_path):
+    template = tmp_path / "integers.jinja"
+    template.write_text("{{ messages[0].payload | tojson }}")
+    smg = Tokenizer(tmp_path, chat_template_path=str(template))
+    payload = {"bounds": [-(2**63), 2**64 - 1], "text": '"\\\\" 100000000000000000001'}
+    result = smg.render([{"role": "user", "content": "", "payload": payload}])
+    assert json.loads(result["text"]) == payload

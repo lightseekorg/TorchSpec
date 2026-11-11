@@ -1,5 +1,6 @@
 """Tests for KimiK25Parser and kimi-k25-vlm template."""
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -7,6 +8,46 @@ import torch
 
 from torchspec.data.parse import KimiK25Parser
 from torchspec.data.template import TEMPLATE_REGISTRY
+
+
+def test_null_assistant_content_does_not_leak_into_loss_mask(mock_tokenizer, kimi_template):
+    parser = KimiK25Parser(mock_tokenizer, kimi_template)
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "search:0", "function": {"arguments": '{"q":"hi"}'}}],
+        },
+    ]
+    text = parser.format(messages)
+    assert "<think></think>" + parser.TOOL_CALLS_SECTION_BEGIN in text
+    ids, mask = parser.parse(messages, max_length=256)
+    supervised = mock_tokenizer.decode(ids[mask.bool()].tolist())
+    assert "None" not in supervised
+    assert "search:0" in supervised
+
+
+@pytest.mark.parametrize("arguments", [{"query": "北京", "values": [True, None, 3]}, '{"q":"hi"}'])
+def test_tool_arguments_are_json_and_strings_are_preserved(
+    mock_tokenizer, kimi_template, arguments
+):
+    parser = KimiK25Parser(mock_tokenizer, kimi_template)
+    text = parser.format(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "search:0", "function": {"arguments": arguments}}],
+            },
+        ]
+    )
+    rendered = text.split(parser.TOOL_CALL_ARGUMENT_BEGIN, 1)[1].split(parser.TOOL_CALL_END, 1)[0]
+    if isinstance(arguments, str):
+        assert rendered == arguments
+    else:
+        assert json.loads(rendered) == arguments
+        assert "北京" in rendered
 
 
 class MockKimiTokenizer:

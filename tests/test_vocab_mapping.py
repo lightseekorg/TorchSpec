@@ -11,6 +11,7 @@ from collections import Counter
 import pytest
 import torch
 
+from torchspec.data.dataset import _load_pretokenized_dataset
 from torchspec.data.preprocessing import (
     _count_token_frequencies,
     generate_vocab_mapping,
@@ -31,6 +32,19 @@ def _make_prompts(input_ids_list, loss_mask_list):
             }
         )
     return prompts
+
+
+def test_generate_vocab_mapping_accepts_a_single_token_pretokenized_row():
+    prompts = _load_pretokenized_dataset(
+        [
+            {"input_ids": [5, 6, 7], "loss_mask": [0, 1, 1]},
+            {"input_ids": [3], "loss_mask": [1]},
+        ],
+        max_length=16,
+    )
+    d2t, t2d = generate_vocab_mapping(prompts, target_vocab_size=32, draft_vocab_size=3)
+    assert torch.where(t2d)[0].tolist() == [3, 6, 7]
+    assert (d2t + torch.arange(3)).tolist() == [3, 6, 7]
 
 
 @pytest.fixture

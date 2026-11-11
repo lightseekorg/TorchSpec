@@ -31,6 +31,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from torchspec.data.parse import (
+    KimiK25Parser,
     create_parser,
     has_thinking_content,
     has_unbalanced_thinking_tags,
@@ -466,6 +467,8 @@ def load_conversation_dataset(args):
             cache_params += (
                 f"-supervision={TEMPLATE_REGISTRY.get(chat_template_name).model_dump_json()}"
             )
+    elif custom_template is not None and custom_template.parser_type == "kimi-k25":
+        cache_params += f"-kimi-k25-parser={KimiK25Parser.CACHE_VERSION}"
     cache_key = hashlib.md5(cache_params.encode()).hexdigest()
     cache_dir = os.path.join(getattr(args, "cache_dir", "./cache"), "tokenized_dataset")
     cache_path = os.path.join(cache_dir, f"{cache_key}.pt")
