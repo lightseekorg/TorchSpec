@@ -458,6 +458,20 @@ class TestDFlashModelForward(unittest.TestCase):
         numerator, denominator = loss_terms
         torch.testing.assert_close(loss, numerator / denominator)
 
+    def test_forward_on_a_sequence_shorter_than_a_block(self):
+        """Dummy anchor blocks reach past the context; RoPE must still cover them."""
+        B, seq_len = 1, self.model.block_size - 1
+        with torch.no_grad():
+            loss, *_ = self.model(
+                input_ids=torch.randint(0, self.V, (B, seq_len)),
+                hidden_states_list=[
+                    torch.randn(B, seq_len, self.H) for _ in range(self.num_target_layers)
+                ],
+                loss_mask=torch.ones(B, seq_len),
+                lm_head_weight=torch.randn(self.V, self.H),
+            )
+        self.assertTrue(torch.isfinite(loss))
+
     def test_loss_requires_grad(self):
         """Loss should be differentiable through the draft model."""
         B, seq_len = 1, 32

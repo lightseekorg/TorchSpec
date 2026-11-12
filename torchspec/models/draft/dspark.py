@@ -50,6 +50,7 @@ from torchspec.models.draft.dflash import (
     DFlashDecoderLayer,
     DFlashDraftModel,
     DFlashRMSNorm,
+    rotary_position_span,
 )
 from torchspec.models.ops.flex_attention import compile_friendly_flex_attention
 
@@ -177,8 +178,6 @@ class K3DSparkConfig(DSparkConfig):
         qk_rope_head_dim: int = 64,
         v_head_dim: int = 128,
         mla_use_output_gate: bool = False,
-        rope_scaling: Optional[dict] = None,
-        rope_parameters: Optional[dict] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -188,30 +187,6 @@ class K3DSparkConfig(DSparkConfig):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.mla_use_output_gate = bool(mla_use_output_gate)
-
-        # transformers 5.x aliases rope_scaling to rope_parameters (a property
-        # on PretrainedConfig), so both names must resolve to one normalized
-        # dict. An explicit legacy rope_scaling wins over rope_parameters;
-        # rope_theta stays nested in the dict for serving-config round trips
-        # but is also lifted to the top-level attribute _init_rope reads.
-        params = rope_scaling if rope_scaling is not None else rope_parameters
-        if params is not None:
-            params = dict(params)
-            rope_theta = params.get("rope_theta")
-            if rope_theta is not None:
-                self.rope_theta = float(rope_theta)
-            if params.get("rope_type", params.get("type")) == "yarn":
-                yarn_defaults = {
-                    "beta_fast": 32.0,
-                    "beta_slow": 1.0,
-                    "mscale": 1.0,
-                    "mscale_all_dim": 0.0,
-                }
-                for key, default in yarn_defaults.items():
-                    if params.get(key) is None:
-                        params[key] = default
-
-        self.rope_parameters = params
 
 
 # Deliberately not @torch.compile'd: like DFlashAttention's inline RoPE, this
@@ -295,6 +270,8 @@ class K3DSparkMLAAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -324,7 +301,9 @@ class K3DSparkMLAAttention(nn.Module):
         k_rope = k_rope.unsqueeze(1)
 
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        cos, sin = self.rotary_emb(q_rope, seq_len=total_len)
+        if position_span is None:
+            position_span = rotary_position_span(full_position_ids)
+        cos, sin = self.rotary_emb(q_rope, seq_len=position_span)
         cos = cos.to(draft_hidden.device)
         sin = sin.to(draft_hidden.device)
         q_rope = _apply_rope_interleaved(q_rope, cos, sin, draft_position_ids)

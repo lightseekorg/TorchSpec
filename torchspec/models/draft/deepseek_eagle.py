@@ -21,7 +21,6 @@
 """DeepSeek MLA (Multi-head Latent Attention) Eagle3 draft model for training."""
 
 import math
-from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -42,8 +41,8 @@ from torchspec.models.draft.base import Eagle3DraftModel, build_lm_head
 from torchspec.models.draft.llama3_eagle import (
     LlamaMLP,
     LlamaRMSNorm,
+    LlamaYarnRotaryEmbedding,
     build_rotary_embedding,
-    rope_config_get,
     yarn_get_mscale,
 )
 from torchspec.models.ops.flex_attention import (
@@ -146,20 +145,14 @@ class DeepSeekMLAAttention(nn.Module):
     def _init_rope(self):
         """Rotate only the rope side dims, so the cache is built at qk_rope_head_dim."""
         self.rotary_emb = build_rotary_embedding(
-            self.config, self.qk_rope_head_dim, self.max_position_embeddings
+            self.config, self.qk_rope_head_dim, self.max_position_embeddings, supports_mrope=False
         )
 
     def _compute_softmax_scale(self) -> float:
         """Compute softmax scale, incorporating YaRN mscale if applicable."""
-        rope_scaling = self.config.rope_scaling
-        if rope_scaling is not None:
-            rget = partial(rope_config_get, rope_scaling)
-            scaling_type = rget("rope_type", rget("type"))
-            if scaling_type == "yarn":
-                factor = rget("factor", 1.0)
-                mscale_all_dim = rget("mscale_all_dim", 0)
-                mscale = yarn_get_mscale(factor, mscale_all_dim)
-                return (mscale * mscale) / math.sqrt(self.qk_head_dim)
+        if isinstance(self.rotary_emb, LlamaYarnRotaryEmbedding):
+            mscale = yarn_get_mscale(self.rotary_emb.scaling_factor, self.rotary_emb.mscale_all_dim)
+            return (mscale * mscale) / math.sqrt(self.qk_head_dim)
         return 1.0 / math.sqrt(self.qk_head_dim)
 
     def _project_qkv(

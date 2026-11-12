@@ -38,7 +38,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
 
-from torchspec.config.utils import resolve_rope_theta
+from torchspec.config.utils import _normalize_rope_scaling
+from torchspec.models.draft.llama3_eagle import build_rotary_embedding
 
 
 class DFlashConfig(PretrainedConfig):
@@ -64,6 +65,8 @@ class DFlashConfig(PretrainedConfig):
         fc_norm: bool = False,
         mask_token_id: int = 151669,
         tie_word_embeddings: bool = False,
+        rope_scaling: Optional[dict] = None,
+        rope_parameters: Optional[dict] = None,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -83,6 +86,23 @@ class DFlashConfig(PretrainedConfig):
         self.fc_norm = bool(fc_norm)
         self.mask_token_id = mask_token_id
 
+        # transformers 5.x aliases rope_scaling to rope_parameters (a property
+        # on PretrainedConfig), so both names must resolve to one normalized
+        # dict. It is kept out of PretrainedConfig.__init__, whose rope
+        # validation reads fields set above and wants rope_theta nested. An
+        # explicit legacy rope_scaling wins over rope_parameters; a nested
+        # rope_theta stays in the dict for serving-config round trips but is
+        # also lifted to the top-level attribute the rotary embedding reads.
+        params = _normalize_rope_scaling(
+            rope_scaling if rope_scaling is not None else rope_parameters
+        )
+        if params is not None and params.get("rope_theta") is not None:
+            self.rope_theta = float(params["rope_theta"])
+        self.rope_parameters = params
+        # Transformers 4.x stores the legacy field independently.
+        if not hasattr(self, "rope_scaling"):
+            self.rope_scaling = params
+
 
 class DFlashRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -98,38 +118,15 @@ class DFlashRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class DFlashRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_position_embeddings: int = 32768, base: float = 10000.0):
-        super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        # +20 buffer avoids cache rebuild if sequences slightly exceed the configured limit.
-        self._set_cos_sin_cache(max_position_embeddings + 20, self.inv_freq.device, torch.float32)
-
-    def _set_cos_sin_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
-
-    def forward(self, x: torch.Tensor, seq_len: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        if seq_len and seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-        return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-        )
-
-
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+def rotary_position_span(position_ids: torch.Tensor) -> int:
+    """Table length needed to index these positions, including any offsets."""
+    return int(position_ids.max()) + 1 if position_ids.numel() else 0
 
 
 # NOTE: Not called in DFlashAttention.forward() (RoPE is applied inline there),
@@ -188,10 +185,8 @@ class DFlashAttention(nn.Module):
         self.q_norm = DFlashRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = DFlashRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        self.rotary_emb = DFlashRotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=resolve_rope_theta(config),
+        self.rotary_emb = build_rotary_embedding(
+            config, self.head_dim, self.max_position_embeddings, supports_mrope=False
         )
 
     def forward(
@@ -201,6 +196,8 @@ class DFlashAttention(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass with dual-source KV.
 
@@ -210,6 +207,7 @@ class DFlashAttention(nn.Module):
             draft_position_ids: [B, draft_len] — position IDs for draft tokens
             context_position_ids: [B, ctx_len] — position IDs for context tokens
             block_mask: FlexAttention BlockMask for block-causal attention
+            position_span: Precomputed table length for the supplied position IDs
         """
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -237,7 +235,9 @@ class DFlashAttention(nn.Module):
 
         # RoPE with concatenated position IDs (context + draft)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
-        cos, sin = self.rotary_emb(q, seq_len=total_len)
+        if position_span is None:
+            position_span = rotary_position_span(full_position_ids)
+        cos, sin = self.rotary_emb(q, seq_len=position_span)
         cos = cos.to(q.device)
         sin = sin.to(q.device)
 
@@ -307,6 +307,8 @@ class DFlashDecoderLayer(nn.Module):
         draft_position_ids: torch.Tensor,
         context_position_ids: torch.Tensor,
         block_mask=None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -317,6 +319,7 @@ class DFlashDecoderLayer(nn.Module):
             draft_position_ids=draft_position_ids,
             context_position_ids=context_position_ids,
             block_mask=block_mask,
+            position_span=position_span,
         )
         draft_hidden = residual + draft_hidden
 
@@ -437,6 +440,8 @@ class DFlashDraftModel(PreTrainedModel):
         context_position_ids: torch.Tensor,
         block_mask=None,
         noise_embedding: Optional[torch.Tensor] = None,
+        *,
+        position_span: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass through draft model.
 
@@ -449,6 +454,7 @@ class DFlashDraftModel(PreTrainedModel):
             block_mask: FlexAttention BlockMask, or a per-layer sequence of
                 BlockMasks for mixed attention schedules
             noise_embedding: [B, draft_len, D] — pre-computed embeddings (from training wrapper)
+            position_span: Precomputed table length for the supplied position IDs
 
         Returns:
             hidden_states: [B, draft_len, D] — pre-norm hidden states
@@ -457,6 +463,11 @@ class DFlashDraftModel(PreTrainedModel):
             draft_hidden = noise_embedding.to(context_feature.dtype)
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
+
+        if position_span is None:
+            position_span = rotary_position_span(
+                torch.cat([context_position_ids, draft_position_ids], dim=1)
+            )
 
         for layer_id, layer in enumerate(self.layers):
             layer_block_mask = block_mask
@@ -468,6 +479,7 @@ class DFlashDraftModel(PreTrainedModel):
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
                 block_mask=layer_block_mask,
+                position_span=position_span,
             )
 
         return self.final_norm(draft_hidden)
