@@ -348,7 +348,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        self.orig_max_position = None
         # Llama3 style rotary embedding frequency scaling
         if all(
             v is not None
@@ -367,29 +367,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             self.high_freq_factor = high_freq_factor
             self.orig_max_position = orig_max_position
 
-            low_freq_wavelen = orig_max_position / low_freq_factor
-            high_freq_wavelen = orig_max_position / high_freq_factor
-            wave_len = 2 * math.pi / inv_freq
-
-            if low_freq_factor != high_freq_factor:
-                smooth = (orig_max_position / wave_len - low_freq_factor) / (
-                    high_freq_factor - low_freq_factor
-                )
-            else:
-                smooth = 0
-
-            new_freqs = torch.where(
-                wave_len < high_freq_wavelen,
-                inv_freq,
-                torch.where(
-                    wave_len > low_freq_wavelen,
-                    inv_freq / self.scaling_factor,
-                    (1 - smooth) * inv_freq / self.scaling_factor + smooth * inv_freq,
-                ),
-            )
-            inv_freq = new_freqs
-
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq", self._compute_inv_freq(device), persistent=False)
 
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
@@ -400,9 +378,40 @@ class LlamaRotaryEmbedding(torch.nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
+    def _compute_inv_freq(self, device):
+        indices = torch.arange(0, self.dim, 2, device=device, dtype=torch.float32)
+        inv_freq = 1.0 / (self.base ** (indices / self.dim))
+        if self.orig_max_position is None:
+            return inv_freq
+
+        low_freq_wavelen = self.orig_max_position / self.low_freq_factor
+        high_freq_wavelen = self.orig_max_position / self.high_freq_factor
+        wave_len = 2 * math.pi / inv_freq
+        if self.low_freq_factor != self.high_freq_factor:
+            smooth = (self.orig_max_position / wave_len - self.low_freq_factor) / (
+                self.high_freq_factor - self.low_freq_factor
+            )
+        else:
+            smooth = 0
+
+        return torch.where(
+            wave_len < high_freq_wavelen,
+            inv_freq,
+            torch.where(
+                wave_len > low_freq_wavelen,
+                inv_freq / self.scaling_factor,
+                (1 - smooth) * inv_freq / self.scaling_factor + smooth * inv_freq,
+            ),
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype, *, position_scale=1.0):
+        # A model dtype cast can round inv_freq. Regenerate it before computing phases.
+        if self.inv_freq.dtype in (torch.bfloat16, torch.float16):
+            self.register_buffer("inv_freq", self._compute_inv_freq(device), persistent=False)
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        if position_scale != 1.0:
+            t = t / position_scale
 
         # CUDA autocast lowers einsum to bf16. Keep the phase product in the
         # frequency dtype when the table grows or resets during training.
@@ -448,15 +457,7 @@ class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
         super().__init__(dim, max_position_embeddings, base, device)
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-        t = t / self.scaling_factor
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+        super()._set_cos_sin_cache(seq_len, device, dtype, position_scale=self.scaling_factor)
 
 
 class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):

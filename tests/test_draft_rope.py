@@ -33,6 +33,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
 from transformers import LlamaConfig
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -284,6 +285,51 @@ LLAMA3 = {
     "original_max_position_embeddings": 64,
 }
 YARN_MINIMAL = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32}
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_bf16_supported(), reason="requires CUDA BF16"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "rope_scaling",
+    [None, {"rope_type": "linear", "factor": 2.0}, LLAMA3],
+    ids=["default", "linear", "llama3"],
+)
+def test_bf16_eagle_attention_preserves_rope_cache_on_growth(device, rope_scaling):
+    length = 257
+    if rope_scaling is not None:
+        rope_scaling = rope_scaling.copy()
+    config = _tiny_llama(rope_scaling, max_position_embeddings=length)
+    with torch.device(device):
+        attention = LlamaAttention(config).to(dtype=torch.bfloat16)
+        reference = build_rotary_embedding(config, config.head_dim, length + 1)
+        hidden = torch.zeros(1, length, 2 * config.hidden_size, dtype=torch.bfloat16)
+        positions = torch.arange(length)[None]
+        mask = hidden.new_zeros(length, length).masked_fill(positions.T < positions, float("-inf"))
+
+    rotary = attention.rotary_emb
+    with torch.no_grad():
+        _, keys, values = attention(
+            hidden, attention_mask=mask, position_ids=positions, use_cache=True
+        )
+        assert rotary.max_seq_len_cached == length
+        attention(hidden, keys, values, attention_mask=mask, position_ids=positions, use_cache=True)
+
+    assert rotary.max_seq_len_cached == length + 1
+    for actual, expected in (
+        (rotary.cos_cached, reference.cos_cached),
+        (rotary.sin_cached, reference.sin_cached),
+    ):
+        torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
 
 
 class TestDFlashRopeScaling(unittest.TestCase):
