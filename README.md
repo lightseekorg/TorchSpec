@@ -148,6 +148,9 @@ enable deferred/decode or preformatted/generation-prefix modes. Missing
 SMG bindings and rendering errors never silently change the selected backend.
 See [SMG setup, supported paths, and correctness gates](docs/smg-tokenization.md).
 
+An opt-in [Qwen3-VL image path](docs/smg-multimodal.md) uses SMG preprocessing
+and sends final token IDs, image tensors, and aligned loss masks directly to vLLM.
+
 ### Backend-Specific Usage
 
 **vLLM**

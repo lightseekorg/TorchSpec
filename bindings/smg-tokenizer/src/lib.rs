@@ -11,6 +11,9 @@ use pyo3::{exceptions::PyValueError, prelude::*};
 use regex::Regex;
 use serde_json::Value;
 
+#[cfg(feature = "multimodal")]
+mod vision;
+
 type RenderOutput = (String, Vec<u32>, Option<Vec<(usize, usize)>>, bool);
 
 fn value_error(error: impl std::fmt::Display) -> PyErr {
@@ -183,7 +186,10 @@ impl Tokenizer {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Tokenizer>()?;
+    #[cfg(feature = "multimodal")]
+    m.add_class::<vision::ImageProcessor>()?;
     m.add("BINDING_VERSION", env!("CARGO_PKG_VERSION"))?;
     m.add("TOKENIZERS_V1", cfg!(feature = "tokenizers-v1"))?;
+    m.add("MULTIMODAL", cfg!(feature = "multimodal"))?;
     Ok(())
 }

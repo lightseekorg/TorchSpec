@@ -2,11 +2,34 @@
 
 import json
 
+from torchspec_smg import _native
 from torchspec_smg._native import BINDING_VERSION, TOKENIZERS_V1
 from torchspec_smg._native import Tokenizer as _Tokenizer
 
 __version__ = BINDING_VERSION
 build_features = "tokenizers-v1" if TOKENIZERS_V1 else "default"
+if getattr(_native, "MULTIMODAL", False):
+    build_features += ",multimodal"
+
+
+class ImageProcessor:
+    """Process encoded Qwen3-VL images in SMG, releasing the GIL for native work."""
+
+    def __init__(self, path):
+        if not getattr(_native, "MULTIMODAL", False):
+            raise ImportError("Rebuild TorchSpec with TORCHSPEC_SMG_FEATURES=multimodal")
+        self._inner = _native.ImageProcessor(str(path))
+
+    def process(self, images):
+        """Return f32 pixels, integer grids, and SMG token replacements for image bytes."""
+        import numpy as np
+
+        pixels, shape, grid, replacements = self._inner.process(images)
+        return {
+            "pixel_values": np.frombuffer(pixels, dtype="<f4").reshape(shape),
+            "image_grid_thw": np.asarray(grid, dtype=np.int64).reshape(-1, 3),
+            "replacements": replacements,
+        }
 
 
 class Tokenizer:
