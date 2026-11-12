@@ -249,6 +249,17 @@ class TestLastTurnOnly:
         result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)
         assert result.tolist() == [0, 0, 0, 0, 0, 0, 0, 1, 1]
 
+    @pytest.mark.parametrize("final_body", [[], [99]])
+    def test_empty_last_turn_does_not_supervise_earlier_turn(self, final_body):
+        # The formatting token, when present, is excluded from supervision.
+        ids = torch.tensor([*self.H, 99, 1, *self.E, *self.H, *final_body, *self.E])
+        all_turns = compute_assistant_loss_mask(ids, self.H, self.E, skip_after_header=1)
+        last_turn = compute_assistant_loss_mask(
+            ids, self.H, self.E, last_turn_only=True, skip_after_header=1
+        )
+        assert ids[all_turns.bool()].tolist() == [1]
+        assert not last_turn.any()
+
     def test_no_assistant_turns(self):
         ids = torch.tensor([5, 6, 7, 8], dtype=torch.long)
         result = compute_assistant_loss_mask(ids, self.H, self.E, last_turn_only=True)

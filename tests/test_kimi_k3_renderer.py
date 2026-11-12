@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from torchspec.data.renderers import RENDERER_REGISTRY, K3Renderer
+from torchspec.data.utils import resolve_loss_mask
 from torchspec.models.ops.loss_mask import compute_assistant_loss_mask
 
 
@@ -77,25 +78,26 @@ def test_kimi_k3_renderer_is_registered_and_created_with_tokenizer():
     assert renderer.tokenizer is tokenizer
 
 
-def test_kimi_k3_assistant_match_tokens_include_outer_sep():
+def test_kimi_k3_assistant_match_tokens_describe_outer_sep():
     renderer = K3Renderer(StubK3Tokenizer())
 
     header_ids, end_ids, skip_after_header = renderer.get_assistant_token_ids()
 
-    assert header_ids == [
-        *StubK3Tokenizer.ASSISTANT_HEADER,
-        StubK3Tokenizer.SEP,
-    ]
+    assert header_ids.prefix == tuple(StubK3Tokenizer.ASSISTANT_HEADER)
+    assert header_ids.terminator_id == StubK3Tokenizer.SEP
     assert end_ids == [StubK3Tokenizer.EOM]
     assert skip_after_header == 0
 
 
-def test_training_matcher_reproduces_k3_mask_after_media_expansion():
+@pytest.mark.parametrize("attributes", [{}, {"name": "named"}])
+def test_training_matcher_reproduces_k3_mask_after_media_expansion(attributes):
     renderer = K3Renderer(StubK3Tokenizer())
     input_ids, _ = renderer.render(
         [
             {"role": "user", "content": "question"},
-            {"role": "assistant", "content": "answer"},
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "another question"},
+            {"role": "assistant", "content": "answer", **attributes},
         ],
         max_seq_length=1024,
         last_turn_only=True,
@@ -124,6 +126,32 @@ def test_training_matcher_reproduces_k3_mask_after_media_expansion():
         last_turn_only=True,
     )
     assert dynamic_mask[assistant_start : assistant_start + 4] == [0, 0, 0, 0]
+    assert all(dynamic_mask[i] for i in _body_indices(expanded_ids, "answer"))
+    assert not any(dynamic_mask[i] for i in _body_indices(expanded_ids, "earlier"))
+    resolved = resolve_loss_mask(
+        {"input_ids": torch.tensor(expanded_ids)[None], "last_turn_loss_only": True},
+        dynamic_loss_mask=True,
+        assistant_header_ids=header_ids,
+        end_token_ids=end_ids,
+        skip_after_header=skip_after_header,
+    )
+    assert resolved.tolist() == dynamic_mask
+
+
+def test_truncated_named_header_does_not_mask_a_following_user_message():
+    renderer = K3Renderer(StubK3Tokenizer())
+    header, end, skip = renderer.get_assistant_token_ids()
+    ids = [
+        *StubK3Tokenizer.ASSISTANT_HEADER,
+        300,
+        StubK3Tokenizer.OPEN,
+        StubK3Tokenizer.USER,
+        StubK3Tokenizer.SEP,
+        1000,
+        StubK3Tokenizer.EOM,
+    ]
+    mask = compute_assistant_loss_mask(torch.tensor(ids), header, end, skip_after_header=skip)
+    assert not mask.any()
 
 
 def test_render_delegates_all_xtml_work_to_remote_tokenizer():

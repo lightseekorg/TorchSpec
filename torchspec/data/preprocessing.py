@@ -43,7 +43,7 @@ except ImportError:
     HAS_QWEN_VL_UTILS = False
     process_vision_info = None
 
-from torchspec.data.parse import create_parser
+from torchspec.data.parse import KimiK25Parser, create_parser
 from torchspec.data.renderers.kimi_k3 import K3Renderer
 from torchspec.data.renderers.smg import SmgRenderer, effective_renderer, prepare_checkpoint
 from torchspec.data.renderers.smg_k3 import SmgK3Renderer
@@ -156,6 +156,8 @@ def _prepare_conversation_renderer(
         signature["version"] = K3Renderer.CACHE_VERSION
     else:
         factory = None
+        if chat_template is not None and chat_template.parser_type == "kimi-k25":
+            signature["version"] = KimiK25Parser.CACHE_VERSION
     return factory, signature
 
 
@@ -579,12 +581,7 @@ def _count_token_frequencies(prompts: list) -> Counter:
     all_masks = []
     for item in tqdm(prompts, desc="Preparing token data"):
         input_ids = item["input_ids"]
-        if isinstance(input_ids, torch.Tensor):
-            ids_np = input_ids.squeeze().numpy().astype(np.int64)
-        elif isinstance(input_ids, np.ndarray):
-            ids_np = input_ids.astype(np.int64)
-        else:
-            ids_np = np.array(input_ids, dtype=np.int64)
+        ids_np = np.asarray(input_ids, dtype=np.int64).reshape(-1)
 
         packed = item.get("packed_loss_mask")
         if packed is not None:

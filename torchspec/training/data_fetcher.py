@@ -37,6 +37,7 @@ from ray.util.queue import Queue as RayQueue
 from torch.utils.data import DataLoader, IterableDataset
 
 from torchspec.data.utils import deserialize_packed_loss_mask, resolve_loss_mask, unpack_loss_mask
+from torchspec.models.ops.loss_mask import AssistantHeader
 from torchspec.utils.distributed import (
     get_draft_sp_group,
     get_sp_ring_group,
@@ -86,7 +87,7 @@ class MooncakeDataset(IterableDataset):
         device: torch.device,
         prefetch_factor: int = 2,
         timeout: Optional[float] = None,
-        assistant_header_ids: Optional[List[int]] = None,
+        assistant_header_ids: list[int] | AssistantHeader | None = None,
         end_token_ids: Optional[List[int]] = None,
         dynamic_loss_mask: bool = False,
         last_turn_loss_only: bool = False,
@@ -528,7 +529,7 @@ def create_mooncake_dataloader(
     batch_size: int = 1,
     prefetch_factor: int = 2,
     timeout: Optional[float] = None,
-    assistant_header_ids: Optional[List[int]] = None,
+    assistant_header_ids: list[int] | AssistantHeader | None = None,
     end_token_ids: Optional[List[int]] = None,
     dynamic_loss_mask: bool = False,
     last_turn_loss_only: bool = False,
@@ -615,7 +616,7 @@ class MooncakeDataFetcher:
         batch_size: int = 1,
         prefetch_factor: int = 2,
         timeout: Optional[float] = None,
-        assistant_header_ids: Optional[List[int]] = None,
+        assistant_header_ids: list[int] | AssistantHeader | None = None,
         end_token_ids: Optional[List[int]] = None,
         dynamic_loss_mask: bool = False,
         last_turn_loss_only: bool = False,

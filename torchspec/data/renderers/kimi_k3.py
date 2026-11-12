@@ -20,6 +20,8 @@
 
 from typing import Any
 
+from torchspec.models.ops.loss_mask import AssistantHeader
+
 
 class K3Renderer:
     """Render Kimi-K3 XTML through the checkpoint's remote tokenizer code.
@@ -269,16 +271,9 @@ class K3Renderer:
             loss_mask[start:end] = [1] * (end - start)
         return loss_mask
 
-    def get_assistant_token_ids(self) -> tuple[list[int], list[int], int]:
-        """Return the K3-aware matcher contract for post-vLLM token IDs.
-
-        K3's derived ``assistant_header_ids`` intentionally stops before the
-        outer ``<|sep|>`` token because :meth:`_assistant_spans` validates that
-        delimiter separately. The generic training-side matcher starts
-        supervision immediately after its header match, so include ``sep_id``
-        in the returned header to keep that structural token masked out.
-        """
-        return [*self.assistant_header_ids, self.sep_id], [self.eom_id], 0
+    def get_assistant_token_ids(self) -> tuple[AssistantHeader, list[int], int]:
+        """Match the role prefix through the separator, including optional names."""
+        return AssistantHeader(tuple(self.assistant_header_ids), self.sep_id), [self.eom_id], 0
 
     def render(
         self,

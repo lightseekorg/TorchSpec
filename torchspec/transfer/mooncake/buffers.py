@@ -164,13 +164,8 @@ class AsyncPutManager:
         Raises the original exception if the transfer failed.
         """
         future = self._in_flight.pop(buffer_ptr, None)
-        if future is None:
-            return
-        try:
+        if future is not None:
             future.result()
-        except Exception as exc:
-            self._last_error = exc
-            raise
 
     def submit(
         self,

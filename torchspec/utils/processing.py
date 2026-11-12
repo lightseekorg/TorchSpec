@@ -20,6 +20,7 @@
 
 from transformers import AutoTokenizer
 
+from torchspec.models.ops.loss_mask import AssistantHeader
 from torchspec.utils.logging import logger
 
 
@@ -30,7 +31,7 @@ def load_tokenizer(name_or_path: str, **kwargs):
 
 def get_assistant_token_ids(
     args,
-) -> tuple[list[int] | None, list[int] | None, int]:
+) -> tuple[list[int] | AssistantHeader | None, list[int] | None, int]:
     """Derive assistant_header_ids, end_token_ids, and skip_after_header.
 
     Returns:

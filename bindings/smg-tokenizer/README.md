@@ -32,3 +32,6 @@ Rendering and encoding continue to use the pinned upstream Rust implementation.
 
 0.1.3 enables serde_json float round-tripping so Python tool-argument floats
 retain their exact binary value across the native JSON boundary.
+
+0.1.4 rejects integer literals outside the native signed or unsigned 64-bit
+range before JSON decoding can round them.

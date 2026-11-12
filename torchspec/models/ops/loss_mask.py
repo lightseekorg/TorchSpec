@@ -18,14 +18,29 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from dataclasses import dataclass
+
 import numba
 import numpy as np
 import torch
 
+DYNAMIC_LOSS_MASK_CACHE_VERSION = "v2"
+
+
+@dataclass(frozen=True)
+class AssistantHeader:
+    """A header prefix followed by optional attributes and a structural terminator."""
+
+    prefix: tuple[int, ...]
+    terminator_id: int
+
 
 @numba.njit(cache=True)
-def _numba_loss_mask(ids, header, header_len, end, end_len, out, skip_after):
+def _numba_loss_mask(ids, header, end, out, skip_after, header_terminator_id):
     n = len(ids)
+    header_len = len(header)
+    end_len = len(end)
+    last_body_start = n
     i = 0
     while i <= n - header_len:
         match = True
@@ -36,8 +51,20 @@ def _numba_loss_mask(ids, header, header_len, end, end_len, out, skip_after):
         if not match:
             i += 1
             continue
-        j = i + header_len + skip_after
-        found_end = False
+        j = i + header_len
+        if header_terminator_id is not None:
+            while j < n and ids[j] != header_terminator_id:
+                # An incomplete header must not consume another message.
+                if ids[j] == header[0] or ids[j] == end[0]:
+                    break
+                j += 1
+            if j == n or ids[j] != header_terminator_id:
+                last_body_start = n
+                i = j
+                continue
+            j += 1
+        body_start = j + skip_after
+        last_body_start = body_start
         while j <= n - end_len:
             end_match = True
             for k in range(end_len):
@@ -45,15 +72,13 @@ def _numba_loss_mask(ids, header, header_len, end, end_len, out, skip_after):
                     end_match = False
                     break
             if end_match:
-                found_end = True
                 break
-            out[j] = 1
             j += 1
-        if not found_end:
-            for k in range(j, n):
-                out[k] = 1
+        else:
+            j = n
+        out[body_start:j] = 1
         i = j + end_len
-    return out
+    return last_body_start
 
 
 def _to_contiguous_int64_numpy(t: torch.Tensor) -> np.ndarray:
@@ -67,7 +92,7 @@ def _to_contiguous_int64_numpy(t: torch.Tensor) -> np.ndarray:
 
 def compute_assistant_loss_mask(
     input_ids: torch.Tensor,
-    assistant_header_ids: list[int],
+    assistant_header_ids: list[int] | AssistantHeader,
     end_token_ids: list[int],
     last_turn_only: bool = False,
     skip_after_header: int = 0,
@@ -80,7 +105,8 @@ def compute_assistant_loss_mask(
 
     Args:
         input_ids: 1-D tensor of token IDs (CPU or CUDA).
-        assistant_header_ids: Token ID sequence marking the start of assistant content.
+        assistant_header_ids: A fixed token ID sequence or a prefix and terminator
+            for headers with variable attributes.
         end_token_ids: Token ID sequence marking the end of assistant content.
         last_turn_only: If True, only the last assistant turn is marked.
         skip_after_header: Number of tokens to skip after header match before
@@ -97,17 +123,19 @@ def compute_assistant_loss_mask(
         if isinstance(input_ids, torch.Tensor)
         else np.asarray(input_ids, dtype=np.int64)
     )
+    header_terminator_id = None
+    if isinstance(assistant_header_ids, AssistantHeader):
+        header_terminator_id = assistant_header_ids.terminator_id
+        assistant_header_ids = assistant_header_ids.prefix
     header_np = np.array(assistant_header_ids, dtype=np.int64)
     end_np = np.array(end_token_ids, dtype=np.int64)
     out = np.zeros(len(ids_np), dtype=np.int64)
-    _numba_loss_mask(ids_np, header_np, len(header_np), end_np, len(end_np), out, skip_after_header)
-
-    if last_turn_only and out.any():
-        last_one = len(out) - 1 - np.argmax(out[::-1])
-        first_of_last = last_one
-        while first_of_last > 0 and out[first_of_last - 1] == 1:
-            first_of_last -= 1
-        out[:first_of_last] = 0
+    if header_np.size and end_np.size:
+        last_body_start = _numba_loss_mask(
+            ids_np, header_np, end_np, out, skip_after_header, header_terminator_id
+        )
+        if last_turn_only:
+            out[:last_body_start] = 0
 
     result = torch.from_numpy(out)
     return result.to(device) if device.type != "cpu" else result

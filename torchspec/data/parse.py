@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import json
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -387,6 +388,7 @@ class KimiK25Parser(Parser):
     - Generating loss mask for assistant content (including thinking)
     """
 
+    CACHE_VERSION = "v2"
     MEDIA_TOKEN = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
     USER_HEADER = "<|im_user|>user<|im_middle|>"
     ASSISTANT_HEADER = "<|im_assistant|>assistant<|im_middle|>"
@@ -443,6 +445,8 @@ class KimiK25Parser(Parser):
         for tc in tool_calls:
             tc_id = tc.get("id", "")
             tc_args = tc.get("function", {}).get("arguments", "")
+            if not isinstance(tc_args, str):
+                tc_args = json.dumps(tc_args, ensure_ascii=False)
             tc_parts.append(
                 f"{self.TOOL_CALL_BEGIN}{tc_id}"
                 f"{self.TOOL_CALL_ARGUMENT_BEGIN}{tc_args}"
@@ -465,7 +469,9 @@ class KimiK25Parser(Parser):
             role = msg["role"]
             content = msg.get("content", "")
 
-            if not isinstance(content, str):
+            if content is None:
+                content = ""
+            elif not isinstance(content, str):
                 if isinstance(content, list):
                     text_parts = []
                     for item in content:

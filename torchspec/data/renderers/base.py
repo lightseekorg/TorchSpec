@@ -20,6 +20,8 @@
 
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
+from torchspec.models.ops.loss_mask import AssistantHeader
+
 DEFAULT_CACHE_VERSION = "v1"
 
 
@@ -42,12 +44,12 @@ class ConversationRenderer(Protocol):
 
     def __init__(self, tokenizer: Any) -> None: ...
 
-    def get_assistant_token_ids(self) -> tuple[list[int], list[int], int]:
+    def get_assistant_token_ids(self) -> tuple[list[int] | AssistantHeader, list[int], int]:
         """Return ``(header_ids, end_ids, skip_after_header)`` for dynamic masks.
 
         Used when the loss mask has to be recomputed at training time against
-        the token IDs the inference engine actually produced. ``header_ids``
-        must end at the last structural token before supervision starts, and
+        the token IDs the inference engine actually produced. The fixed header
+        or variable header terminator marks where supervision starts.
         ``end_ids`` must match the token that closes an assistant turn.
         """
 

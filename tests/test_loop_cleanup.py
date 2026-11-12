@@ -475,3 +475,30 @@ def test_setup_eval_cache_key_accepts_omegaconf_list():
 
     assert state.eval_enabled is True
     train_group.load_eval_cache.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("settings", "version"),
+    [
+        ({"dynamic_loss_mask": True}, "DYNAMIC_LOSS_MASK_CACHE_VERSION"),
+        ({"chat_template": "kimi-k25-vlm"}, "KimiK25Parser.CACHE_VERSION"),
+        ({"chat_template": "qwen", "rendering_backend": "smg"}, "SMG_MIN_BINDING_VERSION"),
+    ],
+)
+def test_setup_eval_cache_key_includes_rendering_and_mask_versions(settings, version):
+    train_group = mock.MagicMock()
+    train_group.load_eval_cache.return_value = [1]
+    args = SimpleNamespace(
+        eval_interval=50,
+        dp_size=1,
+        checkpoint_dir=None,
+        eval_data_path="eval.jsonl",
+        target_model_path="model",
+        **settings,
+    )
+
+    cached = eval_utils.setup_eval(mock.MagicMock(), train_group, args, eval_dataset_size=1)
+    with mock.patch(f"torchspec.controller.eval.{version}", "different"):
+        updated = eval_utils.setup_eval(mock.MagicMock(), train_group, args, eval_dataset_size=1)
+
+    assert updated.eval_cache_path != cached.eval_cache_path
