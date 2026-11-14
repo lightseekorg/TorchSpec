@@ -560,10 +560,22 @@ class VllmEngine(InferenceEngine, RayActor):
                 if i < len(packed_loss_mask_list):
                     packed_loss_mask_map[did] = packed_loss_mask_list[i]
 
-        outputs = self._engine.generate(prompts, sampling_params, use_tqdm=False)
+        if any(prompt.get("type") == "multimodal" for prompt in prompts):
+            from torchspec.inference.engine.smg_multimodal import generate_prepared
+
+            outputs = generate_prepared(self._engine, prompts, sampling_params)
+        else:
+            outputs = self._engine.generate(prompts, sampling_params, use_tqdm=False)
 
         results = []
         for i, output in enumerate(outputs):
+            if (
+                prompts[i].get("type") == "multimodal"
+                and list(output.prompt_token_ids) != prompts[i]["prompt_token_ids"]
+            ):
+                raise RuntimeError(
+                    "vLLM changed the prepared SMG input IDs; refusing misaligned supervision"
+                )
             seq_len = len(output.prompt_token_ids)
             did = data_ids[i]
 
@@ -599,6 +611,13 @@ class VllmEngine(InferenceEngine, RayActor):
 
             input_ids_from_kv = kv_params.get("input_ids_list")
             if input_ids_from_kv is not None:
+                if (
+                    prompts[i].get("type") == "multimodal"
+                    and list(input_ids_from_kv) != prompts[i]["prompt_token_ids"]
+                ):
+                    raise RuntimeError(
+                        "Target-state connector IDs disagree with prepared SMG inputs"
+                    )
                 result["input_ids_list"] = input_ids_from_kv
             else:
                 result["input_ids_list"] = list(output.prompt_token_ids)
@@ -689,6 +708,22 @@ class VllmEngine(InferenceEngine, RayActor):
                 }
 
             if multimodal_inputs is not None:
+                payload = multimodal_inputs[i]
+                if payload is not None and "format" in payload:
+                    from torchspec.inference.engine.smg_multimodal import prepared_vllm_input
+
+                    if formatted_prompts is not None:
+                        raise ValueError(
+                            "Prepared SMG images require final input_ids, not formatted text"
+                        )
+                    prompts.append(
+                        prepared_vllm_input(
+                            prompt_dict["prompt_token_ids"],
+                            payload,
+                            self._engine.llm_engine.model_config,
+                        )
+                    )
+                    continue
                 mm_data = self._to_vllm_multi_modal_data(multimodal_inputs[i])
                 if mm_data is not None:
                     prompt_dict["multi_modal_data"] = mm_data

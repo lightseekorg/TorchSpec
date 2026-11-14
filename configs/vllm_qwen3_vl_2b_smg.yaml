@@ -1,0 +1,73 @@
+# Qwen3-VL image training with SMG preprocessing and a one-layer Eagle3 draft.
+# Run from the repository root with a native wheel built with `multimodal`.
+# Uses one vLLM GPU and one training GPU on the same two-GPU host.
+model:
+  target_model_path: Qwen/Qwen3-VL-2B-Instruct
+  target_model_backend: vllm
+  draft_model_config: configs/draft_models/qwen3_vl_2b_eagle3.json
+  embedding_key: model.language_model.embed_tokens.weight
+  # The target checkpoint ties its head to its input embedding.
+  lm_head_key: model.language_model.embed_tokens.weight
+  norm_key: model.language_model.norm.weight
+  freeze_lm_head: true
+
+dataset:
+  train_data_path: ???
+  eval_data_path: ???
+  prompt_key: conversations
+  eval_interval: 100
+  renderer: smg-qwen3-vl
+  rendering_backend: smg
+  chat_template: null
+  defer_tokenization: false
+  last_turn_loss_only: false
+  min_loss_tokens: 2
+  num_proc: 2
+
+training:
+  training_num_nodes: 1
+  training_num_gpus_per_node: 1
+  micro_batch_size: 2
+  draft_accumulation_steps: 1
+  max_concurrent_batches: 1
+  attention_backend: sdpa
+  ttt_length: 3
+  max_seq_length: 2048
+  train_with_decode: false
+  num_epochs: 100
+  num_train_steps: 1000
+  learning_rate: 0.0001
+  min_lr: 0.00001
+  warmup_ratio: 0.015
+  weight_decay: 0.0
+  max_grad_norm: 0.5
+  seed: 42
+
+inference:
+  inference_engine_type: vllm
+  inference_num_gpus: 1
+  inference_num_gpus_per_engine: 1
+  inference_num_gpus_per_node: 2
+  inference_batch_size: 2
+  inference_buffer_threshold: 4
+  max_sample_pool_size: 16
+  aux_hidden_states_layers: [2, 13, 25]
+  last_hidden_states_prenorm: true
+  vllm:
+    tp_size: 1
+    pp_size: 1
+    mem_fraction_static: 0.5
+    extra_args:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 4096
+      limit_mm_per_prompt:
+        image: 2
+      enforce_eager: true
+
+mooncake:
+  protocol: tcp
+  global_segment_size: 16GB
+  local_buffer_size: 4GB
+
+output_dir: ./outputs/qwen3-vl-2b-smg
+cache_dir: ./cache/qwen3-vl-2b-smg

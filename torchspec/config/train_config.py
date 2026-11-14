@@ -42,6 +42,7 @@ class DatasetConfig:
     last_turn_loss_only: Any = "auto"  # bool or "auto"
     length_group_size: int = 32
     min_loss_tokens: int = 0  # DFlash: skip sequences with < N supervised tokens (use 2*block_size)
+    num_proc: int = 64  # dataset preprocessing workers
     prompt_key: str = "conversations"
     renderer: Optional[str] = None  # registered ConversationRenderer; overrides chat_template
     rendering_backend: str = "auto"  # SMG for supported text profiles; huggingface forces legacy
@@ -449,7 +450,8 @@ def config_to_flat_args(config: DictConfig) -> argparse.Namespace:
         flat.get("inference_engine_type") != "offline"
         and (flat["defer_tokenization"] or bool(flat.get("renderer")))
         and not flat["train_with_decode"]
-        and flat.get("renderer") not in ("smg", "smg-kimi-k3")  # SMG supplies packed masks
+        and flat.get("renderer")
+        not in ("smg", "smg-kimi-k3", "smg-qwen3-vl")  # SMG supplies packed masks
     )
     flat["use_wandb"] = flat.get("use_wandb", False) or flat.get("report_to") == "wandb"
     flat["use_tensorboard"] = (
