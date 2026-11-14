@@ -312,6 +312,8 @@ class DFlashModel(nn.Module):
             block_mask = block_masks[0] if len(mask_cache) == 1 else block_masks
 
         # 6. Draft model forward — pass embeddings directly
+        # Anchors stay inside the context. For a shorter context, dummy blocks
+        # occupy positions [0, block_size), regardless of the number of blocks.
         draft_hidden = self.draft_model(
             draft_input_ids=None,
             context_feature=context_feature,
@@ -319,6 +321,7 @@ class DFlashModel(nn.Module):
             context_position_ids=context_position_ids,
             block_mask=block_mask,
             noise_embedding=noise_embedding,
+            position_span=max(seq_len, self.block_size),
         )
 
         return draft_hidden, anchor_positions, block_keep_mask, n_blocks
