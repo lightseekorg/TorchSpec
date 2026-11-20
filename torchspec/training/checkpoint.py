@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import time
 from pathlib import Path
@@ -35,6 +34,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 from torchspec.models.draft.eagle4_moe import stack_latent_experts
 from torchspec.models.draft.keymap import to_internal_keys
+from torchspec.utils.distributed import get_gloo_group
 from torchspec.utils.logging import logger
 
 
@@ -59,6 +59,13 @@ def _fp32_param_names(optimizer) -> list[str]:
     return [name for name, param in optimizer.model.named_parameters() if param.requires_grad]
 
 
+def _named_fp32_params(optimizer) -> dict[str, torch.Tensor]:
+    return {
+        name: master.detach()
+        for name, master in zip(_fp32_param_names(optimizer), optimizer.fp32_params, strict=True)
+    }
+
+
 class OptimizerState(Stateful):
     """Wrapper for optimizer + fp32 master params."""
 
@@ -69,15 +76,11 @@ class OptimizerState(Stateful):
 
     def state_dict(self):
         if self._is_bf16_optimizer:
-            names = _fp32_param_names(self.optimizer)
             return {
                 "optim": self.optimizer.state_dict(),
                 # Keyed by name: which parameters are trainable can differ between the run
                 # that saved and the run that loads.
-                "fp32_params": {
-                    name: param.data
-                    for name, param in zip(names, self.optimizer.fp32_params, strict=True)
-                },
+                "fp32_params": _named_fp32_params(self.optimizer),
             }
         _, optimizer_state_dict = get_state_dict(self.model, optimizers=[self.optimizer])
         return {"optim": optimizer_state_dict}
@@ -108,6 +111,39 @@ class OptimizerState(Stateful):
             model_state_dict=None,
             optim_state_dict=state_dict["optim"],
         )
+
+
+class _BF16OptimizerLoadPlanner(dcp.DefaultLoadPlanner):
+    """Provide DCP destinations for AdamW state created lazily on the first update."""
+
+    def set_up_planner(self, state_dict, metadata, is_coordinator=False):
+        optimizer_state = state_dict["optim_state"]
+        optim = optimizer_state["optim"]
+        # BF16Optimizer has one AdamW group over the fp32 masters in model order.
+        masters = dict(
+            zip(
+                optim["param_groups"][0]["params"],
+                optimizer_state["fp32_params"].values(),
+                strict=True,
+            )
+        )
+        moments = {}
+        for key, path in metadata.planner_data.items():
+            if len(path) != 5 or path[:3] != ("optim_state", "optim", "state"):
+                continue
+            param_id, slot = int(path[3]), path[4]
+            master = masters[param_id]
+            spec = metadata.state_dict_metadata[key]
+            # The fused Adam step is a device scalar. Moments follow the master,
+            # including its DTensor placement when the model is fully sharded.
+            value = (
+                torch.empty(spec.size, device=master.device, dtype=spec.properties.dtype)
+                if slot == "step"
+                else torch.empty_like(master, dtype=spec.properties.dtype)
+            )
+            moments.setdefault(param_id, {})[slot] = value
+        optim["state"] = moments
+        super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
 class LRSchedulerState(Stateful):
@@ -377,7 +413,8 @@ def load(actor: Any) -> dict[str, Any] | None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
         try:
-            dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir))
+            planner = _BF16OptimizerLoadPlanner() if optimizer_state._is_bf16_optimizer else None
+            dcp.load(state_dict=optim_state_dict, checkpoint_id=str(optimizer_dir), planner=planner)
             logger.info(f"Loaded optimizer from {optimizer_dir}")
         except Exception as e:
             # The model is already restored but the fp32 masters still hold their pre-load
@@ -415,8 +452,12 @@ def load(actor: Any) -> dict[str, Any] | None:
 
     rng_state = None
     rng_path = checkpoint_dir / "rng.pt"
-    if rng_path.exists():
+    if not continual_training and rng_path.exists():
         rng_state = torch.load(rng_path, map_location="cpu")
+        # Older checkpoints stored only rank zero's streams.
+        other_ranks = rng_state.pop("other_ranks", {})
+        if other_ranks:
+            rng_state = other_ranks.get(dist.get_rank(), rng_state)
 
     metadata = _read_checkpoint_metadata(checkpoint_dir / "meta.json")
 
@@ -435,11 +476,8 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
     still hold pre-checkpoint (random init) values.  The first optimizer step
     would copy these back to the model, overwriting the loaded weights.
 
-    Strategy: temporarily load the optimizer checkpoint to recover the fp32 master
-    params, then restore the freshly configured param_groups and clear Adam state
-    so continual training still uses the new optimizer hyperparameters. Falls
-    back to copying from the bf16 model weights if the optimizer checkpoint is
-    unavailable.
+    Read only the named masters from the optimizer directory. Fall back to the
+    loaded bf16 weights when the checkpoint has no compatible masters.
     """
     opt = actor.optimizer
     if not hasattr(opt, "fp32_params"):
@@ -447,22 +485,12 @@ def _restore_fp32_master_params(actor: Any, optim_dir: Path) -> None:
 
     if optim_dir.exists() and (optim_dir / ".metadata").exists():
         try:
-            fresh_param_groups = [
-                {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
-                for group in opt.optimizer.param_groups
-            ]
-            optim_state = OptimizerState(actor.model, opt)
-            optim_sd = {"optim_state": optim_state}
-            dcp.load(state_dict=optim_sd, checkpoint_id=str(optim_dir))
-            for group, fresh_group in zip(opt.optimizer.param_groups, fresh_param_groups):
-                params = group["params"]
-                group.clear()
-                group.update(copy.deepcopy(fresh_group))
-                group["params"] = params
+            masters = {"optim_state": {"fp32_params": _named_fp32_params(opt)}}
+            dcp.load(state_dict=masters, checkpoint_id=str(optim_dir))
             opt.optimizer.state.clear()
             logger.info(f"Loaded fp32 master params from {optim_dir}")
             return
-        except Exception as e:
+        except (Exception, dcp.CheckpointException) as e:
             logger.warning(f"Failed to load fp32 params from optimizer checkpoint: {e}")
 
     if hasattr(opt, "sync_fp32_params_from_model"):
@@ -517,47 +545,68 @@ def save(actor: Any, step: int) -> None:
     optimizer_dir = checkpoint_dir / "optimizer"
     lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
 
-    if dist.get_rank() == 0:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model_dir.mkdir(parents=True, exist_ok=True)
-        optimizer_dir.mkdir(parents=True, exist_ok=True)
-        lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+    # DCP creates each component directory and coordinates its writers. Keep the
+    # planner's object collectives off the training GPUs, including between updates.
+    group = get_gloo_group()
 
     # Save model weights
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
-    dcp.save(state_dict, checkpoint_id=str(model_dir))
+    dcp.save(state_dict, checkpoint_id=str(model_dir), process_group=group)
 
     if hasattr(actor, "optimizer") and actor.optimizer is not None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
-        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir))
+        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir), process_group=group)
 
     if hasattr(actor, "lr_scheduler") and actor.lr_scheduler is not None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
-        dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
+        dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir), process_group=group)
 
-    if dist.get_rank() == 0:
-        rng_state = {"torch": torch.get_rng_state()}
-        rng_state["cuda"] = torch.cuda.get_rng_state_all()
-        torch.save(rng_state, checkpoint_dir / "rng.pt")
+    rank = dist.get_rank()
+    try:
+        rng = {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all()}
+    except Exception as exc:
+        rng = f"rank {rank}: {type(exc).__name__}: {exc}"
+    states = [None] * dist.get_world_size() if rank == 0 else None
+    dist.gather_object(rng, states, dst=0, group=group)
 
-        metadata = {
-            "iteration": step_id,
-            "step": step,
-            "inference_id": step,  # compat: old checkpoints use this key
-            "next_step": step + 1,
-            "next_inference_id": step + 1,  # compat: old checkpoints use this key
-            "global_step": actor.global_step,
-            "world_size": dist.get_world_size(),
-            "timestamp": time.time(),
-        }
-        _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
+    # Report failures on all ranks before they resume training or publish a new step.
+    error = [None]
+    if rank == 0:
+        try:
+            for state in states:
+                if isinstance(state, str):
+                    raise RuntimeError(f"Failed to capture RNG on {state}")
+            _finish_checkpoint(actor, step, checkpoint_dir, states)
+        except Exception as exc:
+            error[0] = f"{type(exc).__name__}: {exc}"
+    dist.broadcast_object_list(error, src=0, group=group)
+    if error[0] is not None:
+        raise RuntimeError(f"Failed to finish checkpoint {checkpoint_dir}: {error[0]}")
 
-        tracker_file = base_dir / "latest_checkpointed_iteration.txt"
-        tracker_file.write_text(str(step_id))
-        logger.info(f"Saved checkpoint to {checkpoint_dir}")
 
-    dist.barrier()
+def _finish_checkpoint(actor: Any, step: int, checkpoint_dir: Path, rng_states: list) -> None:
+    step_id = step + 1
+    # Keep the rank-zero fields readable by existing checkpoint consumers.
+    rng_state = {**rng_states[0], "other_ranks": dict(enumerate(rng_states[1:], start=1))}
+    torch.save(rng_state, checkpoint_dir / "rng.pt")
+
+    metadata = {
+        "iteration": step_id,
+        "step": step,
+        "inference_id": step,  # compat: old checkpoints use this key
+        "next_step": step + 1,
+        "next_inference_id": step + 1,  # compat: old checkpoints use this key
+        "global_step": actor.global_step,
+        "world_size": dist.get_world_size(),
+        "timestamp": time.time(),
+    }
+    _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
+
+    tracker_file = checkpoint_dir.parent / "latest_checkpointed_iteration.txt"
+    tmp_tracker = tracker_file.with_suffix(".tmp")
+    tmp_tracker.write_text(str(step_id))
+    tmp_tracker.replace(tracker_file)
+    logger.info(f"Saved checkpoint to {checkpoint_dir}")
