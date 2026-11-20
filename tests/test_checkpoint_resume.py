@@ -44,8 +44,9 @@ def _make_trainer(root, device, strategy=None, continual=False):
     )
 
 
-def _update(trainer, device):
-    batch = torch.rand(4, 8, device=device, dtype=torch.bfloat16)
+def _update(trainer, device, batch=None):
+    if batch is None:
+        batch = torch.rand(4, 8, device=device, dtype=torch.bfloat16)
     trainer.model(batch).float().square().mean().backward()
     trainer.optimizer.step()
     trainer.global_step += 1
@@ -88,7 +89,7 @@ def _round_trip(root, device, strategy=None):
     reference = _make_trainer(root, device, strategy)
     _update(reference, device)
     _update(reference, device)
-    torch.manual_seed(700)
+    torch.manual_seed(700 + dist.get_rank())
     checkpoint.save(reference, step=1)
     cpu_rng = torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state() if device.type == "cuda" else None
@@ -121,9 +122,12 @@ def _round_trip(root, device, strategy=None):
     assert torch.equal(torch.get_rng_state(), cpu_rng)
     if cuda_rng is not None:
         assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
-    with torch.random.fork_rng(devices=[device] if cuda_rng is not None else []):
-        _update(resumed, device)
-    _update(reference, device)
+    # Use identical per-rank inputs for the exact update comparison. Fresh and
+    # warmed DDP models can round the reductions of unequal bf16 gradients differently.
+    batch = torch.rand(4, 8, device=device, dtype=torch.bfloat16)
+    dist.broadcast(batch, src=0)
+    _update(resumed, device, batch)
+    _update(reference, device, batch)
     _check_resume(resumed, reference)
 
 

@@ -41,6 +41,8 @@ def _check_collective_save(rank, root):
             patch.object(torch.cuda, "get_rng_state_all", return_value=[]),
             patch.object(dcp, "save", wraps=dcp.save) as write,
         ):
+            torch.manual_seed(7100 + rank)
+            expected_rng = torch.get_rng_state()
             checkpoint.save(actor, step=0)
             assert [Path(call.kwargs["checkpoint_id"]).name for call in write.call_args_list] == [
                 "model",
@@ -49,6 +51,25 @@ def _check_collective_save(rank, root):
             ]
             assert all(call.kwargs["process_group"] is group for call in write.call_args_list)
             tracker = root / "latest_checkpointed_iteration.txt"
+
+            reader = SimpleNamespace(
+                args=SimpleNamespace(load_path=root), model=model, global_step=0
+            )
+            torch.manual_seed(0)
+            checkpoint.finalize_load(reader, checkpoint.load(reader))
+            assert torch.equal(torch.get_rng_state(), expected_rng)
+
+            # Old rng.pt files contain a single shared stream.
+            if rank == 0:
+                rng_file = root / "iter_0000001" / "rng.pt"
+                rng_state = torch.load(rng_file)
+                rng_state.pop("other_ranks")
+                torch.save(rng_state, rng_file)
+            dist.barrier(group=group)
+            checkpoint.finalize_load(reader, checkpoint.load(reader))
+            assert torch.equal(
+                torch.get_rng_state(), torch.Generator().manual_seed(7100).get_state()
+            )
 
             # Fail inside DCP on a worker, then after DCP on the publishing rank.
             writer_failure = patch.object(

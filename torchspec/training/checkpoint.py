@@ -454,6 +454,10 @@ def load(actor: Any) -> dict[str, Any] | None:
     rng_path = checkpoint_dir / "rng.pt"
     if not continual_training and rng_path.exists():
         rng_state = torch.load(rng_path, map_location="cpu")
+        # Older checkpoints stored only rank zero's streams.
+        other_ranks = rng_state.pop("other_ranks", {})
+        if other_ranks:
+            rng_state = other_ranks.get(dist.get_rank(), rng_state)
 
     metadata = _read_checkpoint_metadata(checkpoint_dir / "meta.json")
 
@@ -560,11 +564,22 @@ def save(actor: Any, step: int) -> None:
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
         dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir), process_group=group)
 
-    # A rank-zero filesystem error must reach peers before they resume training.
+    rank = dist.get_rank()
+    try:
+        rng = {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all()}
+    except Exception as exc:
+        rng = f"rank {rank}: {type(exc).__name__}: {exc}"
+    states = [None] * dist.get_world_size() if rank == 0 else None
+    dist.gather_object(rng, states, dst=0, group=group)
+
+    # Report failures on all ranks before they resume training or publish a new step.
     error = [None]
-    if dist.get_rank() == 0:
+    if rank == 0:
         try:
-            _finish_checkpoint(actor, step, checkpoint_dir)
+            for state in states:
+                if isinstance(state, str):
+                    raise RuntimeError(f"Failed to capture RNG on {state}")
+            _finish_checkpoint(actor, step, checkpoint_dir, states)
         except Exception as exc:
             error[0] = f"{type(exc).__name__}: {exc}"
     dist.broadcast_object_list(error, src=0, group=group)
@@ -572,10 +587,10 @@ def save(actor: Any, step: int) -> None:
         raise RuntimeError(f"Failed to finish checkpoint {checkpoint_dir}: {error[0]}")
 
 
-def _finish_checkpoint(actor: Any, step: int, checkpoint_dir: Path) -> None:
+def _finish_checkpoint(actor: Any, step: int, checkpoint_dir: Path, rng_states: list) -> None:
     step_id = step + 1
-    rng_state = {"torch": torch.get_rng_state()}
-    rng_state["cuda"] = torch.cuda.get_rng_state_all()
+    # Keep the rank-zero fields readable by existing checkpoint consumers.
+    rng_state = {**rng_states[0], "other_ranks": dict(enumerate(rng_states[1:], start=1))}
     torch.save(rng_state, checkpoint_dir / "rng.pt")
 
     metadata = {
