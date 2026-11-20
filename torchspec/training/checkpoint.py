@@ -35,6 +35,7 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 from torchspec.models.draft.eagle4_moe import stack_latent_experts
 from torchspec.models.draft.keymap import to_internal_keys
+from torchspec.utils.distributed import get_gloo_group
 from torchspec.utils.logging import logger
 
 
@@ -517,47 +518,57 @@ def save(actor: Any, step: int) -> None:
     optimizer_dir = checkpoint_dir / "optimizer"
     lr_scheduler_dir = checkpoint_dir / "lr_scheduler"
 
-    if dist.get_rank() == 0:
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        model_dir.mkdir(parents=True, exist_ok=True)
-        optimizer_dir.mkdir(parents=True, exist_ok=True)
-        lr_scheduler_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+    # DCP creates each component directory and coordinates its writers. Keep the
+    # planner's object collectives off the training GPUs, including between updates.
+    group = get_gloo_group()
 
     # Save model weights
     model_state = ModelState(actor.model)
     state_dict = {"model_state": model_state}
-    dcp.save(state_dict, checkpoint_id=str(model_dir))
+    dcp.save(state_dict, checkpoint_id=str(model_dir), process_group=group)
 
     if hasattr(actor, "optimizer") and actor.optimizer is not None:
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
-        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir))
+        dcp.save(optim_state_dict, checkpoint_id=str(optimizer_dir), process_group=group)
 
     if hasattr(actor, "lr_scheduler") and actor.lr_scheduler is not None:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
-        dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir))
+        dcp.save(lr_scheduler_state_dict, checkpoint_id=str(lr_scheduler_dir), process_group=group)
 
+    # A rank-zero filesystem error must reach peers before they resume training.
+    error = [None]
     if dist.get_rank() == 0:
-        rng_state = {"torch": torch.get_rng_state()}
-        rng_state["cuda"] = torch.cuda.get_rng_state_all()
-        torch.save(rng_state, checkpoint_dir / "rng.pt")
+        try:
+            _finish_checkpoint(actor, step, checkpoint_dir)
+        except Exception as exc:
+            error[0] = f"{type(exc).__name__}: {exc}"
+    dist.broadcast_object_list(error, src=0, group=group)
+    if error[0] is not None:
+        raise RuntimeError(f"Failed to finish checkpoint {checkpoint_dir}: {error[0]}")
 
-        metadata = {
-            "iteration": step_id,
-            "step": step,
-            "inference_id": step,  # compat: old checkpoints use this key
-            "next_step": step + 1,
-            "next_inference_id": step + 1,  # compat: old checkpoints use this key
-            "global_step": actor.global_step,
-            "world_size": dist.get_world_size(),
-            "timestamp": time.time(),
-        }
-        _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
 
-        tracker_file = base_dir / "latest_checkpointed_iteration.txt"
-        tracker_file.write_text(str(step_id))
-        logger.info(f"Saved checkpoint to {checkpoint_dir}")
+def _finish_checkpoint(actor: Any, step: int, checkpoint_dir: Path) -> None:
+    step_id = step + 1
+    rng_state = {"torch": torch.get_rng_state()}
+    rng_state["cuda"] = torch.cuda.get_rng_state_all()
+    torch.save(rng_state, checkpoint_dir / "rng.pt")
 
-    dist.barrier()
+    metadata = {
+        "iteration": step_id,
+        "step": step,
+        "inference_id": step,  # compat: old checkpoints use this key
+        "next_step": step + 1,
+        "next_inference_id": step + 1,  # compat: old checkpoints use this key
+        "global_step": actor.global_step,
+        "world_size": dist.get_world_size(),
+        "timestamp": time.time(),
+    }
+    _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
+
+    tracker_file = checkpoint_dir.parent / "latest_checkpointed_iteration.txt"
+    tmp_tracker = tracker_file.with_suffix(".tmp")
+    tmp_tracker.write_text(str(step_id))
+    tmp_tracker.replace(tracker_file)
+    logger.info(f"Saved checkpoint to {checkpoint_dir}")
