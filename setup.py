@@ -5,9 +5,9 @@ import os
 from setuptools import setup
 from setuptools_rust import Binding, RustExtension
 
-features = os.environ.get("TORCHSPEC_SMG_FEATURES", "")
-if features not in ("", "tokenizers-v1"):
-    raise ValueError("TORCHSPEC_SMG_FEATURES must be empty or 'tokenizers-v1'")
+features = [name for name in os.environ.get("TORCHSPEC_SMG_FEATURES", "").split(",") if name]
+if set(features) - {"tokenizers-v1", "multimodal"}:
+    raise ValueError("TORCHSPEC_SMG_FEATURES accepts comma-separated tokenizers-v1,multimodal")
 
 setup(
     rust_extensions=[
@@ -16,7 +16,7 @@ setup(
             path="bindings/smg-tokenizer/Cargo.toml",
             binding=Binding.PyO3,
             cargo_manifest_args=["--locked"],
-            features=[features] if features else [],
+            features=features,
             debug=False,
         )
     ],

@@ -2,6 +2,7 @@ FROM vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013@sha256:95
 
 # Compile against the runtime base for matching architecture and libc.
 FROM base AS torchspec-builder
+ARG TORCHSPEC_SMG_FEATURES=multimodal
 COPY . /tmp/torchspec
 RUN bash /tmp/torchspec/bindings/smg-tokenizer/build-wheel.sh
 
@@ -55,7 +56,7 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
 # Install this checkout as one wheel, then resolve its Python dependencies.
 COPY --from=torchspec-builder /opt/torchspec-wheels/ /tmp/torchspec-wheels/
 RUN python3 -m pip install --no-cache-dir --no-deps --force-reinstall /tmp/torchspec-wheels/*.whl && \
-    python3 -c "from torchspec_smg import Tokenizer, build_features; assert build_features == 'default'" && \
+    python3 -c "from torchspec_smg import Tokenizer, ImageProcessor, _native; assert _native.MULTIMODAL" && \
     rm -rf /tmp/torchspec-wheels
 
 COPY . /root/torchspec
